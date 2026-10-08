@@ -1,14 +1,14 @@
 [
-{"name":"vram read 1024 MiB, 4 blocks/SM","median_ns":3315712,"p99_ns":3336192,"rate":323.834,"unit":"GB/s","cycles":14732184,"instructions":12459067,"cache_misses":223,"page_faults":0},
-{"name":"vram read 1024 MiB, 8 blocks/SM","median_ns":3304448,"p99_ns":3341312,"rate":324.938,"unit":"GB/s","cycles":14471122,"instructions":11892816,"cache_misses":486,"page_faults":0},
-{"name":"vram read 1024 MiB, 16 blocks/SM","median_ns":3300192,"p99_ns":3307520,"rate":325.357,"unit":"GB/s","cycles":15456096,"instructions":13086882,"cache_misses":87,"page_faults":0},
-{"name":"vram read 1024 MiB, 32 blocks/SM","median_ns":3305472,"p99_ns":3357696,"rate":324.838,"unit":"GB/s","cycles":15754325,"instructions":13285261,"cache_misses":77,"page_faults":0},
-{"name":"vram copy 1024 MiB (driver)","median_ns":6852608,"p99_ns":6882176,"rate":313.382,"unit":"GB/s","cycles":31443255,"instructions":27410719,"cache_misses":287,"page_faults":0},
-{"name":"host→device 256 MiB, pinned","median_ns":27631168,"p99_ns":28952929,"rate":9.715,"unit":"GB/s","cycles":121835289,"instructions":106432052,"cache_misses":1114,"page_faults":0},
-{"name":"device→host 256 MiB, pinned","median_ns":27426464,"p99_ns":29318880,"rate":9.787,"unit":"GB/s","cycles":122503252,"instructions":107094103,"cache_misses":701,"page_faults":0},
-{"name":"host→device 256 MiB, pageable","median_ns":28750622,"p99_ns":31641940,"rate":9.337,"unit":"GB/s","cycles":123108789,"instructions":65940163,"cache_misses":3692804,"page_faults":0},
-{"name":"launch ×1000 (CPU)","median_ns":2701048,"p99_ns":17292500,"rate":2.701,"unit":"µs/launch","cycles":21952183,"instructions":20917962,"cache_misses":11220,"page_faults":0},
-{"name":"graph of 100 kernels, replay (CPU)","median_ns":13116,"p99_ns":31264,"rate":13.116,"unit":"µs","cycles":318671,"instructions":267855,"cache_misses":63,"page_faults":0},
-{"name":"graph of 100 kernels, 10 replays queued (CPU)","median_ns":143720,"p99_ns":206880,"rate":14.372,"unit":"µs/replay","cycles":2547988,"instructions":2187061,"cache_misses":507,"page_faults":0},
-{"name":"graph of 100 kernels (GPU)","median_ns":120832,"p99_ns":154624,"rate":1.208,"unit":"µs/kernel","cycles":112233,"instructions":60255,"cache_misses":77,"page_faults":0}
+{"name":"vram read 1024 MiB, 4 blocks/SM","median_ns":3316736,"p99_ns":3329920,"rate":323.734,"unit":"GB/s","cycles":15810763,"instructions":13785636,"cache_misses":211,"page_faults":0},
+{"name":"vram read 1024 MiB, 8 blocks/SM","median_ns":3302400,"p99_ns":3322880,"rate":325.140,"unit":"GB/s","cycles":15519955,"instructions":13543930,"cache_misses":96,"page_faults":0},
+{"name":"vram read 1024 MiB, 16 blocks/SM","median_ns":3299328,"p99_ns":3337216,"rate":325.443,"unit":"GB/s","cycles":14933357,"instructions":13057672,"cache_misses":130,"page_faults":0},
+{"name":"vram read 1024 MiB, 32 blocks/SM","median_ns":3305504,"p99_ns":3342336,"rate":324.835,"unit":"GB/s","cycles":14875749,"instructions":12969384,"cache_misses":231,"page_faults":0},
+{"name":"vram copy 1024 MiB (driver)","median_ns":6851584,"p99_ns":6868992,"rate":313.429,"unit":"GB/s","cycles":31534625,"instructions":27540426,"cache_misses":225,"page_faults":0},
+{"name":"host→device 256 MiB, pinned","median_ns":23939297,"p99_ns":24764959,"rate":11.213,"unit":"GB/s","cycles":106946757,"instructions":93607450,"cache_misses":1231,"page_faults":0},
+{"name":"device→host 256 MiB, pinned","median_ns":24425695,"p99_ns":25731297,"rate":10.990,"unit":"GB/s","cycles":97104674,"instructions":84281168,"cache_misses":1841,"page_faults":0},
+{"name":"host→device 256 MiB, pageable","median_ns":29022230,"p99_ns":34574021,"rate":9.249,"unit":"GB/s","cycles":111209407,"instructions":55933973,"cache_misses":3786330,"page_faults":0},
+{"name":"launch ×1000 (CPU)","median_ns":4006042,"p99_ns":15965015,"rate":4.006,"unit":"µs/launch","cycles":18507060,"instructions":16554707,"cache_misses":12476,"page_faults":0},
+{"name":"graph of 100 kernels, replay (CPU)","median_ns":13219,"p99_ns":49124,"rate":13.219,"unit":"µs","cycles":321570,"instructions":278919,"cache_misses":58,"page_faults":0},
+{"name":"graph of 100 kernels, 10 replays queued (CPU)","median_ns":125907,"p99_ns":544798,"rate":12.590,"unit":"µs/replay","cycles":2744836,"instructions":2378318,"cache_misses":497,"page_faults":0},
+{"name":"graph of 100 kernels (GPU)","median_ns":63488,"p99_ns":109568,"rate":0.635,"unit":"µs/kernel","cycles":334074,"instructions":291798,"cache_misses":64,"page_faults":0}
 ]
