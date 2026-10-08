@@ -156,7 +156,7 @@ fn read(
     mut landed: impl FnMut(usize, usize) -> Result<()>,
 ) -> Result<()> {
     let idle = Slot { chunk: 0, ptr: null_mut(), want: 0, done: 0 };
-    let mut reads = Reads { ring, fd: wpk.data.as_raw_fd(), len, slots: [idle; DEPTH], next: 0, busy: 0 };
+    let mut reads = Reads { ring, fd: wpk.source().as_raw_fd(), len, slots: [idle; DEPTH], next: 0, busy: 0 };
     let mut result = (0..DEPTH).try_for_each(|s| reads.refill(s, &mut target));
     while reads.busy > 0 {
         match reads.complete() {
@@ -171,7 +171,7 @@ fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wpk::{Dtype, Writer};
+    use crate::wpk::{Dtype, Reads, Writer};
     use std::alloc::{Layout, alloc_zeroed, dealloc};
 
     /// Host memory aligned for `O_DIRECT`, standing in for pinned memory.
@@ -216,8 +216,8 @@ mod tests {
     #[test]
     fn every_chunk_arrives_direct_or_buffered() {
         let (path, bytes) = sample("chunks", 5 * CHUNK + 12_345);
-        for direct in [true, false] {
-            let wpk = Wpk::open_with(&path, direct).unwrap();
+        for reads in [Reads::Direct, Reads::Cached] {
+            let wpk = Wpk::open_with(&path, reads).unwrap();
             let mut seen = Vec::new();
             let buf = load(&wpk, |chunk, _| {
                 seen.push(chunk);
@@ -225,8 +225,8 @@ mod tests {
             })
             .unwrap();
             seen.sort_unstable();
-            assert_eq!(seen, [0, 1, 2, 3, 4, 5], "direct: {}", wpk.is_direct());
-            assert!(buf.bytes()[..bytes.len()] == bytes[..], "direct: {}", wpk.is_direct());
+            assert_eq!(seen, [0, 1, 2, 3, 4, 5], "{:?}", wpk.reads());
+            assert!(buf.bytes()[..bytes.len()] == bytes[..], "{:?}", wpk.reads());
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn failures_stop_reading_and_drain() {
         let (path, _) = sample("failures", 6 * CHUNK);
-        let wpk = Wpk::open_with(&path, false).unwrap();
+        let wpk = Wpk::open_with(&path, Reads::Cached).unwrap();
         let mut landed = 0;
         let refused = load(&wpk, |_, _| {
             landed += 1;

@@ -15,13 +15,20 @@
 //! every tensor 256-byte aligned in VRAM. Opening a file checks the header and
 //! the table; [`Wpk::verify`] checks the tensors' bytes, which loading never
 //! touches with the CPU. Integers are little-endian.
+//!
+//! [`Reads::Auto`] picks the path per load: a file whose data the page cache
+//! already holds, such as one a previous process loaded, is read through the
+//! cache (memory speed); any other is read from the disk with `O_DIRECT`.
 
 mod load;
 
 pub use load::{CHUNK, DEPTH, Loader};
 
+use crate::sys;
+
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -205,31 +212,42 @@ fn index(file: &File) -> Result<(Vec<Tensor>, u64)> {
     if c.rest.is_empty() { Ok((tensors, data_len)) } else { bad("the tensor table has trailing bytes") }
 }
 
+/// How loads read a `.wpk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// Through the page cache when it holds at least 90% of the data, with `O_DIRECT` otherwise.
+    Auto,
+    /// From the disk with `O_DIRECT`, bypassing the page cache.
+    Direct,
+    /// Through the page cache. Where the filesystem refuses `O_DIRECT`, every policy becomes this one.
+    Cached,
+}
+
 /// An open `.wpk`: its checked index, and the file to load from.
 pub struct Wpk {
     index: File,
     data: File,
-    direct: bool,
+    reads: Reads,
     tensors: Vec<Tensor>,
     data_len: u64,
 }
 
 impl Wpk {
-    /// Opens and checks `path`, reading its data with `O_DIRECT` where the filesystem allows it.
+    /// Opens and checks `path`, with [`Reads::Auto`].
     pub fn open(path: impl AsRef<Path>) -> Result<Wpk> {
-        Wpk::open_with(path, true)
+        Wpk::open_with(path, Reads::Auto)
     }
 
-    /// Opens and checks `path`; with `direct` false, or where `O_DIRECT` is refused, reads go through the page cache.
-    pub fn open_with(path: impl AsRef<Path>, direct: bool) -> Result<Wpk> {
+    /// Opens and checks `path`, with the read policy `reads`.
+    pub fn open_with(path: impl AsRef<Path>, reads: Reads) -> Result<Wpk> {
         let index = File::open(&path)?;
         let (tensors, data_len) = self::index(&index)?;
-        let uncached = direct.then(|| OpenOptions::new().read(true).custom_flags(O_DIRECT).open(&path).ok()).flatten();
-        let (data, direct) = match uncached {
-            Some(file) => (file, true),
-            None => (index.try_clone()?, false),
+        let uncached = (reads != Reads::Cached).then(|| OpenOptions::new().read(true).custom_flags(O_DIRECT).open(&path).ok()).flatten();
+        let (data, reads) = match uncached {
+            Some(file) => (file, reads),
+            None => (index.try_clone()?, Reads::Cached),
         };
-        Ok(Wpk { index, data, direct, tensors, data_len })
+        Ok(Wpk { index, data, reads, tensors, data_len })
     }
 
     /// Every tensor, in file order.
@@ -247,9 +265,23 @@ impl Wpk {
         self.data_len as usize
     }
 
-    /// Whether loads bypass the page cache with `O_DIRECT`.
-    pub fn is_direct(&self) -> bool {
-        self.direct
+    /// The read policy in effect.
+    pub fn reads(&self) -> Reads {
+        self.reads
+    }
+
+    /// The share of the data region the page cache holds now, from 0 to 1.
+    pub fn cached(&self) -> f64 {
+        sys::resident(self.index.as_raw_fd(), ALIGN, self.data_len as usize)
+    }
+
+    /// The file the next load reads, by the read policy and what the page cache holds now.
+    fn source(&self) -> &File {
+        match self.reads {
+            Reads::Direct => &self.data,
+            Reads::Auto if self.cached() < 0.9 => &self.data,
+            Reads::Auto | Reads::Cached => &self.index,
+        }
     }
 
     /// Checks every tensor's bytes against its CRC32C, reading through the page cache 16 MiB at a time.
@@ -398,6 +430,20 @@ mod tests {
         patch(&tmp.0, ALIGN + 5000, &[0xff]);
         let wpk = Wpk::open(&tmp.0).unwrap();
         assert!(matches!(wpk.verify(), Err(Error::Format(why)) if why.contains("\"embed\"")));
+    }
+
+    #[test]
+    fn auto_reads_through_the_cache_only_when_it_holds_the_data() {
+        let (tmp, _) = sample("auto");
+        let wpk = Wpk::open(&tmp.0).unwrap();
+        crate::sys::testing::evict(wpk.index.as_raw_fd());
+        if wpk.reads() != Reads::Auto || wpk.cached() > 0.5 {
+            return; // no O_DIRECT, or a filesystem whose pages cannot be evicted (tmpfs)
+        }
+        assert_eq!(wpk.source().as_raw_fd(), wpk.data.as_raw_fd(), "evicted: read from the disk");
+        wpk.verify().unwrap();
+        assert!(wpk.cached() > 0.9);
+        assert_eq!(wpk.source().as_raw_fd(), wpk.index.as_raw_fd(), "cached: read through the cache");
     }
 
     #[test]

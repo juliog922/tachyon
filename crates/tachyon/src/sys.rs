@@ -10,6 +10,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const CLOSE: usize = 3;
 const MMAP: usize = 9;
 const MUNMAP: usize = 11;
+const MINCORE: usize = 27;
 const IO_URING_SETUP: usize = 425;
 const IO_URING_ENTER: usize = 426;
 const EINVAL: isize = -22;
@@ -56,6 +57,22 @@ struct Params {
     rest: [u32; 7],
     sq_off: Offsets,
     cq_off: Offsets,
+}
+
+/// The share of `len` bytes of file `fd`, from page-aligned `off`, held in the page cache; 0 when unknown.
+pub fn resident(fd: i32, off: u64, len: usize) -> f64 {
+    // SAFETY: maps the range read-only and shared; nothing reads through the mapping.
+    let addr = unsafe { call(MMAP, [0, len, 1, 1, fd as usize, off as usize]) };
+    if len == 0 || (-4095..0).contains(&addr) {
+        return 0.0;
+    }
+    let mut pages = vec![0u8; len.div_ceil(4096)];
+    // SAFETY: `pages` holds one byte per page of the mapping.
+    let probed = unsafe { call(MINCORE, [addr as usize, len, pages.as_mut_ptr() as usize, 0, 0, 0]) } == 0;
+    // SAFETY: unmaps the mapping made above.
+    unsafe { call(MUNMAP, [addr as usize, len, 0, 0, 0, 0]) };
+    let held = pages.iter().filter(|&&p| p & 1 == 1).count();
+    if probed { held as f64 / pages.len() as f64 } else { 0.0 }
 }
 
 /// Submission queue entry (`struct io_uring_sqe`); `rest` holds the fields file reads leave at zero.
@@ -208,5 +225,15 @@ impl Drop for Ring {
             }
             call(CLOSE, [self.fd as usize, 0, 0, 0, 0, 0]);
         }
+    }
+}
+
+#[cfg(test)]
+pub mod testing {
+    /// Drops file `fd`'s clean pages from the page cache (`posix_fadvise(DONTNEED)`).
+    pub fn evict(fd: i32) {
+        const FADVISE64: usize = 221;
+        // SAFETY: an advisory call on a descriptor the caller owns; no pointers.
+        unsafe { super::call(FADVISE64, [fd as usize, 0, 0, 4, 0, 0]) };
     }
 }
