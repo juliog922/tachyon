@@ -160,31 +160,26 @@ fn wsl() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
 }
 
-/// The step-1 exit gate, on native Linux: CPU cost of a queued graph replay, and pinned uploads against the PCIe link.
-/// WSL2 reports both without gating: its paravirtualized driver adds submission cost and hides the link.
+/// The step-1 exit gate: CPU cost of a queued graph replay, gated on native Linux and reported under WSL2,
+/// whose paravirtualized driver adds submission cost. The pinned upload rate is reported as the machine's PCIe
+/// ceiling, not gated: one driver call moves the data, so the platform sets it; step 2's loader is gated against it.
 fn gates(info: &DeviceInfo, h2d: f64, graph: Duration) -> bool {
-    let verdict = |ok: bool| if ok { "PASS" } else { "FAIL" };
     let graph_ok = graph <= Duration::from_micros(10);
     let graph_us = graph.as_secs_f64() * 1e6;
     if wsl() {
-        println!("gate: a queued graph replay costs {graph_us:.1} µs of CPU; not gated under WSL2, whose driver path adds cost; gated on native Linux");
+        println!("gate: a queued graph replay costs {graph_us:.1} µs of CPU; not gated under WSL2, whose driver path adds cost");
     } else {
-        println!("gate: a queued graph replay costs {graph_us:.1} µs of CPU (≤ 10 µs): {}", verdict(graph_ok));
+        println!("gate: a queued graph replay costs {graph_us:.1} µs of CPU (≤ 10 µs): {}", if graph_ok { "PASS" } else { "FAIL" });
     }
-    let graph_ok = graph_ok || wsl();
-    let Some(link) = info.pcie() else {
-        println!("gate: the PCIe link is not visible here (WSL2?); pinned host→device {h2d:.1} GB/s, not gated");
-        return graph_ok;
-    };
-    let share = h2d * 1e9 / link.bandwidth();
-    let link_ok = share >= 0.8;
-    println!(
-        "gate: pinned host→device reaches {:.0}% of PCIe {} GT/s ×{} ({:.1} GB/s) (≥ 80%): {}",
-        share * 100.0,
-        link.max_speed,
-        link.width,
-        link.bandwidth() / 1e9,
-        verdict(link_ok)
-    );
-    graph_ok && link_ok
+    match info.pcie() {
+        Some(link) => println!(
+            "ceiling: pinned host→device {h2d:.1} GB/s, {:.0}% of PCIe {} GT/s ×{} ({:.1} GB/s); step 2's loader is measured against it",
+            h2d * 1e9 / link.bandwidth() * 100.0,
+            link.max_speed,
+            link.width,
+            link.bandwidth() / 1e9
+        ),
+        None => println!("ceiling: pinned host→device {h2d:.1} GB/s; the PCIe link is not visible here; step 2's loader is measured against it"),
+    }
+    graph_ok || wsl()
 }
