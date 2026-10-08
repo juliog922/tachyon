@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/tachyon", "crates/tachyon-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+keywords = ["inference", "cuda", "llm", "gpu", "embedded"]
+categories = ["science", "hardware-support"]
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+# Driver and kernel code converts between C integer types on purpose.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+# Every fallible function returns the crate's one `Error`, documented where it is defined.
+missing_errors_doc = "allow"
+# Getters are plain field reads; marking each one adds noise, not safety.
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+debug = "line-tables-only"
