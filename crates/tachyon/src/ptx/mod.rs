@@ -2,217 +2,356 @@
 //!
 //! [`module`] targets `sm_80` with PTX ISA 7.1, so one text runs on every supported GPU and driver; the driver
 //! compiles it to machine code once and caches it. Generating the text lets one template serve every unroll
-//! depth, and later every data type, without the CUDA Toolkit.
+//! depth and head size without the CUDA Toolkit.
 //!
-//! - [`QUANT_Q8`] quantizes an `f32` vector to Q8, the layout in [`crate::quant`]. One warp per block of 32.
-//!   Arguments: `x: *const f32, q: *mut i8, s: *mut [f32; 2], len: u32`. Launch `len.div_ceil(256)` blocks of 256.
-//! - [`GEMV_Q4`] computes `y = W·x` for decode: Q4 weights times Q8 activations, `f32` out. One warp per row,
-//!   [`GEMV_ROWS`] rows per block. Each lane takes chunks of 32 weights (16 bytes) `lane, lane + 32, …`, with
-//!   [`UNROLL`] chunks in flight per loop turn and the rest in one final round whose loads are predicated, so even a
-//!   short row issues all its loads at once. Each chunk is 8 `dp4a` integer dot products, then one scale step in
-//!   `f32`. Arguments: `w: *const u8, scales: *const f16, q: *const i8, s: *const [f32; 2], y: *mut f32, rows: u32,
-//!   cols: u32`, with `cols` a multiple of 64. Launch `rows.div_ceil(GEMV_ROWS)` blocks of `32 · GEMV_ROWS`.
+//! Every kernel is listed with its arguments, in order, and its launch shape. Pointers are device addresses
+//! (`u64`); "Q8 out" means two pointers, `q: *mut i8` and `s: *mut [f32; 2]`, in the layout of [`crate::quant`].
+//! A decode step runs, per layer: [`NORM_Q8`] → [`GEMV_Q4`] (query, key, value) → [`ATTEND_256`] or
+//! [`ATTEND_512`] → [`GEMV_Q4`] (output) → [`NORM_Q8`] → [`GEMV_Q4`] (gate and up) → [`GEGLU_Q8`] →
+//! [`GEMV_Q4`] (down) → [`NORM_Q8`] → … Every activation a GEMV reads is written as Q8 by the kernel before it.
+//!
+//! - [`QUANT_Q8`] quantizes an `f32` vector to Q8. Arguments: `x`, Q8 out, `len: u32`.
+//!   Launch `len.div_ceil(256)` blocks of 256.
+//! - [`GEGLU_Q8`] quantizes `gelu(a[i]) · b[i]`, GELU in its tanh form, to Q8. Arguments: `a`, `b`, Q8 out,
+//!   `len: u32`. Launch as [`QUANT_Q8`].
+//! - [`NORM_Q8`] is the residual step: when `y` is not null, `h' = (h + w1 ⊙ rmsnorm(y)) · scale` is written to
+//!   `h_out` (another buffer: every block reads all of `h`); then Q8 out of `w2 ⊙ rmsnorm(h')`, or of `h'` when
+//!   `w2` is null, where `h'` is `h` when `y` is null; no Q8 when `q` is null. `rmsnorm(x) = x / √(mean(x²) + eps)`.
+//!   Arguments: `h, h_out, y, w1, w2: *f32`, Q8 out, `len: u32, eps: f32, scale: f32`. `len` is a multiple of
+//!   [`NORM_THREADS`] up to 16 times it; vectors may hold several chunks of `len`, each normalized on its own with
+//!   the same weights. Launch a grid of `(len / NORM_THREADS, chunks)` blocks of [`NORM_THREADS`]: every block
+//!   reduces its whole chunk and writes one slice of it, so a vector spreads over several multiprocessors.
+//! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`. Arguments:
+//!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
+//!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
+//! - [`GEMV_Q4`]: see [`gemv`]. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
+//!
+//! Lengths are multiples of 32.
+
+pub mod attend;
+pub mod gemv;
+pub mod sample;
+
+pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_KV, rope};
+pub use gemv::{GEMV_Q4, GEMV_ROWS, UNROLL};
+pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
 
 use std::fmt::Write;
 
 /// Name of the activation quantizer.
 pub const QUANT_Q8: &str = "quant_q8";
-/// Name of the Q4 × Q8 matrix-vector product.
-pub const GEMV_Q4: &str = "gemv_q4";
-/// Rows of [`GEMV_Q4`] per block, one warp each.
-pub const GEMV_ROWS: u32 = 4;
-/// Chunks of 32 weights each [`GEMV_Q4`] lane has in flight per loop turn.
-pub const UNROLL: usize = 4;
+/// Name of the GELU-gated quantizer.
+pub const GEGLU_Q8: &str = "geglu_q8";
+/// Name of the residual and normalization step.
+pub const NORM_Q8: &str = "norm_q8";
+/// Name of the embedding lookup.
+pub const EMBED_Q4: &str = "embed_q4";
+/// Threads per block of [`NORM_Q8`].
+pub const NORM_THREADS: u32 = 256;
 
 /// Every kernel, as one PTX module.
 pub fn module() -> String {
-    format!(".version 7.1\n.target sm_80\n.address_size 64\n\n{QUANT}\n{}", gemv_q4(UNROLL))
+    let kernels = [quant(QUANT_Q8, ""), quant(GEGLU_Q8, GELU), norm(), EMBED.into(), gemv::gemv_q4(UNROLL), attend::attend(256), attend::attend(512)];
+    kernels.iter().fold(String::from(".version 7.1\n.target sm_80\n.address_size 64\n"), |m, k| m + "\n" + k) + &sample::sample()
 }
 
+/// Five butterfly steps that leave `op` of `x` over the warp in every lane; `t` is scratch.
+fn warp(op: &str, x: &str, t: &str) -> String {
+    (0..5).fold(String::new(), |mut s, k| {
+        let _ = writeln!(s, "    shfl.sync.bfly.b32 {t}, {x}, {}, 31, -1;\n    {op} {x}, {x}, {t};", 16 >> k);
+        s
+    })
+}
+
+/// The sums (`add.f32`) or another `op` of each of `xs` (up to four) over a block of `warps` warps, left in every
+/// thread; needs [`BLOCK`]. With fewer than 32 warps the missing ones count as 0, so `op` must be a sum.
+fn block(op: &str, xs: &[&str], warps: u32) -> String {
+    let lanes: String = xs.iter().map(|x| warp(op, x, "%bt")).collect();
+    let mut s = lanes.clone();
+    xs.iter().enumerate().for_each(|(i, x)| _ = writeln!(s, "    @%lane0 st.shared.f32 [%rw+{}], {x};", 128 * i));
+    s += "    bar.sync 0;\n";
+    if warps < 32 {
+        let _ = writeln!(s, "    setp.lt.u32 %bp, %lane, {warps};");
+    }
+    for (i, x) in xs.iter().enumerate() {
+        let guard = if warps < 32 { format!("    mov.f32 {x}, 0f00000000;\n    @%bp ") } else { "    ".into() };
+        let _ = writeln!(s, "{guard}ld.shared.f32 {x}, [%rl+{}];", 128 * i);
+    }
+    s + &lanes + "    bar.sync 0;\n"
+}
+
+/// Thread, lane and warp, and the shared slots [`block`] reduces through.
+const BLOCK: &str = "
+    .shared .align 4 .f32 red[128];
+    .reg .pred %lane0, %bp;
+    .reg .b32 %th, %lane, %warp, %rw, %rl;
+    .reg .f32 %bt;
+    mov.u32 %th, %tid.x;
+    and.b32 %lane, %th, 31;
+    shr.u32 %warp, %th, 5;
+    setp.eq.u32 %lane0, %lane, 0;
+    mov.u32 %rw, red;
+    mad.lo.u32 %rl, %lane, 4, %rw;
+    mad.lo.u32 %rw, %warp, 4, %rw;
+";
+
+/// Registers of [`q8`]; `%qp` and `%sp` hold the Q8 output pointers.
+const Q8: &str = "
+    .reg .pred %qz;
+    .reg .b32 %qn, %qm, %qt;
+    .reg .f32 %qa, %qb, %qd, %qi, %qv, %qf;
+    .reg .b64 %qo, %qp, %sp;
+";
+
+/// Stores `x`, value `i` of a vector, as Q8. Each warp holds 32 consecutive values, one block of the layout:
+/// scale `amax/127`, values rounded to nearest even, and the block's `[s, s·Σq]` written by its first lane.
+fn q8(x: &str, i: &str) -> String {
+    format!(
+        "    abs.f32 %qa, {x};\n{}    div.rn.f32 %qd, %qa, 0f42FE0000;
+    setp.gt.f32 %qz, %qa, 0f00000000;
+    div.rn.f32 %qi, 0f42FE0000, %qa;
+    selp.f32 %qi, %qi, 0f00000000, %qz;
+    mul.rn.f32 %qv, {x}, %qi;
+    cvt.rni.s32.f32 %qn, %qv;
+    cvt.u64.u32 %qo, {i};
+    add.u64 %qo, %qp, %qo;
+    st.global.s8 [%qo], %qn;\n{}    and.b32 %qt, {i}, 31;
+    setp.eq.u32 %qz, %qt, 0;
+    cvt.rn.f32.s32 %qf, %qn;
+    mul.rn.f32 %qf, %qf, %qd;
+    shr.u32 %qt, {i}, 5;
+    mul.wide.u32 %qo, %qt, 8;
+    add.u64 %qo, %sp, %qo;
+    @%qz st.global.v2.f32 [%qo], {{%qd, %qf}};\n",
+        warp("max.f32", "%qa", "%qb"),
+        warp("add.s32", "%qn", "%qm")
+    )
+}
+
+/// One value per thread: `%x = a[i]`, with `%qo` the byte offset of `i`; `EXIT` for threads past the end.
 const QUANT: &str = "
-.visible .entry quant_q8(.param .u64 px, .param .u64 pq, .param .u64 ps, .param .u32 plen)
+    .reg .pred %p;
+    .reg .b32 %i, %n, %len;
+    .reg .f32 %x, %b, %t;
+    .reg .b64 %a;
+    mov.u32 %i, %ctaid.x;
+    mov.u32 %n, %ntid.x;
+    mov.u32 %len, %tid.x;
+    mad.lo.u32 %i, %i, %n, %len;
+    ld.param.u32 %len, [plen];
+    setp.ge.u32 %p, %i, %len;
+    @%p bra EXIT;
+    ld.param.u64 %qp, [pq];
+    ld.param.u64 %sp, [ps];
+    cvta.to.global.u64 %qp, %qp;
+    cvta.to.global.u64 %sp, %sp;
+    ld.param.u64 %a, [px];
+    cvta.to.global.u64 %a, %a;
+    mul.wide.u32 %qo, %i, 4;
+    add.u64 %a, %a, %qo;
+    ld.global.f32 %x, [%a];
+";
+
+/// `%x ← gelu(%x) · b[i]`, with `gelu(x) = x / (1 + e^(−2u))`, `u = √(2/π)·(x + 0.044715·x³)`: the tanh form.
+const GELU: &str = "
+    ld.param.u64 %a, [pb];
+    cvta.to.global.u64 %a, %a;
+    add.u64 %a, %a, %qo;
+    ld.global.f32 %b, [%a];
+    mul.f32 %t, %x, %x;
+    fma.rn.f32 %t, %t, 0f3D372713, 0f3F800000;
+    mul.f32 %t, %t, %x;
+    mul.f32 %t, %t, 0fC0135761;
+    ex2.approx.f32 %t, %t;
+    add.f32 %t, %t, 0f3F800000;
+    div.rn.f32 %x, %x, %t;
+    mul.f32 %x, %x, %b;
+";
+
+/// [`QUANT_Q8`], or with [`GELU`] as `gate`, [`GEGLU_Q8`].
+fn quant(name: &str, gate: &str) -> String {
+    let b = if gate.is_empty() { "" } else { ".param .u64 pb, " };
+    format!(
+        ".visible .entry {name}(.param .u64 px, {b}.param .u64 pq, .param .u64 ps, .param .u32 plen)\n{{{Q8}{QUANT}{gate}{}EXIT:\n    ret;\n}}\n",
+        q8("%x", "%i")
+    )
+}
+
+/// Values of [`NORM_Q8`] each thread reads: rows of up to `16 · NORM_THREADS`.
+const PER_THREAD: usize = 16;
+
+/// [`NORM_Q8`]. Every block reads its whole chunk, `LOADS` putting value `k` of this thread in `%h{k}`, `%y{k}`
+/// and `%a{k}` (`w1 ⊙ y`), and `SUM` reduces Σy², Σh², Σh·a and Σa² at once: the new `h` is `(h + r·a)·scale`,
+/// so its squares sum to `scale²·(Σh² + 2r·Σh·a + r²·Σa²)`. Each block stores only its own slice of the new `h` and
+/// of the Q8 output.
+const NORM: &str = "
+.visible .entry norm_q8(.param .u64 ph, .param .u64 pho, .param .u64 py, .param .u64 pw1, .param .u64 pw2, .param .u64 pq, .param .u64 ps,
+                        .param .u32 plen, .param .f32 peps, .param .f32 pscale)
 {
-    .reg .pred %p, %z;
-    .reg .b32 %r<8>;
-    .reg .f32 %f<8>;
-    .reg .b64 %d<6>;
-    mov.u32 %r0, %ctaid.x;
-    mov.u32 %r1, %ntid.x;
-    mov.u32 %r2, %tid.x;
-    mad.lo.u32 %r3, %r0, %r1, %r2;
-    ld.param.u32 %r4, [plen];
-    setp.ge.u32 %p, %r3, %r4;
-    @%p bra EXIT;
-    ld.param.u64 %d0, [px];
-    ld.param.u64 %d1, [pq];
-    ld.param.u64 %d2, [ps];
-    cvta.to.global.u64 %d0, %d0;
-    cvta.to.global.u64 %d1, %d1;
-    cvta.to.global.u64 %d2, %d2;
-    mul.wide.u32 %d3, %r3, 4;
-    add.u64 %d3, %d0, %d3;
-    ld.global.f32 %f0, [%d3];
-    abs.f32 %f1, %f0;
-    shfl.sync.bfly.b32 %f2, %f1, 16, 31, -1;
-    max.f32 %f1, %f1, %f2;
-    shfl.sync.bfly.b32 %f2, %f1, 8, 31, -1;
-    max.f32 %f1, %f1, %f2;
-    shfl.sync.bfly.b32 %f2, %f1, 4, 31, -1;
-    max.f32 %f1, %f1, %f2;
-    shfl.sync.bfly.b32 %f2, %f1, 2, 31, -1;
-    max.f32 %f1, %f1, %f2;
-    shfl.sync.bfly.b32 %f2, %f1, 1, 31, -1;
-    max.f32 %f1, %f1, %f2;
-    div.rn.f32 %f3, %f1, 0f42FE0000;
-    setp.gt.f32 %z, %f1, 0f00000000;
-    div.rn.f32 %f4, 0f42FE0000, %f1;
-    selp.f32 %f4, %f4, 0f00000000, %z;
-    mul.rn.f32 %f5, %f0, %f4;
-    cvt.rni.s32.f32 %r5, %f5;
-    cvt.u64.u32 %d4, %r3;
-    add.u64 %d4, %d1, %d4;
-    st.global.s8 [%d4], %r5;
-    shfl.sync.bfly.b32 %r6, %r5, 16, 31, -1;
-    add.s32 %r5, %r5, %r6;
-    shfl.sync.bfly.b32 %r6, %r5, 8, 31, -1;
-    add.s32 %r5, %r5, %r6;
-    shfl.sync.bfly.b32 %r6, %r5, 4, 31, -1;
-    add.s32 %r5, %r5, %r6;
-    shfl.sync.bfly.b32 %r6, %r5, 2, 31, -1;
-    add.s32 %r5, %r5, %r6;
-    shfl.sync.bfly.b32 %r6, %r5, 1, 31, -1;
-    add.s32 %r5, %r5, %r6;
-    and.b32 %r7, %r3, 31;
-    setp.ne.u32 %p, %r7, 0;
-    @%p bra EXIT;
-    cvt.rn.f32.s32 %f6, %r5;
-    mul.rn.f32 %f6, %f6, %f3;
-    shr.u32 %r7, %r3, 5;
-    mul.wide.u32 %d5, %r7, 8;
-    add.u64 %d5, %d2, %d5;
-    st.global.v2.f32 [%d5], {%f3, %f6};
+    .reg .pred %hy, %hw, %hq, %t, %p<16>;
+    .reg .b32 %len, %base, %slice, %own, %gi;
+    .reg .f32 %ss, %sh, %su, %uu, %r, %x, %w, %eps, %scale, %n, %h<16>, %y<16>, %a<16>;
+    .reg .b64 %hp, %ho, %yp, %w1, %w2, %ah, %ao, %ay, %aw, %ad;
+BLOCK Q8
+    ld.param.u32 %len, [plen];
+    ld.param.f32 %eps, [peps];
+    ld.param.f32 %scale, [pscale];
+    cvt.rn.f32.u32 %n, %len;
+    mov.u32 %slice, %ctaid.x;
+    mov.u32 %base, %ctaid.y;
+    mul.lo.u32 %base, %base, %len;
+    mad.lo.u32 %own, %slice, 256, %th;
+    mul.wide.u32 %ad, %base, 4;
+    ld.param.u64 %hp, [ph];
+    cvta.to.global.u64 %hp, %hp;
+    add.u64 %hp, %hp, %ad;
+    ld.param.u64 %ho, [pho];
+    cvta.to.global.u64 %ho, %ho;
+    add.u64 %ho, %ho, %ad;
+    ld.param.u64 %yp, [py];
+    setp.ne.u64 %hy, %yp, 0;
+    cvta.to.global.u64 %yp, %yp;
+    add.u64 %yp, %yp, %ad;
+    ld.param.u64 %w1, [pw1];
+    cvta.to.global.u64 %w1, %w1;
+    ld.param.u64 %w2, [pw2];
+    setp.ne.u64 %hw, %w2, 0;
+    cvta.to.global.u64 %w2, %w2;
+    ld.param.u64 %qp, [pq];
+    setp.ne.u64 %hq, %qp, 0;
+    cvta.to.global.u64 %qp, %qp;
+    ld.param.u64 %sp, [ps];
+    cvta.to.global.u64 %sp, %sp;
+    mul.wide.u32 %ad, %th, 4;
+    add.u64 %ah, %hp, %ad;
+    add.u64 %ao, %ho, %ad;
+    add.u64 %ay, %yp, %ad;
+    add.u64 %aw, %w1, %ad;
+LOADS
+SUM
+    div.rn.f32 %r, %ss, %n;
+    add.f32 %r, %r, %eps;
+    rsqrt.approx.f32 %r, %r;
+    @!%hy bra ADDED;
+RESIDUAL
+    add.f32 %su, %su, %su;
+    fma.rn.f32 %su, %r, %uu, %su;
+    fma.rn.f32 %sh, %r, %su, %sh;
+    mul.f32 %sh, %sh, %scale;
+    mul.f32 %sh, %sh, %scale;
+ADDED:
+    @!%hq bra EXIT;
+    div.rn.f32 %r, %sh, %n;
+    add.f32 %r, %r, %eps;
+    rsqrt.approx.f32 %r, %r;
+    @!%hw mov.f32 %r, 0f3F800000;
+OWN
+    mul.f32 %x, %x, %r;
+    mov.f32 %w, 0f3F800000;
+    mul.wide.u32 %ad, %own, 4;
+    add.u64 %ad, %w2, %ad;
+    @%hw ld.global.f32 %w, [%ad];
+    mul.f32 %x, %x, %w;
+    add.u32 %gi, %base, %own;
+Q8
 EXIT:
     ret;
 }
 ";
 
-/// Registers: `%rd0..3` walk this lane's weights, scales, Q8 values and Q8 scales; `%r10` is its chunk index,
-/// `%r7` the row's chunk count, `%r4` the row, `%r1` the lane.
-const GEMV_HEAD: &str = "
-    mov.u32 %r0, %tid.x;
-    and.b32 %r1, %r0, 31;
-    shr.u32 %r2, %r0, 5;
-    mov.u32 %r3, %ctaid.x;
-    mad.lo.u32 %r4, %r3, ROWS, %r2;
-    ld.param.u32 %r5, [prows];
-    setp.ge.u32 %p, %r4, %r5;
-    @%p bra EXIT;
-    ld.param.u32 %r6, [pcols];
-    shr.u32 %r7, %r6, 5;
-    ld.param.u64 %rd0, [pw];
-    ld.param.u64 %rd1, [pws];
-    ld.param.u64 %rd2, [pq];
-    ld.param.u64 %rd3, [ps];
-    cvta.to.global.u64 %rd0, %rd0;
-    cvta.to.global.u64 %rd1, %rd1;
-    cvta.to.global.u64 %rd2, %rd2;
-    cvta.to.global.u64 %rd3, %rd3;
-    shr.u32 %r8, %r6, 1;
-    mul.wide.u32 %rd4, %r4, %r8;
-    add.u64 %rd0, %rd0, %rd4;
-    mul.wide.u32 %rd4, %r4, %r7;
-    add.u64 %rd1, %rd1, %rd4;
-    mul.wide.u32 %rd4, %r1, 16;
-    add.u64 %rd0, %rd0, %rd4;
-    shr.u32 %r9, %r1, 1;
-    mul.wide.u32 %rd4, %r9, 2;
-    add.u64 %rd1, %rd1, %rd4;
-    mul.wide.u32 %rd4, %r1, 32;
-    add.u64 %rd2, %rd2, %rd4;
-    mul.wide.u32 %rd4, %r1, 8;
-    add.u64 %rd3, %rd3, %rd4;
-    mov.u32 %r10, %r1;
-    mov.f32 %sum, 0f00000000;
-";
+/// `%{sum} ← Σ %{a}k·%{b}k` over this thread's values.
+fn dot(sum: &str, a: &str, b: &str) -> String {
+    (1..PER_THREAD).fold(format!("    mul.f32 %{sum}, %{a}0, %{b}0;\n"), |mut s, k| {
+        let _ = writeln!(s, "    fma.rn.f32 %{sum}, %{a}{k}, %{b}{k}, %{sum};");
+        s
+    })
+}
 
-const GEMV_TAIL: &str = "
-    shfl.sync.bfly.b32 %o, %sum, 16, 31, -1;
-    add.f32 %sum, %sum, %o;
-    shfl.sync.bfly.b32 %o, %sum, 8, 31, -1;
-    add.f32 %sum, %sum, %o;
-    shfl.sync.bfly.b32 %o, %sum, 4, 31, -1;
-    add.f32 %sum, %sum, %o;
-    shfl.sync.bfly.b32 %o, %sum, 2, 31, -1;
-    add.f32 %sum, %sum, %o;
-    shfl.sync.bfly.b32 %o, %sum, 1, 31, -1;
-    add.f32 %sum, %sum, %o;
-    setp.ne.u32 %p, %r1, 0;
+fn norm() -> String {
+    let (mut loads, mut loads2, mut residual, mut own) = (String::new(), String::new(), String::new(), String::new());
+    for k in 0..PER_THREAD {
+        let (at, t) = (1024 * k, 256 * k);
+        let _ =
+            writeln!(loads, "    add.u32 %gi, %th, {t};\n    setp.lt.u32 %p{k}, %gi, %len;\n    mov.f32 %h{k}, 0f00000000;\n    mov.f32 %y{k}, 0f00000000;");
+        let _ = writeln!(loads, "    @%p{k} ld.global.f32 %h{k}, [%ah+{at}];\n    and.pred %t, %p{k}, %hy;\n    @%t ld.global.f32 %y{k}, [%ay+{at}];");
+        let _ = writeln!(loads, "    mov.f32 %a{k}, 0f00000000;\n    @%t ld.global.f32 %a{k}, [%aw+{at}];");
+        let _ = writeln!(loads2, "    mul.f32 %a{k}, %a{k}, %y{k};");
+        let _ = writeln!(residual, "    fma.rn.f32 %h{k}, %a{k}, %r, %h{k};\n    mul.f32 %h{k}, %h{k}, %scale;");
+        let _ = writeln!(residual, "    setp.eq.u32 %t, %slice, {k};\n    @%t st.global.f32 [%ao+{at}], %h{k};");
+        let _ = writeln!(own, "    setp.eq.u32 %t, %slice, {k};\n    @%t mov.f32 %x, %h{k};");
+    }
+    NORM.replace("BLOCK Q8", &(BLOCK.to_string() + Q8))
+        .replace("LOADS\n", &(loads + &loads2 + &dot("ss", "y", "y") + &dot("sh", "h", "h") + &dot("su", "h", "a") + &dot("uu", "a", "a")))
+        .replace("SUM\n", &block("add.f32", &["%ss", "%sh", "%su", "%uu"], NORM_THREADS / 32))
+        .replace("RESIDUAL\n", &residual)
+        .replace("OWN\n", &own)
+        .replace("Q8\n", &q8("%x", "%gi"))
+}
+
+/// [`EMBED_Q4`]: thread `i` decodes weight `i` of row `token`, as [`crate::quant`] packs it.
+const EMBED: &str = "
+.visible .entry embed_q4(.param .u64 pw, .param .u64 ps, .param .u64 ptok, .param .u64 py, .param .u32 pcols, .param .f32 pscale)
+{
+    .reg .pred %p;
+    .reg .b32 %i, %t, %cols, %tok, %g, %k, %n;
+    .reg .b16 %h;
+    .reg .f32 %d, %x, %scale;
+    .reg .b64 %a, %b, %o;
+    mov.u32 %i, %ctaid.x;
+    mov.u32 %t, %ntid.x;
+    mov.u32 %n, %tid.x;
+    mad.lo.u32 %i, %i, %t, %n;
+    ld.param.u32 %cols, [pcols];
+    setp.ge.u32 %p, %i, %cols;
     @%p bra EXIT;
-    ld.param.u64 %rd5, [py];
-    cvta.to.global.u64 %rd5, %rd5;
-    mul.wide.u32 %rd6, %r4, 4;
-    add.u64 %rd5, %rd5, %rd6;
-    st.global.f32 [%rd5], %sum;
+    ld.param.u64 %a, [ptok];
+    cvta.to.global.u64 %a, %a;
+    ld.global.u32 %tok, [%a];
+    shr.u32 %g, %i, 6;
+    shr.u32 %t, %cols, 6;
+    mul.wide.u32 %o, %tok, %t;
+    cvt.u64.u32 %b, %g;
+    add.u64 %o, %o, %b;
+    shl.b64 %o, %o, 1;
+    ld.param.u64 %a, [ps];
+    cvta.to.global.u64 %a, %a;
+    add.u64 %a, %a, %o;
+    ld.global.b16 %h, [%a];
+    cvt.f32.f16 %d, %h;
+    shr.u32 %t, %cols, 1;
+    mul.wide.u32 %o, %tok, %t;
+    and.b32 %k, %i, 63;
+    shr.u32 %t, %k, 3;
+    shl.b32 %t, %t, 2;
+    and.b32 %n, %k, 3;
+    add.u32 %t, %t, %n;
+    shl.b32 %n, %g, 5;
+    add.u32 %t, %t, %n;
+    cvt.u64.u32 %b, %t;
+    add.u64 %o, %o, %b;
+    ld.param.u64 %a, [pw];
+    cvta.to.global.u64 %a, %a;
+    add.u64 %a, %a, %o;
+    ld.global.u8 %n, [%a];
+    shr.u32 %t, %k, 2;
+    and.b32 %t, %t, 1;
+    shl.b32 %t, %t, 2;
+    shr.u32 %n, %n, %t;
+    and.b32 %n, %n, 15;
+    sub.s32 %n, %n, 8;
+    cvt.rn.f32.s32 %x, %n;
+    mul.f32 %x, %x, %d;
+    ld.param.f32 %scale, [pscale];
+    mul.f32 %x, %x, %scale;
+    ld.param.u64 %a, [py];
+    cvta.to.global.u64 %a, %a;
+    mul.wide.u32 %o, %i, 4;
+    add.u64 %a, %a, %o;
+    st.global.f32 [%a], %x;
 EXIT:
     ret;
 }
 ";
-
-/// Loads chunk `i` of the current turn: 16 bytes of weights, its scale, 32 Q8 values and their scales. A guarded
-/// load runs only under predicate `%q{i}`, after zeroing what makes a missing chunk add nothing.
-fn load(ptx: &mut String, i: usize, guarded: bool) {
-    let guard = if guarded {
-        let _ = writeln!(ptx, "    mov.f32 %sx{i}, 0f00000000;\n    mov.f32 %ss{i}, 0f00000000;\n    mov.b16 %h{i}, 0;");
-        format!("@%q{i} ")
-    } else {
-        String::new()
-    };
-    let (wr, ar) = (4 * i, 8 * i);
-    let _ = writeln!(ptx, "    {guard}ld.global.cs.v4.u32 {{%w{wr}, %w{}, %w{}, %w{}}}, [%rd0+{}];", wr + 1, wr + 2, wr + 3, 512 * i);
-    let _ = writeln!(ptx, "    {guard}ld.global.nc.v4.u32 {{%a{ar}, %a{}, %a{}, %a{}}}, [%rd2+{}];", ar + 1, ar + 2, ar + 3, 1024 * i);
-    let _ = writeln!(ptx, "    {guard}ld.global.nc.v4.u32 {{%a{}, %a{}, %a{}, %a{}}}, [%rd2+{}];", ar + 4, ar + 5, ar + 6, ar + 7, 1024 * i + 16);
-    let _ = writeln!(ptx, "    {guard}ld.global.nc.v2.f32 {{%sx{i}, %ss{i}}}, [%rd3+{}];", 256 * i);
-    let _ = writeln!(ptx, "    {guard}ld.global.nc.b16 %h{i}, [%rd1+{}];", 32 * i);
-}
-
-/// Adds chunk `i` to `%sum`: `d · (s · Σ n·q − 8 · s·Σq)`, the integer sum from 8 `dp4a`.
-fn dot(ptx: &mut String, i: usize) {
-    for word in 0..4 {
-        let (wr, ar) = (4 * i + word, 8 * i + 2 * word);
-        let acc = if word == 0 { "0".to_string() } else { format!("%acc{i}") };
-        let _ = writeln!(ptx, "    and.b32 %r12, %w{wr}, 0x0F0F0F0F;\n    dp4a.u32.s32 %acc{i}, %r12, %a{ar}, {acc};");
-        let _ = writeln!(ptx, "    shr.u32 %r13, %w{wr}, 4;\n    and.b32 %r13, %r13, 0x0F0F0F0F;\n    dp4a.u32.s32 %acc{i}, %r13, %a{}, %acc{i};", ar + 1);
-    }
-    let _ = writeln!(ptx, "    cvt.f32.f16 %sw{i}, %h{i};\n    cvt.rn.f32.s32 %f{i}, %acc{i};\n    mul.f32 %f{i}, %f{i}, %sx{i};");
-    let _ = writeln!(ptx, "    fma.rn.f32 %f{i}, %ss{i}, 0fC1000000, %f{i};\n    fma.rn.f32 %sum, %f{i}, %sw{i}, %sum;");
-}
-
-/// [`GEMV_Q4`] with `u` chunks in flight per loop turn.
-fn gemv_q4(u: usize) -> String {
-    let mut s = format!(
-        ".visible .entry gemv_q4(.param .u64 pw, .param .u64 pws, .param .u64 pq, .param .u64 ps, .param .u64 py, .param .u32 prows, .param .u32 pcols)
-{{
-    .reg .pred %p, %q<{u}>;
-    .reg .b16 %h<{u}>;
-    .reg .b32 %r<16>, %w<{}>, %a<{}>, %acc<{u}>;
-    .reg .f32 %sx<{u}>, %ss<{u}>, %sw<{u}>, %f<{u}>, %sum, %o;
-    .reg .b64 %rd<8>;",
-        4 * u,
-        8 * u
-    );
-    s += &GEMV_HEAD.replace("ROWS", &GEMV_ROWS.to_string());
-    let _ = writeln!(s, "TURN:\n    add.u32 %r11, %r10, {};\n    setp.ge.u32 %p, %r11, %r7;\n    @%p bra LAST;", 32 * (u - 1));
-    (0..u).for_each(|i| load(&mut s, i, false));
-    (0..u).for_each(|i| dot(&mut s, i));
-    let _ = writeln!(s, "    add.u64 %rd0, %rd0, {};\n    add.u64 %rd1, %rd1, {};\n    add.u64 %rd2, %rd2, {};", 512 * u, 32 * u, 1024 * u);
-    let _ = writeln!(s, "    add.u64 %rd3, %rd3, {};\n    add.u32 %r10, %r10, {};\n    bra TURN;\nLAST:", 256 * u, 32 * u);
-    for i in 0..u {
-        let _ = writeln!(s, "    add.u32 %r11, %r10, {};\n    setp.lt.u32 %q{i}, %r11, %r7;", 32 * i);
-        load(&mut s, i, true);
-    }
-    (0..u).for_each(|i| dot(&mut s, i));
-    s + GEMV_TAIL
-}
 
 #[cfg(test)]
 mod tests {
@@ -222,7 +361,9 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/ptx");
         std::fs::create_dir_all(&dir).unwrap();
         let ptx = super::module();
-        assert!(ptx.contains(".entry gemv_q4") && ptx.contains(".entry quant_q8"));
+        for name in [super::QUANT_Q8, super::GEGLU_Q8, super::NORM_Q8, super::EMBED_Q4, super::GEMV_Q4, super::ATTEND_256, super::ATTEND_512, super::SAMPLE] {
+            assert!(ptx.contains(&format!(".entry {name}(")), "{name} is missing");
+        }
         std::fs::write(dir.join("kernels.ptx"), ptx).unwrap();
     }
 }
