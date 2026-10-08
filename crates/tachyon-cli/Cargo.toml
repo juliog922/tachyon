@@ -1,0 +1,20 @@
+[package]
+name = "tachyon-cli"
+description = "Command line of the Tachyon inference engine: GPU inspection, model downloads, runs and benchmarks"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[dependencies]
+tachyon = { path = "../tachyon", version = "0.1.0" }
+
+[lints]
+workspace = true
