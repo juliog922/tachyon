@@ -1,0 +1,126 @@
+// Kernels that test and measure the driver layer.
+//
+//   noop      does nothing: launch and graph-replay cost.
+//   add_f32   c[i] = a[i] + b[i] for i < n: launch arguments and copies.
+//   xor_read  reads `count` 16-byte vectors once, four independent loads in
+//             flight per thread, and stores each thread's XOR of the words it
+//             read to out[thread]: the VRAM read bandwidth ceiling. XOR-ing
+//             all of `out` gives the XOR of every input word, which tests check.
+
+.version 7.1
+.target sm_80
+.address_size 64
+
+.visible .entry noop()
+{
+    ret;
+}
+
+.visible .entry add_f32(.param .u64 a, .param .u64 b, .param .u64 c, .param .u32 n)
+{
+    .reg .pred  p;
+    .reg .b32   r<5>;
+    .reg .f32   f<3>;
+    .reg .b64   d<5>;
+
+    ld.param.u64        d0, [a];
+    ld.param.u64        d1, [b];
+    ld.param.u64        d2, [c];
+    ld.param.u32        r0, [n];
+    mov.u32             r1, %ctaid.x;
+    mov.u32             r2, %ntid.x;
+    mov.u32             r3, %tid.x;
+    mad.lo.u32          r4, r1, r2, r3;
+    setp.ge.u32         p, r4, r0;
+    @p bra              DONE;
+    cvta.to.global.u64  d0, d0;
+    cvta.to.global.u64  d1, d1;
+    cvta.to.global.u64  d2, d2;
+    mul.wide.u32        d3, r4, 4;
+    add.u64             d4, d0, d3;
+    ld.global.f32       f0, [d4];
+    add.u64             d4, d1, d3;
+    ld.global.f32       f1, [d4];
+    add.f32             f2, f0, f1;
+    add.u64             d4, d2, d3;
+    st.global.f32       [d4], f2;
+DONE:
+    ret;
+}
+
+.visible .entry xor_read(.param .u64 src, .param .u64 count, .param .u64 out)
+{
+    .reg .pred  p;
+    .reg .b32   r<24>;
+    .reg .b64   d<12>;
+
+    ld.param.u64        d0, [src];
+    ld.param.u64        d1, [count];
+    ld.param.u64        d2, [out];
+    cvta.to.global.u64  d0, d0;
+    cvta.to.global.u64  d2, d2;
+    mov.u32             r0, %ctaid.x;
+    mov.u32             r1, %ntid.x;
+    mov.u32             r2, %tid.x;
+    mov.u32             r3, %nctaid.x;
+    mad.lo.u32          r4, r0, r1, r2;     // this thread
+    mul.lo.u32          r5, r1, r3;         // threads in the grid
+    cvt.u64.u32         d3, r4;             // i: next vector
+    cvt.u64.u32         d4, r5;             // stride, in vectors
+    mul.wide.u32        d5, r5, 16;         // stride, in bytes
+    mul.lo.u64          d6, d4, 3;          // three strides, in vectors
+    shl.b64             d7, d4, 2;          // four strides, in vectors
+    shl.b64             d8, d5, 2;          // four strides, in bytes
+    shl.b64             d9, d3, 4;
+    add.u64             d9, d0, d9;         // address of vector i
+    mov.b32             r6, 0;              // XOR of everything read
+
+UNROLLED:
+    add.u64             d10, d3, d6;
+    setp.ge.u64         p, d10, d1;
+    @p bra              TAIL;
+    add.u64             d10, d9, d5;
+    add.u64             d11, d10, d5;
+    ld.global.nc.v4.u32 {r7, r8, r9, r10}, [d9];
+    ld.global.nc.v4.u32 {r11, r12, r13, r14}, [d10];
+    add.u64             d10, d11, d5;
+    ld.global.nc.v4.u32 {r15, r16, r17, r18}, [d11];
+    ld.global.nc.v4.u32 {r19, r20, r21, r22}, [d10];
+    xor.b32             r7, r7, r8;
+    xor.b32             r9, r9, r10;
+    xor.b32             r11, r11, r12;
+    xor.b32             r13, r13, r14;
+    xor.b32             r15, r15, r16;
+    xor.b32             r17, r17, r18;
+    xor.b32             r19, r19, r20;
+    xor.b32             r21, r21, r22;
+    xor.b32             r7, r7, r9;
+    xor.b32             r11, r11, r13;
+    xor.b32             r15, r15, r17;
+    xor.b32             r19, r19, r21;
+    xor.b32             r7, r7, r11;
+    xor.b32             r15, r15, r19;
+    xor.b32             r7, r7, r15;
+    xor.b32             r6, r6, r7;
+    add.u64             d3, d3, d7;
+    add.u64             d9, d9, d8;
+    bra                 UNROLLED;
+
+TAIL:
+    setp.ge.u64         p, d3, d1;
+    @p bra              DONE;
+    ld.global.nc.v4.u32 {r7, r8, r9, r10}, [d9];
+    xor.b32             r7, r7, r8;
+    xor.b32             r9, r9, r10;
+    xor.b32             r7, r7, r9;
+    xor.b32             r6, r6, r7;
+    add.u64             d3, d3, d4;
+    add.u64             d9, d9, d5;
+    bra                 TAIL;
+
+DONE:
+    mul.wide.u32        d10, r4, 4;
+    add.u64             d10, d2, d10;
+    st.global.u32       [d10], r6;
+    ret;
+}
