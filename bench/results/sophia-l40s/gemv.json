@@ -1,0 +1,123 @@
+[
+    {
+        "name": "vram read ceiling, 4 blocks/SM",
+        "median_ns": 2207488,
+        "p99_ns": 2212320,
+        "rate": 729.613,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "vram read ceiling, 8 blocks/SM",
+        "median_ns": 2213504,
+        "p99_ns": 2216128,
+        "rate": 727.630,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "q, sliding, shared kv: 2048×2560 ×579",
+        "median_ns": 2863968,
+        "p99_ns": 2866272,
+        "rate": 563.092,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "qkv, sliding: 3072×2560 ×386",
+        "median_ns": 2601984,
+        "p99_ns": 2605312,
+        "rate": 619.787,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "q, global, shared kv: 4096×2560 ×290",
+        "median_ns": 2504896,
+        "p99_ns": 2506240,
+        "rate": 644.922,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "qkv, global: 6144×2560 ×193",
+        "median_ns": 2348160,
+        "p99_ns": 2348896,
+        "rate": 686.783,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "o, sliding: 2560×2048 ×579",
+        "median_ns": 2863936,
+        "p99_ns": 2867360,
+        "rate": 563.098,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "o, global: 2560×4096 ×290",
+        "median_ns": 2608992,
+        "p99_ns": 2612224,
+        "rate": 619.190,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gate + up: 20480×2560 ×64",
+        "median_ns": 2387328,
+        "p99_ns": 2388832,
+        "rate": 746.684,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "down: 2560×10240 ×116",
+        "median_ns": 2326208,
+        "p99_ns": 2328832,
+        "rate": 694.462,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "lm head: 262144×2560 ×64",
+        "median_ns": 30209791,
+        "p99_ns": 30233025,
+        "rate": 755.285,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]
