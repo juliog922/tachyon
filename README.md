@@ -4,7 +4,7 @@ An embedded inference engine for NVIDIA GPUs, written in Rust with zero dependen
 
 Tachyon runs a fixed catalog of open-weight models (Gemma 4, Laya, Granite embeddings) inside your process, at the speed the GPU's memory bandwidth allows, and switches between them in tenths of a second. It needs only `libc` and the NVIDIA driver's `libcuda.so.1`, loaded at run time: no CUDA Toolkit, no crates, no Python.
 
-> **Status: step 1 of 14.** The CUDA driver layer is done. Model inference arrives in later steps; see the roadmap below.
+> **Status: step 2 of 14.** The CUDA driver layer is done; the weight file loader is built and awaits GPU validation. Model inference arrives in later steps; see the roadmap below.
 
 ## Requirements
 
@@ -30,6 +30,9 @@ cargo run --release -p tachyon-cli -- gpu --json
 crates/tachyon/          the library
   src/cuda/driver.rs     libcuda.so.1 loaded with dlopen; every function fetched at the CUDA 12.0 ABI
   src/cuda/mod.rs        owning, non-Send wrappers: Context, DevBuf, HostBuf, Stream, Event, Module, Graph
+  src/wpk/mod.rs         the .wpk weight file: writer, checked index, CRC32C verification
+  src/wpk/load.rs        io_uring + O_DIRECT loader: disk → VRAM, disk → host-RAM tier, host tier → VRAM
+  src/sys.rs             raw syscalls and io_uring, ported from caudal
   tests/                 GPU tests (feature `gpu`) and their PTX kernels
   benches/               machine ceilings and the bench harness
 crates/tachyon-cli/      the `tachyon` command
@@ -57,9 +60,10 @@ Tools: `pip install lizard`, and for `ptxas` without the CUDA Toolkit, `pip inst
 ```sh
 cargo test --workspace --features tachyon/gpu
 cargo bench -p tachyon --features gpu --bench machine
+cargo bench -p tachyon --features gpu --bench load
 ```
 
-The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate.
+The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate. The `load` bench writes a test `.wpk` sized to the machine (to `$TACHYON_BENCH_DIR`, default `target/bench`; put it on the disk models load from) and checks the step-2 gate: a staged disk → VRAM load reaches 90% of the slower of the disk and PCIe.
 
 Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=1`; later runs fail when a median is more than 3% slower. The machine name is `$TACHYON_BENCH_MACHINE`, else the host name. For stable numbers, lock the GPU clocks (`nvidia-smi -lgc`) and keep laptops on AC power.
 
@@ -68,8 +72,8 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | Step | What | State |
 | --- | --- | --- |
 | 0 | Workspace, quality gates, bench harness | done |
-| 1 | CUDA driver layer | done; GPU validation pending |
-| 2 | Weight file format and `io_uring` loader | |
+| 1 | CUDA driver layer | done |
+| 2 | Weight file format and `io_uring` loader | built; GPU validation pending |
 | 3 | 4-bit GEMV kernel at ≥ 90% of VRAM bandwidth | |
 | 4 | Remaining decode kernels | |
 | 5 | Tokenizer and chat template | |
