@@ -7,9 +7,9 @@ use tachyon::cuda::{Context, DevBuf, Module, Stream, arg};
 use tachyon::ptx::{GEMV_Q4, GEMV_ROWS, QUANT_Q8, module};
 use tachyon::quant::{Q4, f16_value, q4, q8};
 
-/// Every Gemma 4 E4B decode projection (fused where the engine fuses), with rows cut where only `cols` matters,
-/// and edge shapes: one group, rows not a multiple of the block, and fewer chunks than lanes.
-const SHAPES: [(usize, usize); 9] = [(3072, 2560), (6144, 2560), (2560, 2048), (2560, 4096), (2048, 10240), (4096, 2560), (37, 2560), (5, 64), (3, 192)];
+/// Every column count of a Gemma 4 E4B decode projection (only `cols` changes the kernel's path; rows only add
+/// warps), and edge shapes: rows not a multiple of the block, one group, and fewer chunks than lanes.
+const SHAPES: [(usize, usize); 7] = [(512, 2560), (512, 2048), (512, 4096), (256, 10240), (37, 2560), (5, 64), (3, 192)];
 
 /// Uniform values in [-1, 1) from a fixed seed.
 fn values(len: usize, seed: u64) -> Vec<f32> {
