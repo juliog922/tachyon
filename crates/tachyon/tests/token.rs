@@ -3,7 +3,9 @@
 //! Gemma 4's own, from `$TACHYON_MODELS/gemma-4-E4B-it/tokenizer.json`.
 
 use tachyon::json::Json;
-use tachyon::token::{Chat, Detokenizer, Message, Role, Tokenizer};
+#[cfg(feature = "models")]
+use tachyon::token::{Chat, Message, Role};
+use tachyon::token::{Detokenizer, Tokenizer};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 

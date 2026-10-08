@@ -16,7 +16,7 @@ pub use chat::{Chat, Message, Role};
 
 use crate::json::Json;
 use crate::{Error, Result};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
 /// No entry in a lookup table, and no token.
 const NONE: u32 = u32::MAX;
@@ -211,32 +211,43 @@ impl Tokenizer {
         w.next.extend(1..=n);
         w.prev.clear();
         w.prev.extend((0..n).map(|i| i.wrapping_sub(1)));
-        w.heap.clear();
-        (0..n.saturating_sub(1)).for_each(|i| self.queue(w, i));
-        while let Some(std::cmp::Reverse((top, a, b, merged))) = w.heap.pop() {
+        // A tournament tree of the merges' keys: leaf `half + i` is symbol `i`'s, each node the least of its two.
+        // The first lookups are independent: in one plain loop, their cache misses overlap.
+        let half = w.ids.len().next_power_of_two();
+        w.tree.clear();
+        w.tree.resize(2 * half, u64::MAX);
+        w.merged.clear();
+        for (i, p) in w.ids.windows(2).enumerate() {
+            let (rank, merged) = self.merge(p[0], p[1]).unwrap_or((NONE, NONE));
+            w.tree[half + i] = u64::from(rank) << 32 | i as u64;
+            w.merged.push(merged);
+        }
+        w.merged.push(NONE);
+        for k in (1..half).rev() {
+            w.tree[k] = w.tree[2 * k].min(w.tree[2 * k + 1]);
+        }
+        while let Some(top) = Some(w.tree[1]).filter(|&k| k >> 32 != u64::from(NONE)) {
             let i = top as u32 as usize;
             let j = w.next[i] as usize;
-            if w.ids[i] != a || w.ids.get(j) != Some(&b) {
-                continue;
-            }
-            (w.ids[i], w.ids[j], w.next[i]) = (merged, NONE, w.next[j]);
+            (w.ids[i], w.ids[j], w.next[i]) = (w.merged[i], NONE, w.next[j]);
             if let Some(after) = w.prev.get_mut(w.next[i] as usize) {
                 *after = i as u32;
             }
-            self.queue(w, w.prev[i]);
-            self.queue(w, i as u32);
+            w.set(j, (u64::MAX, NONE));
+            for k in [w.prev[i], i as u32] {
+                if k < n {
+                    w.set(k as usize, self.after(w, k));
+                }
+            }
         }
         out.extend(w.ids.iter().copied().filter(|&id| id != NONE));
     }
 
-    /// Queues the merge of symbol `i` with the next one, if there is one.
-    fn queue(&self, w: &mut Work, i: u32) {
-        let j = w.next.get(i as usize).copied().unwrap_or(NONE);
-        if let (Some(&a), Some(&b)) = (w.ids.get(i as usize), w.ids.get(j as usize))
-            && let Some((rank, merged)) = self.merge(a, b)
-        {
-            w.heap.push(std::cmp::Reverse((u64::from(rank) << 32 | u64::from(i), a, b, merged)));
-        }
+    /// The merge of symbol `i` with the next one, as `(rank << 32 | i, merged)`.
+    fn after(&self, w: &Work, i: u32) -> (u64, u32) {
+        let (a, b) = (w.ids.get(i as usize), w.next.get(i as usize).and_then(|&j| w.ids.get(j as usize)));
+        let (rank, merged) = a.zip(b).and_then(|(&a, &b)| self.merge(a, b)).unwrap_or((NONE, NONE));
+        (u64::from(rank) << 32 | u64::from(i), merged)
     }
 
     /// The tokens before merging, into `ids`: one per character, or per byte of a character the vocabulary lacks.
@@ -326,8 +337,27 @@ struct Work {
     ids: Vec<u32>,
     next: Vec<u32>,
     prev: Vec<u32>,
-    /// Merges by rank, then position: `(rank << 32 | position, left, right, merged)`.
-    heap: BinaryHeap<std::cmp::Reverse<(u64, u32, u32, u32)>>,
+    /// Each symbol's merge with the next as `rank << 32 | position`, so the least is the one to merge first, in a
+    /// tournament tree.
+    tree: Vec<u64>,
+    /// What each of those merges makes.
+    merged: Vec<u32>,
+}
+
+impl Work {
+    /// Sets the merge of symbol `i` with the next one, and the tree above its key.
+    fn set(&mut self, i: usize, (key, merged): (u64, u32)) {
+        self.merged[i] = merged;
+        let mut k = self.tree.len() / 2 + i;
+        self.tree[k] = key;
+        while k > 1 {
+            let least = self.tree[k].min(self.tree[k ^ 1]);
+            k /= 2;
+            if std::mem::replace(&mut self.tree[k], least) == least {
+                break;
+            }
+        }
+    }
 }
 
 /// A merge as `tokenizer.json` writes it: `["a", "b"]`, or `"a b"` in older files.
