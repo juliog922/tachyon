@@ -1,0 +1,57 @@
+[
+    {
+        "name": "disk → host tier (O_DIRECT)",
+        "median_ns": 770548249,
+        "p99_ns": 775456922,
+        "rate": 3.462,
+        "unit": "GB/s",
+        "cycles": 613501,
+        "instructions": 29114,
+        "cache_misses": 4099,
+        "page_faults": 0
+    },
+    {
+        "name": "disk → VRAM, staged (O_DIRECT)",
+        "median_ns": 795142275,
+        "p99_ns": 796302625,
+        "rate": 3.355,
+        "unit": "GB/s",
+        "cycles": 1223909290,
+        "instructions": 1053390715,
+        "cache_misses": 121759,
+        "page_faults": 1
+    },
+    {
+        "name": "host tier → VRAM",
+        "median_ns": 275915462,
+        "p99_ns": 297303133,
+        "rate": 9.668,
+        "unit": "GB/s",
+        "cycles": 1203256191,
+        "instructions": 1010902878,
+        "cache_misses": 4470,
+        "page_faults": 0
+    },
+    {
+        "name": "page cache → VRAM",
+        "median_ns": 632624867,
+        "p99_ns": 664337279,
+        "rate": 4.217,
+        "unit": "GB/s",
+        "cycles": 1282895596,
+        "instructions": 1111330567,
+        "cache_misses": 65172,
+        "page_faults": 0
+    },
+    {
+        "name": "automatic → VRAM",
+        "median_ns": 662025646,
+        "p99_ns": 733226133,
+        "rate": 4.029,
+        "unit": "GB/s",
+        "cycles": 1273111897,
+        "instructions": 1106084313,
+        "cache_misses": 80775,
+        "page_faults": 0
+    }
+]
