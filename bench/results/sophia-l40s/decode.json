@@ -1,0 +1,156 @@
+[
+    {
+        "name": "vram read ceiling, 4 blocks/SM",
+        "median_ns": 2208512,
+        "p99_ns": 2215168,
+        "rate": 729.275,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "vram read ceiling, 8 blocks/SM",
+        "median_ns": 2213568,
+        "p99_ns": 2223680,
+        "rate": 727.609,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "norm 2560×1 ×64",
+        "median_ns": 135968,
+        "p99_ns": 136544,
+        "rate": 2.124,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "geglu 10240 ×64",
+        "median_ns": 78912,
+        "p99_ns": 79520,
+        "rate": 1.233,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "geglu 256 ×64",
+        "median_ns": 71616,
+        "p99_ns": 71904,
+        "rate": 1.119,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "norm 256×42 ×64",
+        "median_ns": 125824,
+        "p99_ns": 126464,
+        "rate": 1.966,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "embed 2560 from vram ×64",
+        "median_ns": 69664,
+        "p99_ns": 70368,
+        "rate": 1.088,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "embed 10752 from host ×64",
+        "median_ns": 125856,
+        "p99_ns": 127680,
+        "rate": 1.966,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "sample 262144, greedy ×64",
+        "median_ns": 410272,
+        "p99_ns": 410624,
+        "rate": 6.410,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "sample 262144, top-k, top-p, min-p ×64",
+        "median_ns": 2272384,
+        "p99_ns": 2572608,
+        "rate": 35.506,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "attend 256, 512 of 512 positions ×1536",
+        "median_ns": 14042528,
+        "p99_ns": 14051616,
+        "rate": 9.142,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "attend 512, 1024 of 1024 positions ×384",
+        "median_ns": 8133632,
+        "p99_ns": 8136736,
+        "rate": 21.181,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "attend 512, 4096 of 4096 positions ×96",
+        "median_ns": 3771648,
+        "p99_ns": 4014880,
+        "rate": 39.288,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "attend 512, 16384 of 16384 positions ×64",
+        "median_ns": 6932320,
+        "p99_ns": 6938208,
+        "rate": 108.317,
+        "unit": "µs each",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]

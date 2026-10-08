@@ -1,0 +1,16 @@
+[
+{"name":"vram read ceiling, 4 blocks/SM","median_ns":3321856,"p99_ns":3341280,"rate":323.236,"unit":"GB/s","cycles":14819716,"instructions":12984690,"cache_misses":323,"page_faults":0},
+{"name":"vram read ceiling, 8 blocks/SM","median_ns":3306496,"p99_ns":3321856,"rate":324.737,"unit":"GB/s","cycles":15209570,"instructions":13374894,"cache_misses":85,"page_faults":0},
+{"name":"norm 2560×1 ×64","median_ns":217088,"p99_ns":225280,"rate":3.392,"unit":"µs each","cycles":1013908,"instructions":887588,"cache_misses":54,"page_faults":0},
+{"name":"geglu 10240 ×64","median_ns":122880,"p99_ns":152576,"rate":1.920,"unit":"µs each","cycles":557685,"instructions":487608,"cache_misses":46,"page_faults":0},
+{"name":"geglu 256 ×64","median_ns":111616,"p99_ns":117760,"rate":1.744,"unit":"µs each","cycles":518881,"instructions":454602,"cache_misses":46,"page_faults":0},
+{"name":"norm 256×42 ×64","median_ns":291680,"p99_ns":300032,"rate":4.557,"unit":"µs each","cycles":1345457,"instructions":1180122,"cache_misses":44,"page_faults":0},
+{"name":"embed 2560 from vram ×64","median_ns":95232,"p99_ns":113664,"rate":1.488,"unit":"µs each","cycles":479938,"instructions":421669,"cache_misses":46,"page_faults":0},
+{"name":"embed 10752 from host ×64","median_ns":148480,"p99_ns":150528,"rate":2.320,"unit":"µs each","cycles":669766,"instructions":588097,"cache_misses":70,"page_faults":0},
+{"name":"sample 262144, greedy ×64","median_ns":671744,"p99_ns":698144,"rate":10.496,"unit":"µs each","cycles":2894769,"instructions":2541575,"cache_misses":64,"page_faults":0},
+{"name":"sample 262144, top-k, top-p, min-p ×64","median_ns":3088384,"p99_ns":3470336,"rate":48.256,"unit":"µs each","cycles":13776997,"instructions":12055245,"cache_misses":168,"page_faults":0},
+{"name":"attend 256, 512 of 512 positions ×64","median_ns":784384,"p99_ns":808704,"rate":12.256,"unit":"µs each","cycles":3491583,"instructions":3061789,"cache_misses":69,"page_faults":0},
+{"name":"attend 512, 1024 of 1024 positions ×64","median_ns":1900544,"p99_ns":1928192,"rate":29.696,"unit":"µs each","cycles":8363043,"instructions":7302541,"cache_misses":214,"page_faults":0},
+{"name":"attend 512, 4096 of 4096 positions ×64","median_ns":5972992,"p99_ns":6029312,"rate":93.328,"unit":"µs each","cycles":26550167,"instructions":22731306,"cache_misses":221,"page_faults":0},
+{"name":"attend 512, 16384 of 16384 positions ×64","median_ns":21800768,"p99_ns":21835775,"rate":340.637,"unit":"µs each","cycles":94157702,"instructions":82290939,"cache_misses":491,"page_faults":0}
+]
