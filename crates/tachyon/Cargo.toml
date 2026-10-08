@@ -1,0 +1,25 @@
+[package]
+name = "tachyon"
+description = "Embedded LLM inference engine for NVIDIA GPUs on Linux x86_64, with zero dependencies"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+# Enables the tests and benches that need an NVIDIA GPU.
+gpu = []
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "machine"
+harness = false
+required-features = ["gpu"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
