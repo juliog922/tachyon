@@ -4,7 +4,7 @@ An embedded inference engine for NVIDIA GPUs, written in Rust with zero dependen
 
 Tachyon runs a fixed catalog of open-weight models (Gemma 4, Laya, Granite embeddings) inside your process, at the speed the GPU's memory bandwidth allows, and switches between them in tenths of a second. It needs only `libc` and the NVIDIA driver's `libcuda.so.1`, loaded at run time: no CUDA Toolkit, no crates, no Python.
 
-> **Status: step 5 of 14.** The CUDA driver layer, the weight file loader and the 4-bit decode kernel are done: one Gemma 4 E4B token's matrix-vector products stream at 96% (RTX 3060 Laptop) and 98% (L40S) of the measured VRAM bandwidth. The rest of the decode kernels (normalization, gated activation, embeddings, attention, sampling) are done and tested on the GPU; step 6 fuses them into a decode step. Model inference arrives in later steps; see the roadmap below.
+> **Status: step 5 of 14.** The CUDA driver layer, the weight file loader, the decode kernels and the tokenizer are done or under validation: one Gemma 4 E4B token's matrix-vector products stream at 96% (RTX 3060 Laptop) and 98% (L40S) of the measured VRAM bandwidth. The rest of the decode kernels (normalization, gated activation, embeddings, attention, sampling) are done and tested on the GPU; step 6 fuses them into a decode step. Model inference arrives in later steps; see the roadmap below.
 
 ## Requirements
 
@@ -34,11 +34,15 @@ crates/tachyon/          the library
   src/wpk/load.rs        io_uring + O_DIRECT loader: disk → VRAM, disk → host-RAM tier, host tier → VRAM
   src/sys.rs             raw syscalls and io_uring, ported from caudal
   src/quant.rs           Q4 weight and Q8 activation layouts, on the CPU
+  src/json.rs            a JSON reader for the files models ship with
+  src/token/mod.rs       the tokenizer: Gemma's BPE with byte fallback, stored ready to use, streaming detokenizer
+  src/token/chat.rs      Gemma 4's chat template, coded by hand
   src/ptx/mod.rs         the GPU kernels, generated as PTX text: quantizers, residual norm, embedding lookup
   src/ptx/gemv.rs        the Q4 × Q8 decode GEMV
   src/ptx/attend.rs      decode attention: QK norms, RoPE, KV cache, split over positions, merged by the last block
   src/ptx/sample.rs      sampling on the GPU: greedy, temperature, top-k, top-p, min-p, penalty, allowed tokens
-  tests/                 GPU tests (feature `gpu`) and their PTX kernels
+  tests/                 tests; GPU ones behind feature `gpu`, model-file ones behind `models`
+  tests/fixtures/        tokenizer fixtures: 10,000 strings and the reference token IDs
   benches/               machine ceilings and the bench harness
 crates/tachyon-cli/      the `tachyon` command
 bench/results/<machine>/ benchmark baselines, one directory per machine
@@ -59,6 +63,16 @@ The best code is code not written. Every module has a line budget (`budget.txt`)
 7. `ptxas` on every PTX file for sm_80, sm_86, sm_89 and sm_90, when installed
 
 Tools: `pip install lizard`, and for `ptxas` without the CUDA Toolkit, `pip install nvidia-cuda-nvcc-cu12`.
+
+## Tests with model files
+
+Tests and benches behind the `models` feature read model files from `$TACHYON_MODELS`, a directory holding, for now, `gemma-4-E4B-it/tokenizer.json`. The reference token IDs in `tests/fixtures` come from Hugging Face `tokenizers` through `scripts/fixture.py`, run once and committed.
+
+```sh
+hf download google/gemma-4-E4B-it tokenizer.json chat_template.jinja --local-dir ~/models/gemma-4-E4B-it
+TACHYON_MODELS=~/models cargo test -p tachyon --features models --test token
+TACHYON_MODELS=~/models cargo bench -p tachyon --bench token
+```
 
 ## Tests and benchmarks on a GPU
 
@@ -83,7 +97,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 2 | Weight file format and `io_uring` loader | done |
 | 3 | 4-bit GEMV kernel at ≥ 90% of VRAM bandwidth | done |
 | 4 | Remaining decode kernels | done |
-| 5 | Tokenizer and chat template | |
+| 5 | Tokenizer and chat template | built; speed gate pending on your machines |
 | 6 | Gemma 4 E4B text generation | |
 | 7 | Prefill on tensor cores | |
 | 8 | Residency, keep-alive, model switching | |

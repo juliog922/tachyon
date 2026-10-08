@@ -6,6 +6,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Added
 
+- `tachyon::token`: the tokenizer. `Tokenizer::from_json` reads a Hugging Face `tokenizer.json` (BPE with byte fallback, as Gemma uses), `to_bytes`/`from_bytes` store and load it ready to use; `encode` matches `tokenizers` exactly on 10,000 strings in 34 languages, emoji and code, and cuts the text where no merge can cross. `Detokenizer` emits whole characters as tokens arrive. `Chat` is Gemma 4's chat template coded by hand, with the system turn and thinking switch; turn markers enter only by ID, so text cannot forge them.
+- `tachyon::json`: a JSON reader for model files.
+- `token` benchmark, with the step-5 exit gate; `scripts/fixture.py`, which makes the tokenizer fixtures.
 - `tachyon::quant`: Q4 weights (groups of 64, f16 scale, zero point 8, packed for `dp4a`) and Q8 activations (blocks of 32 with their sums), and exact f16 conversion.
 - `tachyon::ptx`: kernels generated as PTX text for `sm_80`+: `quant_q8`, and `gemv_q4`, the decode matrix-vector product, Q4 × Q8 with `dp4a`, one warp per row and every load of a short row in flight at once.
 - `tachyon::ptx`: the rest of the decode kernels. `norm_q8`, the residual add with RMS normalization and the next input's Q8; `geglu_q8`, the GELU-gated activation into Q8; `embed_q4`, a Q4 embedding row from VRAM or pinned host memory; `attend_256` and `attend_512`, decode attention with query and key norms, RoPE (including Gemma 4's proportional RoPE through `ptx::rope`), an `f16` key-value cache as a sliding window or global, shared caches, and positions split across blocks; `sample`, greedy or exact sampling with temperature, top-k, top-p, min-p, repetition penalty, an allowed-token mask and logit soft-capping, set through `ptx::Sampling` in device memory.
