@@ -23,6 +23,10 @@ pub enum Error {
     Ptx(String),
     /// A driver call failed with this `CUresult` code.
     Cuda(i32),
+    /// A file operation failed with this `errno`.
+    Io(i32),
+    /// A file is not a valid `.wpk`, or its contents do not match their checksums.
+    Format(String),
 }
 
 /// `Result` with [`Error`].
@@ -37,11 +41,23 @@ impl fmt::Display for Error {
             Error::OutOfRange => f.write_str("a copy reaches past the end of a buffer"),
             Error::Ptx(log) => write!(f, "the driver rejected the PTX: {log}"),
             Error::Cuda(code) => write!(f, "CUDA error {code} ({})", crate::cuda::error_name(*code)),
+            Error::Io(errno) => write!(f, "{}", std::io::Error::from_raw_os_error(*errno)),
+            Error::Format(why) => write!(f, "invalid weight file: {why}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Error {
+        const EIO: i32 = 5;
+        match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::Format("the file ends early".into()),
+            _ => Error::Io(e.raw_os_error().unwrap_or(EIO)),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

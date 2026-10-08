@@ -6,4 +6,8 @@
 # cuda: raised from 350 in step 1 (38 driver signatures, one safe method each).
 430      crates/tachyon/src/cuda
 450      crates/tachyon/src/lib.rs crates/tachyon/src/error.rs
+# wpk: raised from 300 in step 2 (format, checked index, writer, CRC32C, verify, and a loader with three paths).
+360      crates/tachyon/src/wpk
+# sys: raised from 150 in step 2 (the io_uring ABI structs are declared field by field).
+165      crates/tachyon/src/sys.rs
 500      crates/tachyon-cli/src

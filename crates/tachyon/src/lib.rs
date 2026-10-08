@@ -13,13 +13,16 @@
 //!
 //! # Status
 //!
-//! Development step 1 of the spec: [`cuda`], the driver layer every later
-//! module builds on. The inference API comes in later steps.
+//! Development step 2 of the spec: [`cuda`], the driver layer every later
+//! module builds on, and [`wpk`], the weight file format and its loader. The
+//! inference API comes in later steps.
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("tachyon targets x86_64 Linux only");
 
 pub mod cuda;
 mod error;
+mod sys;
+pub mod wpk;
 
 pub use error::{Error, Result};
