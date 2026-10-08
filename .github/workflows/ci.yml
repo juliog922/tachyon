@@ -1,0 +1,15 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+      - run: pip install --user lizard nvidia-cuda-nvcc-cu12 && echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
+      - run: echo "$(python3 -c 'import nvidia.cuda_nvcc, os; print(os.path.dirname(nvidia.cuda_nvcc.__file__))')/bin" >> "$GITHUB_PATH"
+      - run: ./ci.sh
