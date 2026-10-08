@@ -12,6 +12,8 @@
 // Each bench includes this module and uses part of it.
 #![allow(dead_code)]
 
+pub mod gpu;
+
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
