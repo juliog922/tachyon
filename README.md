@@ -4,7 +4,7 @@ An embedded inference engine for NVIDIA GPUs, written in Rust with zero dependen
 
 Tachyon runs a fixed catalog of open-weight models (Gemma 4, Laya, Granite embeddings) inside your process, at the speed the GPU's memory bandwidth allows, and switches between them in tenths of a second. It needs only `libc` and the NVIDIA driver's `libcuda.so.1`, loaded at run time: no CUDA Toolkit, no crates, no Python.
 
-> **Status: step 4 of 14.** The CUDA driver layer, the weight file loader and the 4-bit decode kernel are done: one Gemma 4 E4B token's matrix-vector products stream at 96% (RTX 3060 Laptop) and 98% (L40S) of the measured VRAM bandwidth. Model inference arrives in later steps; see the roadmap below.
+> **Status: step 5 of 14.** The CUDA driver layer, the weight file loader and the 4-bit decode kernel are done: one Gemma 4 E4B token's matrix-vector products stream at 96% (RTX 3060 Laptop) and 98% (L40S) of the measured VRAM bandwidth. The rest of the decode kernels (normalization, gated activation, embeddings, attention, sampling) are done and tested on the GPU; step 6 fuses them into a decode step. Model inference arrives in later steps; see the roadmap below.
 
 ## Requirements
 
@@ -34,7 +34,10 @@ crates/tachyon/          the library
   src/wpk/load.rs        io_uring + O_DIRECT loader: disk → VRAM, disk → host-RAM tier, host tier → VRAM
   src/sys.rs             raw syscalls and io_uring, ported from caudal
   src/quant.rs           Q4 weight and Q8 activation layouts, on the CPU
-  src/ptx/mod.rs         the GPU kernels, generated as PTX text: the Q8 quantizer and the Q4 × Q8 GEMV
+  src/ptx/mod.rs         the GPU kernels, generated as PTX text: quantizers, residual norm, embedding lookup
+  src/ptx/gemv.rs        the Q4 × Q8 decode GEMV
+  src/ptx/attend.rs      decode attention: QK norms, RoPE, KV cache, split over positions, merged by the last block
+  src/ptx/sample.rs      sampling on the GPU: greedy, temperature, top-k, top-p, min-p, penalty, allowed tokens
   tests/                 GPU tests (feature `gpu`) and their PTX kernels
   benches/               machine ceilings and the bench harness
 crates/tachyon-cli/      the `tachyon` command
@@ -64,9 +67,10 @@ cargo test --workspace --features tachyon/gpu
 cargo bench -p tachyon --features gpu --bench machine
 cargo bench -p tachyon --features gpu --bench load
 cargo bench -p tachyon --features gpu --bench gemv
+cargo bench -p tachyon --features gpu --bench decode
 ```
 
-The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate. The `load` bench writes a test `.wpk` sized to the machine (to `$TACHYON_BENCH_DIR`, default `target/bench`; put it on the disk models load from) and checks the step-2 gate: a staged disk → VRAM load reaches 90% of the slower of the disk and PCIe. The `gemv` bench runs the decode kernel on every Gemma 4 E4B projection and checks the step-3 gate: one token's projections, weighted by the bytes each reads, stream at 90% of the measured VRAM read bandwidth.
+The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate. The `load` bench writes a test `.wpk` sized to the machine (to `$TACHYON_BENCH_DIR`, default `target/bench`; put it on the disk models load from) and checks the step-2 gate: a staged disk → VRAM load reaches 90% of the slower of the disk and PCIe. The `gemv` bench runs the decode kernel on every Gemma 4 E4B projection and checks the step-3 gate: one token's projections, weighted by the bytes each reads, stream at 90% of the measured VRAM read bandwidth. The `decode` bench times every other decode kernel per launch and reports one token's worth of them against a decode step whose GEMVs run at that bandwidth.
 
 Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=1`; later runs fail when a median is more than 3% slower. The machine name is `$TACHYON_BENCH_MACHINE`, else the host name. For stable numbers, lock the GPU clocks (`nvidia-smi -lgc`) and keep laptops on AC power.
 
@@ -78,7 +82,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 1 | CUDA driver layer | done |
 | 2 | Weight file format and `io_uring` loader | done |
 | 3 | 4-bit GEMV kernel at ≥ 90% of VRAM bandwidth | done |
-| 4 | Remaining decode kernels | |
+| 4 | Remaining decode kernels | done |
 | 5 | Tokenizer and chat template | |
 | 6 | Gemma 4 E4B text generation | |
 | 7 | Prefill on tensor cores | |
