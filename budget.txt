@@ -5,11 +5,12 @@
 # limit  paths
 # cuda: raised from 350 in step 1 (38 driver signatures, one safe method each).
 430      crates/tachyon/src/cuda
-450      crates/tachyon/src/lib.rs crates/tachyon/src/error.rs
+450      crates/tachyon/src/lib.rs crates/tachyon/src/error.rs crates/tachyon/src/json.rs
 # wpk: raised from 300 in step 2 (format, checked index, writer, CRC32C, verify, a loader with three paths, page-cache choice).
 375      crates/tachyon/src/wpk
 # sys: raised from 150 in step 2 (the io_uring ABI structs, and the page-cache residency probe).
 175      crates/tachyon/src/sys.rs
 1800     crates/tachyon/src/ptx
 300      crates/tachyon/src/quant.rs
+500      crates/tachyon/src/token
 500      crates/tachyon-cli/src
