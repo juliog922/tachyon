@@ -10,4 +10,6 @@
 375      crates/tachyon/src/wpk
 # sys: raised from 150 in step 2 (the io_uring ABI structs, and the page-cache residency probe).
 175      crates/tachyon/src/sys.rs
+1800     crates/tachyon/src/ptx
+300      crates/tachyon/src/quant.rs
 500      crates/tachyon-cli/src

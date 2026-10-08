@@ -31,7 +31,7 @@ fi
 
 if command -v ptxas > /dev/null; then
     step PTX
-    for ptx in $(find crates -name '*.ptx'); do
+    for ptx in $(find crates target/ptx -name '*.ptx'); do
         for arch in sm_80 sm_86 sm_89 sm_90; do ptxas -arch="$arch" "$ptx" -o /dev/null; done
     done
 fi
