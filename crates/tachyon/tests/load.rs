@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use tachyon::Error;
 use tachyon::cuda::{Context, DevBuf};
-use tachyon::wpk::{CHUNK, Dtype, Loader, Wpk, Writer};
+use tachyon::wpk::{CHUNK, Dtype, Loader, Reads, Wpk, Writer};
 
 /// A two-tensor file whose first tensor spans `len` bytes, enough chunks to reuse every staging slot.
 fn sample(name: &str, len: usize) -> (PathBuf, Vec<u8>) {
@@ -29,7 +29,7 @@ fn device_bytes(ctx: &Context, buf: &DevBuf) -> Vec<u8> {
 fn check(wpk: &Wpk, arena: &[u8], bytes: &[u8]) {
     for t in wpk.tensors() {
         let at = t.offset as usize;
-        assert!(arena[at..at + t.len as usize] == bytes[..t.len as usize], "tensor {} (direct: {})", t.name, wpk.is_direct());
+        assert!(arena[at..at + t.len as usize] == bytes[..t.len as usize], "tensor {} ({:?})", t.name, wpk.reads());
     }
 }
 
@@ -38,8 +38,8 @@ fn disk_to_device_direct_and_buffered() {
     let ctx = Context::new(0).unwrap();
     let mut loader = Loader::new(&ctx).unwrap();
     let (path, bytes) = sample("device", 6 * CHUNK + 777);
-    for direct in [true, false] {
-        let wpk = Wpk::open_with(&path, direct).unwrap();
+    for reads in [Reads::Direct, Reads::Cached, Reads::Auto] {
+        let wpk = Wpk::open_with(&path, reads).unwrap();
         let arena = ctx.alloc(wpk.data_len()).unwrap();
         loader.to_device(&wpk, &arena).unwrap();
         check(&wpk, &device_bytes(&ctx, &arena), &bytes);
