@@ -9,7 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
-      - run: pip install --user lizard nvidia-cuda-nvcc-cu12 && echo "$(python3 -m site --user-base)/bin" >> "$GITHUB_PATH"
-      - run: echo "$(python3 -c 'import nvidia.cuda_nvcc, os; print(os.path.dirname(nvidia.cuda_nvcc.__file__))')/bin" >> "$GITHUB_PATH"
+      - run: pip install lizard nvidia-cuda-nvcc-cu12
+      - run: echo "$(python -c 'import nvidia.cuda_nvcc as m; print(m.__path__[0])')/bin" >> "$GITHUB_PATH"
       - run: ./ci.sh
