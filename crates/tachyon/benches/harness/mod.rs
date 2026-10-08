@@ -9,6 +9,9 @@
 //! the suite. `TACHYON_BENCH_SAVE=1` stores the run as the new baseline. The
 //! machine is `$TACHYON_BENCH_MACHINE`, else the host name.
 
+// Each bench includes this module and uses part of it.
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
