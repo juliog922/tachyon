@@ -9,6 +9,13 @@
 //!
 //! **Q8 activations.** A vector, a multiple of [`BLOCK`] long, as `i8` values and, per block of 32, the pair
 //! `[s, s·Σq]` with `x ≈ q·s`. The sum lets a kernel apply the weights' zero point of 8 once per block.
+//!
+//! **Sources.** [`Safetensors`] reads the checkpoints models ship as, rows at a time, as `f32`.
+
+use crate::json::Json;
+use crate::wpk::Dtype;
+use crate::{Error, Result};
+use std::os::unix::fs::FileExt;
 
 /// Weights per Q4 scale.
 pub const GROUP: usize = 64;
@@ -89,6 +96,85 @@ pub fn f16_value(h: u16) -> f32 {
         31 => f32::from_bits(sign | 0x7f80_0000 | man << 13),
         _ => f32::from_bits(sign | (exp + 112) << 23 | man << 13),
     }
+}
+
+/// A model's `.safetensors` files: each a little-endian header length, a JSON header naming every tensor's type,
+/// shape and byte range, then the data. Tensors are read on demand, so a checkpoint larger than memory converts.
+pub struct Safetensors {
+    files: Vec<std::fs::File>,
+    tensors: std::collections::HashMap<String, (usize, Dtype, Vec<usize>, u64)>,
+}
+
+impl Safetensors {
+    /// Opens every `.safetensors` file in `dir`.
+    pub fn open(dir: &std::path::Path) -> Result<Safetensors> {
+        let mut st = Safetensors { files: Vec::new(), tensors: std::collections::HashMap::new() };
+        let mut paths: Vec<_> =
+            std::fs::read_dir(dir)?.filter_map(|e| Some(e.ok()?.path())).filter(|p| p.extension().is_some_and(|e| e == "safetensors")).collect();
+        paths.sort();
+        for path in paths {
+            let file = std::fs::File::open(&path)?;
+            let (head, data) = header(&file)?;
+            for (name, t) in head.obj().unwrap_or_default() {
+                if let Some((dtype, shape, start)) = entry(t) {
+                    st.tensors.insert(name.clone(), (st.files.len(), dtype, shape, data + start));
+                }
+            }
+            st.files.push(file);
+        }
+        Ok(st)
+    }
+
+    /// Whether the checkpoint has tensor `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    /// The prefix before `name` in this checkpoint: a multimodal one nests its decoder.
+    pub fn prefix(&self, name: &str) -> &'static str {
+        ["model.language_model.", "model.", ""].into_iter().find(|p| self.has(&format!("{p}{name}"))).unwrap_or_default()
+    }
+
+    /// Rows and columns of tensor `name`: the last dimension is a row; a scalar is one row of one.
+    pub fn dims(&self, name: &str) -> Result<(usize, usize)> {
+        let shape = &self.tensors.get(name).ok_or_else(|| bad(name))?.2;
+        let cols = shape.last().copied().unwrap_or(1);
+        Ok((shape.iter().product::<usize>() / cols.max(1), cols))
+    }
+
+    /// Rows `rows` of tensor `name` as `f32`.
+    pub fn rows(&self, name: &str, rows: std::ops::Range<usize>) -> Result<Vec<f32>> {
+        let (file, dtype, _, start) = self.tensors.get(name).ok_or_else(|| bad(name))?;
+        let (size, cols) = (dtype.size() as usize, self.dims(name)?.1);
+        let mut raw = vec![0; rows.len() * cols * size];
+        self.files[*file].read_exact_at(&mut raw, start + (rows.start * cols * size) as u64)?;
+        Ok(match dtype {
+            Dtype::F32 => raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            Dtype::F16 => raw.chunks_exact(2).map(|b| f16_value(u16::from_le_bytes([b[0], b[1]]))).collect(),
+            _ => raw.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect(),
+        })
+    }
+}
+
+/// A file's JSON header, and where its data starts.
+fn header(file: &std::fs::File) -> Result<(Json, u64)> {
+    let mut len = [0; 8];
+    file.read_exact_at(&mut len, 0)?;
+    let mut head = vec![0; usize::try_from(u64::from_le_bytes(len)).map_err(|_| bad("header"))?];
+    file.read_exact_at(&mut head, 8)?;
+    Ok((Json::parse(&head)?, 8 + head.len() as u64))
+}
+
+/// A header entry's type, shape and data offset; `None` for `__metadata__` and types other than floats.
+fn entry(t: &Json) -> Option<(Dtype, Vec<usize>, u64)> {
+    let types = [("BF16", Dtype::BF16), ("F16", Dtype::F16), ("F32", Dtype::F32)];
+    let dtype = types.into_iter().find(|&(n, _)| Some(n) == t.get("dtype").and_then(Json::str))?.1;
+    let shape = t.get("shape")?.arr()?.iter().map(|d| d.num().unwrap_or(0.0) as usize).collect();
+    Some((dtype, shape, t.get("data_offsets")?.arr()?.first()?.num()? as u64))
+}
+
+fn bad(name: &str) -> Error {
+    Error::Format(format!("safetensors: {name} is missing or damaged"))
 }
 
 #[cfg(test)]

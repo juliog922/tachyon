@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Added
 
+- `tachyon::model::Decoder`: Gemma 4 on the GPU. One decode step (embedding, per-layer inputs, 42 layers of sliding or global attention with shared caches, LM head, sampler) is recorded once as a CUDA Graph; the token goes in and comes out through one pinned host word, so the CPU only waits. Tested against a CPU reference that matches Hugging Face transformers to 1e-5, on a generated tiny Gemma 4. `tachyon run <model> <prompt>` answers a prompt greedily and reports the speed.
+- `tachyon::model`: Gemma 4's decoder configuration and `convert`, which turns a Hugging Face checkpoint into a model directory: Q4 weights for VRAM with query/key/value and gate/up fused, the per-layer embedding table for pinned host memory, the stored tokenizer. `tachyon convert <checkpoint> <model>` runs it. `tachyon::quant::Safetensors` reads checkpoints a slice of rows at a time, so a checkpoint larger than memory converts.
 - `tachyon::token`: the tokenizer. `Tokenizer::from_json` reads a Hugging Face `tokenizer.json` (BPE with byte fallback, as Gemma uses), `to_bytes`/`from_bytes` store and load it ready to use; `encode` matches `tokenizers` exactly on 10,000 strings in 34 languages, emoji and code, and cuts the text where no merge can cross. `Detokenizer` emits whole characters as tokens arrive. `Chat` is Gemma 4's chat template coded by hand, with the system turn and thinking switch; turn markers enter only by ID, so text cannot forge them.
 - `tachyon::json`: a JSON reader for model files.
 - `token` benchmark, with the step-5 exit gate; `scripts/fixture.py`, which makes the tokenizer fixtures.

@@ -1,6 +1,6 @@
 //! Helpers the GPU tests share: a context with the kernels loaded, copies, and seeded values.
 // Each test file uses part of this module; the Q8 check compares a stored product exactly, as the kernel computes it.
-#![allow(dead_code, clippy::float_cmp)]
+#![allow(dead_code, clippy::float_cmp, clippy::many_single_char_names)]
 
 use tachyon::cuda::{Context, DevBuf, Module, Stream};
 
@@ -55,6 +55,8 @@ impl Gpu {
         self.download(buf).chunks_exact(2).map(|c| u16::from_ne_bytes(c.try_into().unwrap())).collect()
     }
 }
+
+pub mod tiny;
 
 /// Plain numbers viewed as their bytes.
 pub fn bytes<T: Copy>(v: &[T]) -> &[u8] {

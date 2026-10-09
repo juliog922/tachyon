@@ -24,6 +24,7 @@ compile_error!("tachyon targets x86_64 Linux only");
 pub mod cuda;
 mod error;
 pub mod json;
+pub mod model;
 pub mod ptx;
 pub mod quant;
 mod sys;

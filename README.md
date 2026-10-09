@@ -33,7 +33,9 @@ crates/tachyon/          the library
   src/wpk/mod.rs         the .wpk weight file: writer, checked index, CRC32C verification
   src/wpk/load.rs        io_uring + O_DIRECT loader: disk → VRAM, disk → host-RAM tier, host tier → VRAM
   src/sys.rs             raw syscalls and io_uring, ported from caudal
-  src/quant.rs           Q4 weight and Q8 activation layouts, on the CPU
+  src/quant.rs           Q4 weight and Q8 activation layouts on the CPU; the safetensors reader
+  src/model/mod.rs       Gemma 4's decoder: configuration, checkpoint conversion
+  src/model/decode.rs    the decode step as one CUDA Graph: every layer's kernels, KV caches, sampling
   src/json.rs            a JSON reader for the files models ship with
   src/token/mod.rs       the tokenizer: Gemma's BPE with byte fallback, stored ready to use, streaming detokenizer
   src/token/chat.rs      Gemma 4's chat template, coded by hand

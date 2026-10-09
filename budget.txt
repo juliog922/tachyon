@@ -13,4 +13,5 @@
 1800     crates/tachyon/src/ptx
 300      crates/tachyon/src/quant.rs
 500      crates/tachyon/src/token
+900      crates/tachyon/src/model
 500      crates/tachyon-cli/src
