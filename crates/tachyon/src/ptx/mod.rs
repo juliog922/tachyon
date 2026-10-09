@@ -51,9 +51,49 @@ pub const NORM_THREADS: u32 = 256;
 
 /// Every kernel, as one PTX module.
 pub fn module() -> String {
-    let kernels = [quant(QUANT_Q8, ""), quant(GEGLU_Q8, GELU), norm(), EMBED.into(), gemv::gemv_q4(UNROLL), attend::attend(256), attend::attend(512)];
+    let pf = |k: String, last: &str| prefetching(&k, last);
+    let (quant, geglu, norm) = (pf(quant(QUANT_Q8, ""), "plen)"), pf(quant(GEGLU_Q8, GELU), "plen)"), pf(norm(), "pscale)"));
+    let kernels = [quant, geglu, norm, EMBED.into(), gemv::gemv_q4(UNROLL), pf(attend::attend(256), "ps)"), pf(attend::attend(512), "ps)")];
     kernels.iter().fold(String::from(".version 7.1\n.target sm_80\n.address_size 64\n"), |m, k| m + "\n" + k) + &sample::sample()
 }
+
+/// `kernel` with two more parameters, `pf: u64` and `pf_len: u64`, and a first step that has every thread of the grid
+/// prefetch into L2 its share of the `pf_len` bytes at `pf`, one 128-byte line at a time, without waiting for them.
+/// `last` ends the kernel's parameter list.
+fn prefetching(kernel: &str, last: &str) -> String {
+    let k = kernel.replacen(last, &format!("{}, .param .u64 ppf, .param .u64 ppfn)", &last[..last.len() - 1]), 1);
+    let body = k.find("\n{").map_or(0, |i| i + 2);
+    format!("{}{PREFETCH}{}", &k[..body], &k[body..])
+}
+
+/// The prefetch step of [`prefetching`].
+const PREFETCH: &str = "
+    .reg .pred %zp;
+    .reg .b32 %z<4>;
+    .reg .b64 %za, %zo, %zn, %zs, %zx;
+    ld.param.u64 %za, [ppf];
+    ld.param.u64 %zn, [ppfn];
+    mov.u32 %z0, %ctaid.y;
+    mov.u32 %z1, %nctaid.x;
+    mov.u32 %z2, %ctaid.x;
+    mad.lo.u32 %z0, %z0, %z1, %z2;
+    mov.u32 %z2, %nctaid.y;
+    mul.lo.u32 %z1, %z1, %z2;
+    mov.u32 %z2, %ntid.x;
+    mul.lo.u32 %z1, %z1, %z2;
+    mov.u32 %z3, %tid.x;
+    mad.lo.u32 %z0, %z0, %z2, %z3;
+    mul.wide.u32 %zo, %z0, 128;
+    mul.wide.u32 %zs, %z1, 128;
+PREFETCH:
+    setp.ge.u64 %zp, %zo, %zn;
+    @%zp bra PREFETCHED;
+    add.u64 %zx, %za, %zo;
+    prefetch.global.L2 [%zx];
+    add.u64 %zo, %zo, %zs;
+    bra PREFETCH;
+PREFETCHED:
+";
 
 /// Five butterfly steps that leave `op` of `x` over the warp in every lane; `t` is scratch.
 fn warp(op: &str, x: &str, t: &str) -> String {

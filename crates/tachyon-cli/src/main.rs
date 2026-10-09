@@ -62,7 +62,7 @@ fn run(dir: &std::path::Path, prompt: &str) -> tachyon::Result<()> {
     let mut ids = Vec::new();
     chat.encode(&tok, &[Message { role: Role::User, text: prompt }], false, &mut ids);
     let ctx = cuda::Context::new(0)?;
-    let mut dec = Decoder::open(&ctx, dir, 4096)?;
+    let mut dec = Decoder::open(&ctx, dir, &tachyon::model::Settings::default())?;
     let start = std::time::Instant::now();
     let first = ids.iter().map(|&t| dec.step(t)).last().unwrap_or(Ok(0))?;
     let (prefill, mid) = (start.elapsed(), std::time::Instant::now());

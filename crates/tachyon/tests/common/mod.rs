@@ -58,6 +58,9 @@ impl Gpu {
 
 pub mod tiny;
 
+/// A null pointer or zero length: the prefetch arguments of a launch that prefetches nothing.
+pub static NONE: u64 = 0;
+
 /// Plain numbers viewed as their bytes.
 pub fn bytes<T: Copy>(v: &[T]) -> &[u8] {
     // SAFETY: plain numbers, viewed as their bytes for the length of the borrow.

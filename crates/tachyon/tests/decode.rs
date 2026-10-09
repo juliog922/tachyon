@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Gpu, assert_q8, values};
+use common::{Gpu, NONE, assert_q8, values};
 use tachyon::cuda::{DevBuf, arg};
 use tachyon::ptx::{ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, NORM_Q8, NORM_THREADS, QUANT_Q8, rope};
 use tachyon::quant::{f16_bits, f16_value, q4, q8};
@@ -34,14 +34,14 @@ fn geglu_gates_then_quantizes() {
     let (a, b): (Vec<f32>, Vec<f32>) = (values(n, 1).iter().map(|x| 6.0 * x).collect(), values(n, 2));
     let (ad, bd, out) = (gpu.upload(&a), gpu.upload(&b), q8_out(&gpu, n));
     let (pa, pb, pq, ps, len) = (ad.ptr(), bd.ptr(), out.0.ptr(), out.1.ptr(), n as u32);
-    // SAFETY: five arguments of the kernel's types; the outputs hold `n` values.
+    // SAFETY: seven arguments of the kernel's types (no prefetch); the outputs hold `n` values.
     unsafe {
         gpu.stream.launch(
             &gpu.module.function(GEGLU_Q8).unwrap(),
             [len.div_ceil(256), 1, 1],
             [256, 1, 1],
             0,
-            &[arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len)],
+            &[arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len), arg(&NONE), arg(&NONE)],
         )
     }
     .unwrap();
@@ -73,8 +73,9 @@ impl Norm<'_> {
         let (pq, ps) = (ptr(out.as_ref().map(|o| &o.0)), ptr(out.as_ref().map(|o| &o.1)));
         let (len, chunks) = (self.len as u32, (self.h.len() / self.len) as u32);
         let grid = [len / NORM_THREADS, chunks, 1];
-        let args = [arg(&ph), arg(&pho), arg(&py), arg(&pw1), arg(&pw2), arg(&pq), arg(&ps), arg(&len), arg(&self.eps), arg(&self.scale)];
-        // SAFETY: ten arguments of the kernel's types; every buffer holds `chunks × len` values or one chunk of weights.
+        let args =
+            [arg(&ph), arg(&pho), arg(&py), arg(&pw1), arg(&pw2), arg(&pq), arg(&ps), arg(&len), arg(&self.eps), arg(&self.scale), arg(&NONE), arg(&NONE)];
+        // SAFETY: twelve arguments of the kernel's types (no prefetch); every buffer holds `chunks × len` values or one chunk of weights.
         unsafe { gpu.stream.launch(&gpu.module.function(NORM_Q8).unwrap(), grid, [NORM_THREADS, 1, 1], 0, &args) }.unwrap();
         assert_eq!(gpu.floats(&h), self.h, "the input is left alone");
         (gpu.floats(&ho), out.map(|o| q8_read(gpu, &o)))
@@ -147,9 +148,15 @@ fn norm_without_inputs_quantizes_exactly_as_quant_q8() {
     let x = gpu.upload(&h);
     let out = q8_out(&gpu, n);
     let (px, pq, ps, len) = (x.ptr(), out.0.ptr(), out.1.ptr(), n as u32);
-    // SAFETY: four arguments of the kernel's types; the outputs hold `n` values.
+    // SAFETY: six arguments of the kernel's types (no prefetch); the outputs hold `n` values.
     unsafe {
-        gpu.stream.launch(&gpu.module.function(QUANT_Q8).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&px), arg(&pq), arg(&ps), arg(&len)])
+        gpu.stream.launch(
+            &gpu.module.function(QUANT_Q8).unwrap(),
+            [len.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &[arg(&px), arg(&pq), arg(&ps), arg(&len), arg(&NONE), arg(&NONE)],
+        )
     }
     .unwrap();
     assert_eq!(q8_read(&gpu, &out), (q, s));
@@ -237,10 +244,12 @@ impl Attend {
             arg(&pcount),
             arg(&pq),
             arg(&ps),
+            arg(&NONE),
+            arg(&NONE),
         ];
         let f = gpu.module.function(if d == 256 { ATTEND_256 } else { ATTEND_512 }).unwrap();
         for _ in 0..times {
-            // SAFETY: thirteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
+            // SAFETY: fifteen arguments of the kernel's types (no prefetch), every buffer sized as the kernel's documentation gives.
             unsafe { gpu.stream.launch(&f, [KV as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }.unwrap();
         }
         assert_eq!(gpu.words(&count), [0; KV], "the counters are left at zero");

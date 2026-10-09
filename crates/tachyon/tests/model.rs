@@ -59,7 +59,7 @@ fn tiny_model_decodes_as_the_reference() {
     let dst = src.join("out");
     convert(&src, &dst).unwrap();
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, 64).unwrap();
+    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64, prefetch: None }).unwrap();
     dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
     let tokens: Vec<u32> = (0..20).map(|i| (i * 797 + 11) % tiny::VOCAB as u32).collect();
     let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();

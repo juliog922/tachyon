@@ -4,6 +4,9 @@ use super::Suite;
 use std::time::Duration;
 use tachyon::cuda::{Context, DevBuf, Event, Graph, Module, Stream, arg};
 
+/// A null pointer or zero length: the prefetch arguments of a launch that prefetches nothing.
+pub static NONE: u64 = 0;
+
 const PROBE: &str = include_str!("../../tests/kernels/probe.ptx");
 
 /// GPU 0 with every kernel loaded, a stream, and two timing events.

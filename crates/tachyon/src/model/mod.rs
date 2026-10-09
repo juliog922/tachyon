@@ -10,7 +10,7 @@
 
 mod decode;
 
-pub use decode::Decoder;
+pub use decode::{Decoder, Settings};
 
 use crate::json::Json;
 use crate::quant::{Safetensors, q4};

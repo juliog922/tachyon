@@ -53,6 +53,21 @@ struct Mat {
     cols: u32,
 }
 
+/// How a [`Decoder`] is set up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    /// Positions the global layers' caches hold.
+    pub context: usize,
+    /// Bytes of the next matrix each small kernel prefetches into L2; `None` is half the GPU's L2.
+    pub prefetch: Option<usize>,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings { context: 4096, prefetch: None }
+    }
+}
+
 /// A model loaded on the GPU, with its decode step recorded.
 pub struct Decoder {
     graph: Graph,
@@ -151,12 +166,14 @@ impl Weights<'_> {
 
 impl Decoder {
     /// Loads the model directory `dir` (see [`super::convert`]) onto `ctx`'s GPU, with room for `context` positions.
-    pub fn open(ctx: &Context, dir: &Path, context: usize) -> Result<Decoder> {
+    pub fn open(ctx: &Context, dir: &Path, settings: &Settings) -> Result<Decoder> {
+        let context = settings.context;
         let (stream, module, mut loader) = (ctx.stream()?, ctx.load(&crate::ptx::module())?, Loader::new(ctx)?);
         let (cfg, [wpk, hpk], weights, host, scalars) = load(ctx, dir, &mut loader)?;
         let (token, ctl, arena, b) = scratch(ctx, &stream, &cfg, context)?;
         let (w, hw) = (Weights { wpk: &wpk, base: weights.ptr() }, Weights { wpk: &hpk, base: host.device_ptr()? });
-        let ops = step(&cfg, [&w, &hw], &b, &scalars, ctx.info().sms);
+        let mut ops = step(&cfg, [&w, &hw], &b, &scalars, ctx.info().sms);
+        prefetch(&mut ops, settings.prefetch.unwrap_or(ctx.info().l2 as usize / 2) as u64);
         let graph = stream.capture(|s| ops.iter().try_for_each(|op| launch(s, &module, op)))?;
         let done = ctx.event(false)?;
         let mut dec = Decoder { graph, cfg, stream, done, token, control: ctl, arena, logits: b.logits, loader, _keep: (module, weights, host) };
@@ -214,6 +231,19 @@ fn scratch(ctx: &Context, stream: &Stream, cfg: &Config, context: usize) -> Resu
     let (mut b, _) = layout(cfg, context, arena.ptr());
     (b.control, b.token) = (at.map(|at| ctl.ptr() + at as u64), token.device_ptr()?);
     Ok((token, ctl, arena, b))
+}
+
+/// Gives every kernel that can prefetch (see [`crate::ptx`]) the first `budget` bytes of the next matrix's weights to
+/// fetch into L2 while it runs, so VRAM keeps streaming across the kernel boundaries of a step.
+fn prefetch(ops: &mut [Op], budget: u64) {
+    let mut next = [0, 0];
+    for (name, _, _, args) in ops.iter_mut().rev() {
+        match (*name, args.first(), args.get(5..7)) {
+            (GEMV_Q4, Some(&A::P(w)), Some(&[A::U(rows), A::U(cols)])) => next = [w, (u64::from(rows) * u64::from(cols) / 2).min(budget)],
+            (NORM_Q8 | GEGLU_Q8 | ATTEND_256 | ATTEND_512, ..) => args.extend(next.map(A::P)),
+            _ => {}
+        }
+    }
 }
 
 /// Each layer's `layer_scalar`, read from the file.

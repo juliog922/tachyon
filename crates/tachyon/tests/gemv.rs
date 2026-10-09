@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Gpu, values};
+use common::{Gpu, NONE, values};
 use tachyon::cuda::{DevBuf, arg};
 use tachyon::ptx::{GEMV_Q4, GEMV_ROWS, QUANT_Q8};
 use tachyon::quant::{Q4, f16_value, q4, q8};
@@ -18,9 +18,15 @@ const SHAPES: [(usize, usize); 7] = [(512, 2560), (512, 2048), (512, 4096), (256
 fn gpu_q8(gpu: &Gpu, x: &[f32]) -> (DevBuf, DevBuf, Vec<u8>, Vec<f32>) {
     let (xd, q, s) = (gpu.upload(x), gpu.zeros(x.len()), gpu.zeros(x.len() / 4));
     let (px, pq, ps, len) = (xd.ptr(), q.ptr(), s.ptr(), x.len() as u32);
-    // SAFETY: four arguments of the kernel's types; `q` and `s` hold `len` bytes and `len / 32` pairs.
+    // SAFETY: six arguments of the kernel's types (no prefetch); `q` and `s` hold `len` bytes and `len / 32` pairs.
     unsafe {
-        gpu.stream.launch(&gpu.module.function(QUANT_Q8).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&px), arg(&pq), arg(&ps), arg(&len)])
+        gpu.stream.launch(
+            &gpu.module.function(QUANT_Q8).unwrap(),
+            [len.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+            &[arg(&px), arg(&pq), arg(&ps), arg(&len), arg(&NONE), arg(&NONE)],
+        )
     }
     .unwrap();
     let (qv, sv) = (gpu.download(&q), gpu.floats(&s));
