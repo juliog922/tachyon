@@ -5,28 +5,23 @@
 
 mod common;
 
-use common::{Gpu, NONE, values};
+use common::{Gpu, values};
 use tachyon::cuda::{DevBuf, arg};
-use tachyon::ptx::{GEMV_Q4, GEMV_ROWS, QUANT_Q8};
+use tachyon::ptx::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, QUANT_Q8};
 use tachyon::quant::{Q4, f16_value, q4, q8};
 
 /// Every column count of a Gemma 4 E4B decode projection (only `cols` changes the kernel's path; rows only add
-/// warps), and edge shapes: rows not a multiple of the block, one group, and fewer chunks than lanes.
-const SHAPES: [(usize, usize); 7] = [(512, 2560), (512, 2048), (512, 4096), (256, 10240), (37, 2560), (5, 64), (3, 192)];
+/// warps), and edge shapes: rows not a multiple of the block, one group, and fewer chunks than lanes. Rows of at most
+/// 256 weights, in a multiple of 4, run on [`GEMV_Q4_NARROW`].
+const SHAPES: [(usize, usize); 9] = [(512, 2560), (512, 2048), (512, 4096), (256, 10240), (37, 2560), (5, 64), (3, 192), (2560, 256), (36, 64)];
 
 /// Quantizes `x` on the GPU; returns the device buffers and their contents.
 fn gpu_q8(gpu: &Gpu, x: &[f32]) -> (DevBuf, DevBuf, Vec<u8>, Vec<f32>) {
     let (xd, q, s) = (gpu.upload(x), gpu.zeros(x.len()), gpu.zeros(x.len() / 4));
     let (px, pq, ps, len) = (xd.ptr(), q.ptr(), s.ptr(), x.len() as u32);
-    // SAFETY: six arguments of the kernel's types (no prefetch); `q` and `s` hold `len` bytes and `len / 32` pairs.
+    // SAFETY: four arguments of the kernel's types; `q` and `s` hold `len` bytes and `len / 32` pairs.
     unsafe {
-        gpu.stream.launch(
-            &gpu.module.function(QUANT_Q8).unwrap(),
-            [len.div_ceil(256), 1, 1],
-            [256, 1, 1],
-            0,
-            &[arg(&px), arg(&pq), arg(&ps), arg(&len), arg(&NONE), arg(&NONE)],
-        )
+        gpu.stream.launch(&gpu.module.function(QUANT_Q8).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&px), arg(&pq), arg(&ps), arg(&len)])
     }
     .unwrap();
     let (qv, sv) = (gpu.download(&q), gpu.floats(&s));
@@ -39,8 +34,9 @@ fn gpu_gemv(gpu: &Gpu, w: &Q4, x: &[f32], rows: usize) -> Vec<f32> {
     let (wd, sd, y) = (gpu.upload(&w.packed), gpu.upload(&w.scales), gpu.zeros(rows * 4));
     let (pw, pws, pq, ps, py, n, k) = (wd.ptr(), sd.ptr(), q.ptr(), s.ptr(), y.ptr(), rows as u32, x.len() as u32);
     let args = [arg(&pw), arg(&pws), arg(&pq), arg(&ps), arg(&py), arg(&n), arg(&k)];
+    let (f, grid) = if k <= 256 && n % 4 == 0 { (GEMV_Q4_NARROW, n.div_ceil(16)) } else { (GEMV_Q4, n.div_ceil(GEMV_ROWS)) };
     // SAFETY: seven arguments of the kernel's types; every buffer has the size the layout gives for `n × k`.
-    unsafe { gpu.stream.launch(&gpu.module.function(GEMV_Q4).unwrap(), [n.div_ceil(GEMV_ROWS), 1, 1], [32 * GEMV_ROWS, 1, 1], 0, &args) }.unwrap();
+    unsafe { gpu.stream.launch(&gpu.module.function(f).unwrap(), [grid, 1, 1], [32 * GEMV_ROWS, 1, 1], 0, &args) }.unwrap();
     gpu.floats(&y)
 }
 

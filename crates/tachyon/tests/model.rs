@@ -59,7 +59,7 @@ fn tiny_model_decodes_as_the_reference() {
     let dst = src.join("out");
     convert(&src, &dst).unwrap();
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64, prefetch: None }).unwrap();
+    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64 }).unwrap();
     dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
     let tokens: Vec<u32> = (0..20).map(|i| (i * 797 + 11) % tiny::VOCAB as u32).collect();
     let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();
@@ -71,5 +71,24 @@ fn tiny_model_decodes_as_the_reference() {
         assert!(err <= 0.04 * scale, "position {pos}: logits differ by {err} RMS (logits {scale} RMS)");
         assert!(want[picked] >= want[best] - 3.0 * err, "position {pos}: picked {picked} ({}), reference {best} ({})", want[picked], want[best]);
     }
+    // Generating with a step always queued gives the same tokens as stepping one at a time.
+    let mut runs = [Vec::new(), Vec::new()];
+    for (i, run) in runs.iter_mut().enumerate() {
+        dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
+        let mut token = dec.step(tokens[0]).unwrap();
+        run.push(token);
+        if i == 0 {
+            dec.generate(token, |t| {
+                run.push(t);
+                run.len() < 5
+            })
+            .unwrap();
+        }
+        while run.len() < 5 {
+            token = dec.step(token).unwrap();
+            run.push(token);
+        }
+    }
+    assert_eq!(runs[0], runs[1], "queued generation and single steps agree");
     std::fs::remove_dir_all(src).unwrap();
 }

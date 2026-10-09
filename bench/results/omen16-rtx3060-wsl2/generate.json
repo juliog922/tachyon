@@ -1,0 +1,5 @@
+[
+{"name":"vram read ceiling, 4 blocks/SM","median_ns":3324896,"p99_ns":3350528,"rate":322.940,"unit":"GB/s","cycles":14160557,"instructions":12272235,"cache_misses":716,"page_faults":0},
+{"name":"vram read ceiling, 8 blocks/SM","median_ns":3309536,"p99_ns":3352576,"rate":324.439,"unit":"GB/s","cycles":13960343,"instructions":12184106,"cache_misses":464,"page_faults":0},
+{"name":"decode","median_ns":9353213,"p99_ns":9587153,"rate":106.915,"unit":"tok/s","cycles":64,"instructions":14,"cache_misses":1,"page_faults":0}
+]

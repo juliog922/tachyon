@@ -1,9 +1,11 @@
 //! One decode step of Gemma 4 on the GPU, recorded once as a CUDA Graph and replayed per token.
 //!
-//! A step reads the input token from pinned host memory, embeds it, runs every layer and samples the next token,
-//! which the sampler writes back to that same host word: the next replay continues from it with no copy, and the
-//! CPU only waits for the step to end. To feed a prompt, the CPU writes each prompt token there before a replay.
-//! The sampler's step counter is the position, so attention reads it from the same place.
+//! A step reads the input token from a word of pinned host memory, embeds it, runs every layer and samples the next
+//! token, which the sampler writes to a second word. The step is recorded twice with the words swapped, and steps
+//! alternate between the recordings: each continues from the token the last one wrote, with no copy, so the next
+//! step is queued while one runs and the GPU never waits for the CPU, which reads each token from its word. To feed
+//! a prompt, the CPU writes each prompt token before a step. The sampler's step counter is the position, so
+//! attention reads it from the same place.
 //!
 //! Per layer, each kernel writes what the next one reads, activations as Q8 ([`crate::ptx`] lists them):
 //!
@@ -23,7 +25,10 @@
 use super::Config;
 use crate::Result;
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Stream, arg};
-use crate::ptx::{ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE, SAMPLE_THREADS, Sampling, rope};
+use crate::ptx::{
+    ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE, SAMPLE_THREADS, SPIN,
+    Sampling, rope,
+};
 use crate::wpk::{ALIGN, Loader, Wpk};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -39,7 +44,7 @@ enum A {
 /// What [`load`] returns: configuration, `weights.wpk` and `host.wpk`, their memory, the layer scalars.
 type Loaded = (Config, [Wpk; 2], DevBuf, HostBuf, Vec<f32>);
 
-/// What [`scratch`] returns: the token word, the control buffer, the arena, and the buffers laid out in them.
+/// What [`scratch`] returns: the token words, the control buffer, the arena, and the buffers laid out in them.
 type Scratch = (HostBuf, DevBuf, DevBuf, Bufs);
 
 /// A kernel launch: name, grid, threads per block, arguments.
@@ -58,28 +63,28 @@ struct Mat {
 pub struct Settings {
     /// Positions the global layers' caches hold.
     pub context: usize,
-    /// Bytes of the next matrix each small kernel prefetches into L2; `None` is half the GPU's L2.
-    pub prefetch: Option<usize>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { context: 4096, prefetch: None }
+        Settings { context: 4096 }
     }
 }
 
 /// A model loaded on the GPU, with its decode step recorded.
 pub struct Decoder {
-    graph: Graph,
+    graphs: Vec<Graph>,
     cfg: Config,
     stream: Stream,
-    done: Event,
-    token: HostBuf,
+    done: Vec<Event>,
+    tokens: HostBuf,
     control: DevBuf,
     arena: DevBuf,
     logits: u64,
     loader: Loader,
-    _keep: (crate::cuda::Module, DevBuf, HostBuf),
+    ops: Vec<Op>,
+    module: crate::cuda::Module,
+    _keep: (DevBuf, HostBuf),
 }
 
 /// Device addresses of the step's buffers.
@@ -99,7 +104,8 @@ struct Bufs {
     context: u32,
     /// In the control buffer: step counter and token, sampling settings, the two RoPE tables, seen tokens.
     control: [u64; 5],
-    token: u64,
+    /// The token a step reads, and the one it writes: two words of pinned host memory.
+    token: [u64; 2],
 }
 
 /// Lays the step's buffers out from `base`, and returns them with the bytes they take.
@@ -123,7 +129,7 @@ fn layout(cfg: &Config, context: usize, base: u64) -> (Bufs, usize) {
         })
         .collect();
     let kv = (0..l).map(|i| caches[cfg.source(i)]).collect();
-    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context: context as u32, control: [0; 5], token: 0 };
+    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context: context as u32, control: [0; 5], token: [0; 2] };
     (bufs, end)
 }
 
@@ -170,13 +176,18 @@ impl Decoder {
         let context = settings.context;
         let (stream, module, mut loader) = (ctx.stream()?, ctx.load(&crate::ptx::module())?, Loader::new(ctx)?);
         let (cfg, [wpk, hpk], weights, host, scalars) = load(ctx, dir, &mut loader)?;
-        let (token, ctl, arena, b) = scratch(ctx, &stream, &cfg, context)?;
+        let (tokens, ctl, arena, mut b) = scratch(ctx, &stream, &cfg, context)?;
         let (w, hw) = (Weights { wpk: &wpk, base: weights.ptr() }, Weights { wpk: &hpk, base: host.device_ptr()? });
-        let mut ops = step(&cfg, [&w, &hw], &b, &scalars, ctx.info().sms);
-        prefetch(&mut ops, settings.prefetch.unwrap_or(ctx.info().l2 as usize / 2) as u64);
-        let graph = stream.capture(|s| ops.iter().try_for_each(|op| launch(s, &module, op)))?;
-        let done = ctx.event(false)?;
-        let mut dec = Decoder { graph, cfg, stream, done, token, control: ctl, arena, logits: b.logits, loader, _keep: (module, weights, host) };
+        // Two recordings with the token words traded: steps alternate between them, so one can be queued while the
+        // other runs and the CPU reads each token from its own word.
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            steps.push(step(&cfg, [&w, &hw], &b, &scalars, ctx.info().sms));
+            b.token.reverse();
+        }
+        let (graphs, done) = record(&stream, &module, &steps)?;
+        let ops = steps.swap_remove(0);
+        let mut dec = Decoder { graphs, cfg, stream, done, tokens, control: ctl, arena, logits: b.logits, loader, ops, module, _keep: (weights, host) };
         dec.reset(&Sampling::default())?;
         Ok(dec)
     }
@@ -193,12 +204,80 @@ impl Decoder {
 
     /// Runs one step on `token` at the next position and returns the token sampled after it.
     pub fn step(&mut self, token: u32) -> Result<u32> {
-        self.token.copy_from_slice(&token.to_ne_bytes());
-        // SAFETY: the graph reads and writes only buffers this decoder owns, laid out for it when it was recorded.
-        unsafe { self.stream.replay(&self.graph) }?;
-        self.stream.record(&self.done)?;
-        self.done.sync()?;
-        Ok(u32::from_ne_bytes([self.token[0], self.token[1], self.token[2], self.token[3]]))
+        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        self.queue(0)?;
+        self.done[0].sync()?;
+        Ok(self.token(0))
+    }
+
+    /// Generates from `token` at the next position, handing each sampled token to `next` until it returns false.
+    /// One step is always queued behind the running one, so the GPU never waits for the CPU. The token `next`
+    /// refuses has still been fed to the model by the step queued behind it, whose own sample is dropped: the
+    /// sequence continues after the refused token.
+    pub fn generate(&mut self, token: u32, mut next: impl FnMut(u32) -> bool) -> Result<()> {
+        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        self.queue(0)?;
+        for i in 0.. {
+            self.queue((i + 1) % 2)?;
+            self.done[i % 2].sync()?;
+            if !next(self.token(i % 2)) {
+                break;
+            }
+        }
+        self.stream.sync()
+    }
+
+    /// Queues recording `g`, which writes token word `g`, and marks its end.
+    fn queue(&self, g: usize) -> Result<()> {
+        // SAFETY: the graphs read and write only buffers this decoder owns, laid out for them when they were recorded.
+        unsafe { self.stream.replay(&self.graphs[g]) }?;
+        self.stream.record(&self.done[g])
+    }
+
+    /// Token word `g`.
+    fn token(&self, g: usize) -> u32 {
+        u32::from_ne_bytes([self.tokens[4 * g], self.tokens[4 * g + 1], self.tokens[4 * g + 2], self.tokens[4 * g + 3]])
+    }
+
+    /// Every kind of kernel in the step (its name; for a matrix product with its shape), how many run, and the time
+    /// of a graph of only those kernels, as the step records them (the mean of 20 replays): what each kind costs
+    /// alone, with no other kernel and no CPU in the way.
+    pub fn alone(&self) -> Result<Vec<(String, usize, std::time::Duration)>> {
+        let mut kinds: Vec<(String, usize, std::time::Duration)> = Vec::new();
+        for op in &self.ops {
+            match kinds.iter_mut().find(|k| k.0 == kind(op)) {
+                Some(k) => k.1 += 1,
+                None => kinds.push((kind(op), 1, std::time::Duration::ZERO)),
+            }
+        }
+        let [start, end] = [self.stream.context().event(true)?, self.stream.context().event(true)?];
+        for (name, _, t) in &mut kinds {
+            let ops: Vec<Op> = self.ops.iter().filter(|op| kind(op) == *name).cloned().collect();
+            let graph = self.stream.capture(|s| ops.iter().try_for_each(|op| launch(s, &self.module, op)))?;
+            // SAFETY: as in `step`: the graph uses only this decoder's buffers.
+            let replay = |n| (0..n).try_for_each(|_| unsafe { self.stream.replay(&graph) });
+            replay(3).and_then(|()| self.stream.record(&start)).and_then(|()| replay(20)).and_then(|()| self.stream.record(&end))?;
+            end.sync()?;
+            *t = std::time::Duration::from_secs_f64(f64::from(end.since(&start)?) / 2e4);
+        }
+        Ok(kinds)
+    }
+
+    /// Runs one step on `token` kernel by kernel, each timed on the GPU, and returns every kernel's kind (its name;
+    /// for a matrix product with its shape) and time, in order. A [`SPIN`] kernel first holds the GPU while the CPU
+    /// queues the whole step, so the kernels run back to back, as in the recorded step, each with its launch gap.
+    pub fn timeline(&mut self, token: u32) -> Result<Vec<(String, std::time::Duration)>> {
+        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        let marks = (0..=self.ops.len()).map(|_| self.stream.context().event(true)).collect::<Result<Vec<_>>>()?;
+        launch(&self.stream, &self.module, &(SPIN, [1, 1], 32, vec![A::P(50_000_000)]))?;
+        self.stream.record(&marks[0])?;
+        for (op, mark) in self.ops.iter().zip(&marks[1..]) {
+            launch(&self.stream, &self.module, op)?;
+            self.stream.record(mark)?;
+        }
+        marks[self.ops.len()].sync()?;
+        let time = |m: &[Event]| m[1].since(&m[0]).map(|ms| std::time::Duration::from_secs_f64(f64::from(ms) / 1e3));
+        self.ops.iter().zip(marks.windows(2)).map(|(op, m)| Ok((kind(op), time(m)?))).collect()
     }
 
     /// The last step's logits, before soft-capping.
@@ -223,26 +302,22 @@ fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded> {
     Ok((cfg, [wpk, hpk], weights, host, scalars))
 }
 
-/// The token word, the control buffer and the arena, and the step's buffers in them.
+/// The token words, the control buffer and the arena, and the step's buffers in them.
 fn scratch(ctx: &Context, stream: &Stream, cfg: &Config, context: usize) -> Result<Scratch> {
     let (ctl, at) = control(cfg, &Sampling::default());
-    let (token, ctl, arena) = (ctx.alloc_host(4)?, ctx.alloc(ctl.len())?, ctx.alloc(layout(cfg, context, 0).1)?);
+    let (tokens, ctl, arena) = (ctx.alloc_host(8)?, ctx.alloc(ctl.len())?, ctx.alloc(layout(cfg, context, 0).1)?);
     stream.fill(&arena, 0)?;
     let (mut b, _) = layout(cfg, context, arena.ptr());
-    (b.control, b.token) = (at.map(|at| ctl.ptr() + at as u64), token.device_ptr()?);
-    Ok((token, ctl, arena, b))
+    let word = tokens.device_ptr()?;
+    (b.control, b.token) = (at.map(|at| ctl.ptr() + at as u64), [word + 4, word]);
+    Ok((tokens, ctl, arena, b))
 }
 
-/// Gives every kernel that can prefetch (see [`crate::ptx`]) the first `budget` bytes of the next matrix's weights to
-/// fetch into L2 while it runs, so VRAM keeps streaming across the kernel boundaries of a step.
-fn prefetch(ops: &mut [Op], budget: u64) {
-    let mut next = [0, 0];
-    for (name, _, _, args) in ops.iter_mut().rev() {
-        match (*name, args.first(), args.get(5..7)) {
-            (GEMV_Q4, Some(&A::P(w)), Some(&[A::U(rows), A::U(cols)])) => next = [w, (u64::from(rows) * u64::from(cols) / 2).min(budget)],
-            (NORM_Q8 | GEGLU_Q8 | ATTEND_256 | ATTEND_512, ..) => args.extend(next.map(A::P)),
-            _ => {}
-        }
+/// The kind of `op`: its kernel, or for a matrix product its shape.
+fn kind(op: &Op) -> String {
+    match (op.0, op.3.get(5..7)) {
+        (name, Some(&[A::U(rows), A::U(cols)])) if name.starts_with("gemv") => format!("{name} {rows}×{cols}"),
+        (name, _) => name.into(),
     }
 }
 
@@ -257,6 +332,12 @@ fn scalars(path: &Path, wpk: &Wpk, layers: usize) -> Result<Vec<f32>> {
             Ok(f32::from_le_bytes(v))
         })
         .collect()
+}
+
+/// Each of `steps` recorded as a graph, and an event per graph to mark its end.
+fn record(stream: &Stream, module: &crate::cuda::Module, steps: &[Vec<Op>]) -> Result<(Vec<Graph>, Vec<Event>)> {
+    let graphs = steps.iter().map(|ops| stream.capture(|s| ops.iter().try_for_each(|op| launch(s, module, op)))).collect::<Result<_>>()?;
+    Ok((graphs, steps.iter().map(|_| stream.context().event(false)).collect::<Result<_>>()?))
 }
 
 /// Records `op` on the capturing stream `s`.
@@ -277,7 +358,7 @@ fn launch(s: &Stream, m: &crate::cuda::Module, (name, grid, threads, args): &Op)
 /// `y = M·x`, reading the Q8 input `q`.
 fn gemv(m: Mat, q: [u64; 2], y: u64) -> Op {
     let args = vec![A::P(m.w[0]), A::P(m.w[1]), A::P(q[0]), A::P(q[1]), A::P(y), A::U(m.rows), A::U(m.cols)];
-    (GEMV_Q4, [m.rows.div_ceil(GEMV_ROWS), 1], 32 * GEMV_ROWS, args)
+    if m.cols <= 256 { (GEMV_Q4_NARROW, [m.rows.div_ceil(16), 1], 128, args) } else { (GEMV_Q4, [m.rows.div_ceil(GEMV_ROWS), 1], 32 * GEMV_ROWS, args) }
 }
 
 /// [`NORM_Q8`] on `p = [h, h_out, y, w1, w2]` over `shape = [len, chunks]` with `k = [eps, scale]`:
@@ -301,8 +382,8 @@ fn embed(m: Mat, token: u64, out: u64, scale: f32) -> Op {
 fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u32) -> Vec<Op> {
     let (h, pl, l, eps) = (cfg.hidden, cfg.per_layer, cfg.layers(), cfg.eps);
     let mut ops = vec![
-        embed(w.mat("embed"), b.token, b.x[0], bf16((h as f32).sqrt())),
-        embed(hw.mat("embed_per_layer"), b.token, b.ple, (pl as f32).sqrt()),
+        embed(w.mat("embed"), b.token[0], b.x[0], bf16((h as f32).sqrt())),
+        embed(hw.mat("embed_per_layer"), b.token[0], b.ple, (pl as f32).sqrt()),
         norm([b.x[0], 0, 0, 0, 0], b.q, [h, 1], [eps, 1.0]),
         gemv(w.mat("per_layer_proj"), b.q, b.proj),
         // rmsnorm(c·y) is rmsnorm(y) with eps / c²: the projection's 1/√hidden scale folds into eps.
@@ -317,7 +398,7 @@ fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u3
     let blocks = sms.min((cfg.vocab as u32).div_ceil(4 * SAMPLE_THREADS));
     let [state, sampling, .., seen] = b.control;
     let args = [b.logits, b.work].map(A::P).into_iter().chain([A::U(cfg.vocab as u32)]);
-    ops.push((SAMPLE, [blocks, 1], SAMPLE_THREADS, args.chain([sampling, state, seen, b.token, b.partial[1], b.count[1]].map(A::P)).collect()));
+    ops.push((SAMPLE, [blocks, 1], SAMPLE_THREADS, args.chain([sampling, state, seen, b.token[1], b.partial[1], b.count[1]].map(A::P)).collect()));
     ops
 }
 

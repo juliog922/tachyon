@@ -80,13 +80,20 @@ fn run(dir: &std::path::Path, prompt: &str) -> tachyon::Result<()> {
 /// Prints the text of `first` and the tokens after it until `end` or 512 tokens; returns how many it printed.
 fn generate(dec: &mut Decoder, tok: &Tokenizer, first: u32, end: u32) -> tachyon::Result<usize> {
     use std::io::Write as _;
-    let (mut next, mut text, mut detok, mut count) = (first, String::new(), Detokenizer::default(), 0);
-    while next != end && next != 1 && count < 512 {
-        detok.push(tok, next, &mut text);
-        print!("{text}");
-        std::io::stdout().flush()?;
-        text.clear();
-        (next, count) = (dec.step(next)?, count + 1);
+    let (mut text, mut detok, mut count) = (String::new(), Detokenizer::default(), 0);
+    let mut show = |t: u32| {
+        let more = t != end && t != 1 && count < 512;
+        if more {
+            detok.push(tok, t, &mut text);
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+            text.clear();
+            count += 1;
+        }
+        more
+    };
+    if show(first) {
+        dec.generate(first, &mut show)?;
     }
     detok.finish(&mut text);
     println!("{text}");

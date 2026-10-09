@@ -15,7 +15,7 @@
 mod harness;
 
 use harness::Suite;
-use harness::gpu::{Gpu, NONE, token_bytes};
+use harness::gpu::{Gpu, token_bytes};
 use std::process::ExitCode;
 use std::time::Duration;
 use tachyon::cuda::{DevBuf, Stream, arg};
@@ -46,8 +46,8 @@ fn norm(gpu: &Gpu, suite: &mut Suite, len: u32, chunks: u32) -> Duration {
     let [ph, pho, py, pw, pq, ps] = [&h, &ho, &y, &w, &q, &s].map(DevBuf::ptr);
     let (eps, scale, f) = (1e-6f32, 1f32, gpu.module.function(NORM_Q8).unwrap());
     per_launch(gpu, suite, &format!("norm {len}×{chunks}"), LAUNCHES, |st, _| {
-        let args = [arg(&ph), arg(&pho), arg(&py), arg(&pw), arg(&pw), arg(&pq), arg(&ps), arg(&len), arg(&eps), arg(&scale), arg(&NONE), arg(&NONE)];
-        // SAFETY: twelve arguments of the kernel's types (no prefetch); every buffer holds `len × chunks` values.
+        let args = [arg(&ph), arg(&pho), arg(&py), arg(&pw), arg(&pw), arg(&pq), arg(&ps), arg(&len), arg(&eps), arg(&scale)];
+        // SAFETY: ten arguments of the kernel's types; every buffer holds `len × chunks` values.
         unsafe { st.launch(&f, [len / NORM_THREADS, chunks, 1], [NORM_THREADS, 1, 1], 0, &args) }
     })
 }
@@ -58,8 +58,8 @@ fn geglu(gpu: &Gpu, suite: &mut Suite, len: u32) -> Duration {
     let (a, q, s) = (gpu.filled(8 * n, 0x3c), gpu.filled(n, 0), gpu.filled(n / 4, 0));
     let (pa, pb, pq, ps, f) = (a.ptr(), a.ptr() + 4 * n as u64, q.ptr(), s.ptr(), gpu.module.function(GEGLU_Q8).unwrap());
     per_launch(gpu, suite, &format!("geglu {len}"), LAUNCHES, |st, _| {
-        // SAFETY: seven arguments of the kernel's types (no prefetch); every buffer holds `len` values.
-        unsafe { st.launch(&f, [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len), arg(&NONE), arg(&NONE)]) }
+        // SAFETY: five arguments of the kernel's types; every buffer holds `len` values.
+        unsafe { st.launch(&f, [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len)]) }
     })
 }
 
@@ -72,7 +72,7 @@ fn embed(gpu: &Gpu, suite: &mut Suite, cols: u32, host: bool) -> Duration {
     let (pw, ps, tok, out) = (base, base + (rows * cols as usize / 2) as u64, gpu.filled(4, 0), gpu.filled(4 * cols as usize, 0));
     let (pt, po, scale, f) = (tok.ptr(), out.ptr(), 1f32, gpu.module.function(EMBED_Q4).unwrap());
     per_launch(gpu, suite, &format!("embed {cols} from {}", if host { "host" } else { "vram" }), LAUNCHES, |st, _| {
-        // SAFETY: six arguments of the kernel's types; the table holds `rows × cols` weights.
+        // SAFETY: four arguments of the kernel's types; the table holds `rows × cols` weights.
         unsafe { st.launch(&f, [cols.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&pw), arg(&ps), arg(&pt), arg(&po), arg(&cols), arg(&scale)]) }
     })
 }
@@ -93,24 +93,8 @@ fn attend(gpu: &Gpu, suite: &mut Suite, d: usize, cap: u32, ctx: u32) -> Duratio
     let name = format!("attend {d}, {} of {cap} positions", ctx.min(cap));
     per_launch(gpu, suite, &name, copies.max(LAUNCHES), |st, i| {
         let (pk, pv, fresh) = (k.ptr() + (i % copies * half) as u64, v.ptr() + (i % copies * half) as u64, 1u32);
-        let args = [
-            arg(&pqkv),
-            arg(&pw),
-            arg(&pw),
-            arg(&pf),
-            arg(&pk),
-            arg(&pv),
-            arg(&pp),
-            arg(&cap),
-            arg(&fresh),
-            arg(&ppart),
-            arg(&pc),
-            arg(&pq),
-            arg(&ps),
-            arg(&NONE),
-            arg(&NONE),
-        ];
-        // SAFETY: fifteen arguments of the kernel's types (no prefetch), every buffer sized as the kernel's documentation gives.
+        let args = [arg(&pqkv), arg(&pw), arg(&pw), arg(&pf), arg(&pk), arg(&pv), arg(&pp), arg(&cap), arg(&fresh), arg(&ppart), arg(&pc), arg(&pq), arg(&ps)];
+        // SAFETY: thirteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
         unsafe { st.launch(&f, [KV as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }
     })
 }

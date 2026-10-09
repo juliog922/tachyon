@@ -24,7 +24,8 @@
 //! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`. Arguments:
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
-//! - [`GEMV_Q4`]: see [`gemv`]. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
+//! - [`GEMV_Q4`]: see [`gemv`].
+//! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
 //! Lengths are multiples of 32.
 
@@ -33,7 +34,7 @@ pub mod gemv;
 pub mod sample;
 
 pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_KV, rope};
-pub use gemv::{GEMV_Q4, GEMV_ROWS, UNROLL};
+pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
 
 use std::fmt::Write;
@@ -46,54 +47,27 @@ pub const GEGLU_Q8: &str = "geglu_q8";
 pub const NORM_Q8: &str = "norm_q8";
 /// Name of the embedding lookup.
 pub const EMBED_Q4: &str = "embed_q4";
+/// Name of the kernel that holds the GPU for `ns: u64` nanoseconds (one thread), so that work queued behind it then
+/// runs back to back: for profiling.
+pub const SPIN: &str = "spin";
 /// Threads per block of [`NORM_Q8`].
 pub const NORM_THREADS: u32 = 256;
 
 /// Every kernel, as one PTX module.
 pub fn module() -> String {
-    let pf = |k: String, last: &str| prefetching(&k, last);
-    let (quant, geglu, norm) = (pf(quant(QUANT_Q8, ""), "plen)"), pf(quant(GEGLU_Q8, GELU), "plen)"), pf(norm(), "pscale)"));
-    let kernels = [quant, geglu, norm, EMBED.into(), gemv::gemv_q4(UNROLL), pf(attend::attend(256), "ps)"), pf(attend::attend(512), "ps)")];
+    let kernels = [
+        quant(QUANT_Q8, ""),
+        quant(GEGLU_Q8, GELU),
+        norm(),
+        EMBED.into(),
+        gemv::gemv_q4(UNROLL, 32),
+        gemv::gemv_q4(UNROLL, 8),
+        attend::attend(256),
+        attend::attend(512),
+        SPIN_PTX.into(),
+    ];
     kernels.iter().fold(String::from(".version 7.1\n.target sm_80\n.address_size 64\n"), |m, k| m + "\n" + k) + &sample::sample()
 }
-
-/// `kernel` with two more parameters, `pf: u64` and `pf_len: u64`, and a first step that has every thread of the grid
-/// prefetch into L2 its share of the `pf_len` bytes at `pf`, one 128-byte line at a time, without waiting for them.
-/// `last` ends the kernel's parameter list.
-fn prefetching(kernel: &str, last: &str) -> String {
-    let k = kernel.replacen(last, &format!("{}, .param .u64 ppf, .param .u64 ppfn)", &last[..last.len() - 1]), 1);
-    let body = k.find("\n{").map_or(0, |i| i + 2);
-    format!("{}{PREFETCH}{}", &k[..body], &k[body..])
-}
-
-/// The prefetch step of [`prefetching`].
-const PREFETCH: &str = "
-    .reg .pred %zp;
-    .reg .b32 %z<4>;
-    .reg .b64 %za, %zo, %zn, %zs, %zx;
-    ld.param.u64 %za, [ppf];
-    ld.param.u64 %zn, [ppfn];
-    mov.u32 %z0, %ctaid.y;
-    mov.u32 %z1, %nctaid.x;
-    mov.u32 %z2, %ctaid.x;
-    mad.lo.u32 %z0, %z0, %z1, %z2;
-    mov.u32 %z2, %nctaid.y;
-    mul.lo.u32 %z1, %z1, %z2;
-    mov.u32 %z2, %ntid.x;
-    mul.lo.u32 %z1, %z1, %z2;
-    mov.u32 %z3, %tid.x;
-    mad.lo.u32 %z0, %z0, %z2, %z3;
-    mul.wide.u32 %zo, %z0, 128;
-    mul.wide.u32 %zs, %z1, 128;
-PREFETCH:
-    setp.ge.u64 %zp, %zo, %zn;
-    @%zp bra PREFETCHED;
-    add.u64 %zx, %za, %zo;
-    prefetch.global.L2 [%zx];
-    add.u64 %zo, %zo, %zs;
-    bra PREFETCH;
-PREFETCHED:
-";
 
 /// Five butterfly steps that leave `op` of `x` over the warp in every lane; `t` is scratch.
 fn warp(op: &str, x: &str, t: &str) -> String {
@@ -329,6 +303,23 @@ fn norm() -> String {
 }
 
 /// [`EMBED_Q4`]: thread `i` decodes weight `i` of row `token`, as [`crate::quant`] packs it.
+/// [`SPIN`].
+const SPIN_PTX: &str = "
+.visible .entry spin(.param .u64 pns)
+{
+    .reg .pred %p;
+    .reg .b64 %t0, %t, %n;
+    ld.param.u64 %n, [pns];
+    mov.u64 %t0, %globaltimer;
+WAIT:
+    mov.u64 %t, %globaltimer;
+    sub.u64 %t, %t, %t0;
+    setp.lt.u64 %p, %t, %n;
+    @%p bra WAIT;
+    ret;
+}
+";
+
 const EMBED: &str = "
 .visible .entry embed_q4(.param .u64 pw, .param .u64 ps, .param .u64 ptok, .param .u64 py, .param .u32 pcols, .param .f32 pscale)
 {

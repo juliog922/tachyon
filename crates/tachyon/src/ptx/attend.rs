@@ -16,8 +16,9 @@
 //! The cache is `f16 [Hkv][cap][D]`, keys and values in separate buffers. Arguments: `qkv, qn, kn, freq:
 //! *const f32, k_cache, v_cache: *mut f16, pos: *const u32, cap: u32, fresh: u32, partial: *mut f32, count:
 //! *mut u32`, Q8 out (`H × D` values). Launch a grid of `(Hkv, S)` blocks of `32 · ATTEND_WARPS` threads, `S ≤
-//! 256`: the positions in the cache are split evenly over the `S` blocks of each key-value head, whatever the
-//! context, and the block that finishes last for its head merges the others' partial results. Blocks of
+//! 256`: the positions in the cache are split evenly over the `S` blocks of each key-value head, at least 24 per
+//! block (so a short context uses few blocks, and they have little to merge), and the block that finishes last for
+//! its head merges the others' partial results. Blocks of
 //! [`ATTEND_256`] fit two per multiprocessor and those of [`ATTEND_512`] one, so one wave is `S = 2·SMs / Hkv`
 //! or `SMs / Hkv`. `partial` holds
 //! `Hkv · S · (8 + 4·D)` floats of scratch; `count` holds `Hkv` counters, zero before the first launch and left
@@ -50,16 +51,6 @@ fn ld32(s: &mut String, reg: &str, first: usize, addr: &str, off: usize, n: usiz
     for m in (0..n).step_by(4) {
         let r = first + m;
         let _ = writeln!(s, "    ld.global.v4.f32 {{%{reg}{r}, %{reg}{}, %{reg}{}, %{reg}{}}}, [{addr}+{}];", r + 1, r + 2, r + 3, off + 4 * m);
-    }
-}
-
-/// `e` registers `%{reg}0..` loaded from `f16` at `[{addr}]`.
-fn ld16(s: &mut String, reg: &str, addr: &str, e: usize) {
-    for m in (0..e).step_by(8) {
-        let _ = writeln!(s, "    ld.global.v4.b32 {{%pk0, %pk1, %pk2, %pk3}}, [{addr}+{}];", 2 * m);
-        for j in 0..8 {
-            let _ = writeln!(s, "    mov.b32 {{%hk0, %hk1}}, %pk{};\n    cvt.f32.f16 %{reg}{}, %hk{};", j / 2, m + j, j % 2);
-        }
     }
 }
 
@@ -146,6 +137,52 @@ fn fresh(s: &mut String, d: usize, e: usize) {
 fn slot(s: &mut String, t: &str, d: usize, e: usize) {
     let _ = writeln!(s, "    mad.lo.u32 %x, %g, %cap, {t};\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;");
     *s += "    mul.wide.u32 %o, %x, 2;\n    add.u64 %a, %kc, %o;\n";
+}
+
+/// Positions per chunk of the cache loop: a chunk's keys and values are loaded at once, so their latencies overlap.
+fn chunk(d: usize) -> usize {
+    if d == 256 { 3 } else { 2 }
+}
+
+/// The cache loop. The fresh token goes first, from registers; then warp `w` takes positions `start + w`,
+/// `start + w + 8`, …, [`chunk`] at a time: it loads every key and value of the chunk, then scores them in order.
+fn positions(s: &mut String, d: usize, e: usize) {
+    let (mut score, c) = (String::new(), chunk(d));
+    step(&mut score, e);
+    *s += "    @!%dofresh bra POSITIONS;\n";
+    fresh(s, d, e);
+    *s += &score;
+    *s += "POSITIONS:\n    add.u32 %t, %start, %warp;\nCHUNK:\n    setp.ge.u32 %p, %t, %end;\n    @%p bra DONE;\n";
+    for k in 0..c {
+        let _ = writeln!(s, "    add.u32 %j, %t, {};\n    setp.lt.u32 %pc{k}, %j, %end;", 8 * k);
+        slot(s, "%j", d, e);
+        raw(s, "%rk", k * e / 2, "%a", e, k);
+        *s += "    add.u64 %a, %vc, %o;\n";
+        raw(s, "%rv", k * e / 2, "%a", e, k);
+    }
+    for k in 0..c {
+        let _ = writeln!(s, "    @!%pc{k} bra NEXT{k};\n    add.u32 %j, %t, {};\n    setp.eq.u32 %p, %j, %skip;\n    @%p bra NEXT{k};", 8 * k);
+        unpack(s, "k", "%rk", k * e / 2, e);
+        unpack(s, "v", "%rv", k * e / 2, e);
+        *s += &score;
+        let _ = writeln!(s, "NEXT{k}:");
+    }
+    let _ = writeln!(s, "    add.u32 %t, %t, {};\n    bra CHUNK;\nDONE:", 8 * c);
+}
+
+/// Loads, under predicate `%pc{k}`, this lane's `e` halves at `[{addr}]` into `{reg}{first}..` as packed pairs.
+fn raw(s: &mut String, reg: &str, first: usize, addr: &str, e: usize, k: usize) {
+    for m in (0..e).step_by(8) {
+        let r = first + m / 2;
+        let _ = writeln!(s, "    @%pc{k} ld.global.v4.b32 {{{reg}{r}, {reg}{}, {reg}{}, {reg}{}}}, [{addr}+{}];", r + 1, r + 2, r + 3, 2 * m);
+    }
+}
+
+/// `e` registers `%{to}0..` from the packed halves `{from}{first}..`.
+fn unpack(s: &mut String, to: &str, from: &str, first: usize, e: usize) {
+    for j in 0..e {
+        let _ = writeln!(s, "    mov.b32 {{%hk0, %hk1}}, {from}{};\n    cvt.f32.f16 %{to}{j}, %hk{};", first + j / 2, j % 2);
+    }
 }
 
 /// One position for every head: score `q·k`, then the online softmax update of `%m`, `%l` and `%acc` with `v`.
@@ -238,6 +275,7 @@ const SETUP: &str = "
     add.u32 %span, %n, %nsp;
     sub.u32 %span, %span, 1;
     div.u32 %span, %span, %nsp;
+    max.u32 %span, %span, 24;
     selp.b32 %skip, %cur, -1, %fresh;
     mul.lo.u32 %start, %spl, %span;
     setp.ge.u32 %p, %start, %n;
@@ -259,32 +297,6 @@ const SETUP: &str = "
     cvta.to.global.u64 %qp, %qp;
     ld.param.u64 %sp, [ps];
     cvta.to.global.u64 %sp, %sp;
-";
-
-/// The cache loop: warp `w` takes positions `start + w`, `start + w + 8`, …; the fresh token goes first.
-const LOOP: &str = "
-    setp.ne.u32 %infresh, %th, %th;
-    @!%dofresh bra POSITIONS;
-FRESH
-    setp.eq.u32 %infresh, %th, %th;
-    bra STEP;
-POSITIONS:
-    setp.ne.u32 %infresh, %th, %th;
-    add.u32 %t, %start, %warp;
-LOOP:
-    setp.ge.u32 %p, %t, %end;
-    @%p bra DONE;
-PREFETCH
-    setp.eq.u32 %p, %t, %skip;
-    @%p bra NEXT;
-LOAD
-STEP:
-SCORE
-    @%infresh bra POSITIONS;
-NEXT:
-    add.u32 %t, %t, 8;
-    bra LOOP;
-DONE:
 ";
 
 /// Warp 0 writes the block's partial result (`STORE`: its sums, from registers); thread 0 counts the block in, with
@@ -386,9 +398,9 @@ pub(super) fn attend(d: usize) -> String {
     .shared .align 16 .f32 sm[32];
     .shared .align 16 .f32 sacc[{}];
     .shared .align 4 .u32 flag;
-    .reg .pred %p, %ps, %fresh, %dofresh, %infresh, %last, %lane0;
+    .reg .pred %p, %ps, %fresh, %dofresh, %last, %lane0, %pc<{}>;
     .reg .b32 %th, %lane, %warp, %g, %spl, %nkv, %nsp, %pos, %cap, %span, %n, %cur, %skip, %start, %end, %active, %t, %x, %j, %s, %h, %old, %gi;
-    .reg .b32 %pk<4>;
+    .reg .b32 %pk<4>, %rk<{}>, %rv<{}>;
     .reg .b16 %hk<2>;
     .reg .f32 %q<{}>, %acc<{}>, %k<{e}>, %v<{e}>, %c<{e}>, %sn<{e}>, %w<{e}>, %m<4>, %l<4>, %cr<4>, %M<4>;
     .reg .f32 %pf, %sgn, %sc, %f, %ft, %mn, %r, %num, %den, %ls, %as;
@@ -396,6 +408,9 @@ pub(super) fn attend(d: usize) -> String {
         // Two blocks per multiprocessor for the smaller heads: register use capped at 128.
         if d == 256 { ".maxntid 256, 1, 1\n.minnctapersm 2\n" } else { "" },
         4 * (4 * d + 4),
+        chunk(d),
+        chunk(d) * e / 2,
+        chunk(d) * e / 2,
         4 * e,
         4 * e,
         SETUP
@@ -403,17 +418,7 @@ pub(super) fn attend(d: usize) -> String {
     angles(&mut s, e);
     queries(&mut s, d, e);
     s += "    setp.eq.u32 %dofresh, %spl, 0;\n    and.pred %dofresh, %dofresh, %fresh;\n    setp.eq.u32 %p, %warp, 0;\n    and.pred %dofresh, %dofresh, %p;\n";
-    let (mut fresh_code, mut load, mut score) = (String::new(), String::new(), String::new());
-    fresh(&mut fresh_code, d, e);
-    slot(&mut load, "%t", d, e);
-    ld16(&mut load, "k", "%a", e);
-    load += "    add.u64 %a, %vc, %o;\n";
-    ld16(&mut load, "v", "%a", e);
-    step(&mut score, e);
-    let mut fetch = format!("    add.u32 %j, %t, {};\n    setp.lt.u32 %p, %j, %end;\n    @!%p bra FETCHED;\n", 4 * ATTEND_WARPS);
-    slot(&mut fetch, "%j", d, e);
-    fetch += "    prefetch.global.L2 [%a];\n    add.u64 %a, %vc, %o;\n    prefetch.global.L2 [%a];\nFETCHED:\n";
-    s += &LOOP.replace("PREFETCH\n", &fetch).replace("FRESH\n", &fresh_code).replace("LOAD\n", &load).replace("SCORE\n", &score);
+    positions(&mut s, d, e);
     merge(&mut s, d, e);
     let stride = 8 + 4 * d;
     let fill = |t: &str| t.replace("STRIDE", &stride.to_string()).replace("LANE", &(4 * e).to_string());
