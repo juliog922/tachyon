@@ -121,7 +121,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 3 | 4-bit GEMV kernel at ≥ 90% of VRAM bandwidth | done |
 | 4 | Remaining decode kernels | done |
 | 5 | Tokenizer and chat template | done |
-| 6 | Gemma 4 E4B text generation | decode at 81% of the roofline on the RTX 3060 Laptop; chat API built |
+| 6 | Gemma 4 E4B text generation | done: 108 tok/s on the RTX 3060 Laptop, 1.45× llama.cpp |
 | 7 | Prefill on tensor cores | |
 | 8 | Residency, keep-alive, model switching | |
 | 9 | `pull`, catalog, conversion | |
