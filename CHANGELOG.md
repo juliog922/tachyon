@@ -6,6 +6,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Changed
 
+- The `generate` bench checks the step-6 gate (≥ 80% of the roofline) on the RTX 3060 only; on other GPUs it prints the figure.
 - Attention gives each block at least 24 positions and loads a chunk of positions' keys and values at once, instead of relying on prefetch hints, which the RTX 3060 ignores: 11 µs → 8 µs per sliding layer at short contexts.
 
 ### Added
