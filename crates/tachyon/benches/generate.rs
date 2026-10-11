@@ -3,7 +3,8 @@
 //! from 85% by the decision of 2026-10-09: one kernel per operation measures 81–83% on the RTX 3060 Laptop, where
 //! Ollama's llama.cpp runs E4B at 61–77 tok/s against Tachyon's 107). The gate is checked on the RTX 3060 only;
 //! elsewhere the figure is information (the L40S measures 77%: small kernels' fixed latency weighs more against its
-//! faster memory). Then shows where a step's time goes, kernel by kernel.
+//! faster memory). Then shows where a step's time goes, kernel by kernel, and the time to first token of prompts
+//! from 64 to 8192 tokens.
 //!
 //! `cargo bench -p tachyon --features gpu --bench generate` uses the converted model in `$TACHYON_MODEL`, by default
 //! `~/.local/share/tachyon/gemma-4-e4b` (`tachyon convert` makes it).
@@ -35,6 +36,26 @@ fn steps(gpu: &Gpu, suite: &mut Suite, dir: &std::path::Path) -> Duration {
     dec.stop().unwrap();
     let mut times = times.into_iter().skip(WARM);
     suite.run("decode", STEPS, || times.next().unwrap_or_default())
+}
+
+/// Time to first token for prompts of 64 to 8192 tokens: prefill of all but the last, then the decode step that
+/// samples the first answer token; printed as milliseconds and prompt tokens per second, to compare with
+/// llama.cpp's `pp` rates (`scripts/llamacpp.sh`).
+fn ttft(gpu: &Gpu, suite: &mut Suite, dir: &std::path::Path) {
+    let mut dec = Decoder::open(&gpu.ctx, dir, &Settings { context: 8192, ..Settings::default() }).unwrap();
+    let vocab = dec.config().vocab as u32;
+    let tokens: Vec<u32> = (0..8192).map(|i| (i * 7919 + 13) % vocab).collect();
+    println!("time to first token:");
+    for n in [64, 256, 512, 1024, 2048, 4096, 8192] {
+        let t = suite.run(&format!("time to first token, {n} tokens"), 5, || {
+            dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
+            let start = Instant::now();
+            dec.prefill(&tokens[..n - 1]).unwrap();
+            dec.step(tokens[n - 1]).unwrap();
+            start.elapsed()
+        });
+        println!("  {n:>5} tokens: {:>8.1} ms, {:>6.0} tok/s", t.as_secs_f64() * 1e3, n as f64 / t.as_secs_f64());
+    }
 }
 
 /// Bytes a matrix product of kind `gemv… {rows}×{cols}` reads: Q4 weights and their f16 scales.
@@ -108,6 +129,7 @@ fn main() -> ExitCode {
     let t = steps(&gpu, &mut suite, &dir);
     suite.rate(1.0 / t.as_secs_f64(), "tok/s");
     profile(&gpu, &dir, roof);
+    ttft(&gpu, &mut suite, &dir);
     println!("{} · read ceiling {roof:.1} GB/s · {:.2} GB of weights per token · roofline {:.1} tok/s", gpu.ctx.info().name, bytes / 1e9, 1.0 / ideal);
     let gated = gpu.ctx.info().name.contains("3060");
     let passed = !gated || ideal / t.as_secs_f64() >= 0.80;

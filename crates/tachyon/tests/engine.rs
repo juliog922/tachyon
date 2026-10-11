@@ -55,7 +55,7 @@ fn answer(engine: &mut Engine, messages: &[Message], max: usize) -> (String, usi
 fn tiny_model_streams_cancels_and_does_not_allocate() {
     let src = common::tiny::checkpoint("engine", 3);
     tachyon::model::convert(&src, &src.join("out")).unwrap();
-    let mut engine = Engine::open(&src.join("out"), &Settings { context: 64 }).unwrap();
+    let mut engine = Engine::open(&src.join("out"), &Settings { context: 64, chunk: 8 }).unwrap();
     let messages = [Message { role: Role::System, text: "Be brief." }, Message { role: Role::User, text: "hello there, how are you" }];
     let (full, tokens) = answer(&mut engine, &messages, 30);
     assert!(tokens > 0 && tokens <= 30, "{tokens} tokens");

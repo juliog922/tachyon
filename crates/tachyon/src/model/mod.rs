@@ -9,6 +9,7 @@
 //! are `f32`.
 
 mod decode;
+mod prefill;
 
 pub use decode::{Decoder, Settings};
 

@@ -72,8 +72,8 @@ impl Engine {
         &self.tok
     }
 
-    /// Feeds the prompt of `req` to the model and returns its answer, as a stream; the prompt is read one token per
-    /// step, so this takes the time of as many steps.
+    /// Feeds the prompt of `req` to the model and returns its answer, as a stream: every prompt token but the last
+    /// through prefill, the last through a decode step, which samples the answer's first token.
     pub fn chat(&mut self, req: &Request<'_>) -> Result<TokenStream<'_>> {
         self.prompt.clear();
         self.chat.encode(&self.tok, req.messages, req.think, &mut self.prompt);
@@ -82,10 +82,9 @@ impl Engine {
             return Err(crate::Error::TooLong { tokens, context });
         }
         self.dec.reset(&req.sampling)?;
-        let mut first = 0;
-        for &t in &self.prompt {
-            first = self.dec.step(t)?;
-        }
+        let (&last, rest) = self.prompt.split_last().unwrap_or((&0, &[]));
+        self.dec.prefill(rest)?;
+        let first = self.dec.step(last)?;
         self.dec.start(first)?;
         let left = req.max_tokens.min(context - tokens);
         Ok(TokenStream { engine: self, detok: Detokenizer::default(), text: String::with_capacity(256), next: Some(first), left, tokens: 0 })

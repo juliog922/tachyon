@@ -23,6 +23,7 @@
 #![allow(clippy::many_single_char_names)]
 
 use super::Config;
+use super::prefill::Chunk;
 use crate::Result;
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Stream, arg};
 use crate::ptx::{
@@ -35,7 +36,7 @@ use std::path::Path;
 
 /// A kernel argument.
 #[derive(Clone, Copy)]
-enum A {
+pub(super) enum A {
     P(u64),
     U(u32),
     F(f32),
@@ -44,18 +45,19 @@ enum A {
 /// What [`load`] returns: configuration, `weights.wpk` and `host.wpk`, their memory, the layer scalars.
 type Loaded = (Config, [Wpk; 2], DevBuf, HostBuf, Vec<f32>);
 
-/// What [`scratch`] returns: the token words, the control buffer, the arena, and the buffers laid out in them.
-type Scratch = (HostBuf, DevBuf, DevBuf, Bufs);
+/// What [`scratch`] returns: the token words and prefill's IDs, the control buffer, the arena, and the buffers laid
+/// out in them.
+type Scratch = ([HostBuf; 2], DevBuf, DevBuf, Bufs, Chunk);
 
 /// A kernel launch: name, grid, threads per block, arguments.
-type Op = (&'static str, [u32; 2], u32, Vec<A>);
+pub(super) type Op = (&'static str, [u32; 3], u32, Vec<A>);
 
 /// A Q4 matrix: packed weights and scales, rows, columns.
 #[derive(Clone, Copy)]
-struct Mat {
-    w: [u64; 2],
-    rows: u32,
-    cols: u32,
+pub(super) struct Mat {
+    pub(super) w: [u64; 2],
+    pub(super) rows: u32,
+    pub(super) cols: u32,
 }
 
 /// How a [`Decoder`] is set up.
@@ -63,11 +65,13 @@ struct Mat {
 pub struct Settings {
     /// Positions the global layers' caches hold.
     pub context: usize,
+    /// Prompt tokens [`Decoder::prefill`] runs at once; sliding layers' caches hold this many past the window.
+    pub chunk: usize,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { context: 4096 }
+        Settings { context: 4096, chunk: 512 }
     }
 }
 
@@ -80,17 +84,32 @@ pub struct Decoder {
     /// The recording [`Decoder::next_token`] waits for.
     at: usize,
     tokens: HostBuf,
+    /// Position of the next step, as the step counter on the GPU holds it.
+    pos: u32,
     control: DevBuf,
     arena: DevBuf,
     logits: u64,
     loader: Loader,
     ops: Vec<Op>,
     module: crate::cuda::Module,
+    pre: Pre,
     _keep: (DevBuf, HostBuf),
 }
 
+/// What prefill builds its launches from: the weight files and where they were loaded, each layer's scalar, the
+/// step's buffers, prefill's buffers, its token IDs in pinned memory, and its chunk size.
+struct Pre {
+    files: [Wpk; 2],
+    bases: [u64; 2],
+    scalars: Vec<f32>,
+    bufs: Bufs,
+    chunk: Chunk,
+    ids: HostBuf,
+    size: usize,
+}
+
 /// Device addresses of the step's buffers.
-struct Bufs {
+pub(super) struct Bufs {
     x: [u64; 2],
     q: [u64; 2],
     qkv: u64,
@@ -102,16 +121,19 @@ struct Bufs {
     work: u64,
     partial: [u64; 2],
     count: [u64; 2],
-    kv: Vec<[u64; 2]>,
-    context: u32,
+    pub(super) kv: Vec<[u64; 2]>,
+    pub(super) context: u32,
+    /// Slots of a sliding layer's cache: the window and a prefill chunk.
+    pub(super) ring: u32,
     /// In the control buffer: step counter and token, sampling settings, the two RoPE tables, seen tokens.
-    control: [u64; 5],
+    pub(super) control: [u64; 5],
     /// The token a step reads, and the one it writes: two words of pinned host memory.
     token: [u64; 2],
 }
 
 /// Lays the step's buffers out from `base`, and returns them with the bytes they take.
-fn layout(cfg: &Config, context: usize, base: u64) -> (Bufs, usize) {
+fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) {
+    let (context, ring) = (settings.context, cfg.window + settings.chunk);
     let mut end = 0;
     let mut take = |len: usize| {
         let at = end;
@@ -126,13 +148,15 @@ fn layout(cfg: &Config, context: usize, base: u64) -> (Bufs, usize) {
     let (partial, count) = ([take(f * kv * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * kv), take(f)]);
     let caches: Vec<[u64; 2]> = (0..l)
         .map(|i| {
-            let len = 2 * kv * if cfg.global[i] { context } else { cfg.window } * cfg.head_dim[usize::from(cfg.global[i])];
+            let len = 2 * kv * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
             if cfg.source(i) == i { [take(len), take(len)] } else { [0, 0] }
         })
         .collect();
     let kv = (0..l).map(|i| caches[cfg.source(i)]).collect();
-    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context: context as u32, control: [0; 5], token: [0; 2] };
-    (bufs, end)
+    let chunk = super::prefill::layout(cfg, settings.chunk, &mut take);
+    let (context, ring) = (context as u32, ring as u32);
+    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context, ring, control: [0; 5], token: [0; 2] };
+    (bufs, chunk, end)
 }
 
 /// The control buffer's contents for a new sequence: step counter and token, `sampling`, the RoPE tables, and no
@@ -154,19 +178,19 @@ fn control(cfg: &Config, sampling: &Sampling) -> (Vec<u8>, [usize; 5]) {
 }
 
 /// The tensors of a `.wpk` loaded at device address `base`.
-struct Weights<'a> {
+pub(super) struct Weights<'a> {
     wpk: &'a Wpk,
     base: u64,
 }
 
 impl Weights<'_> {
     /// Address of tensor `name`, or 0 when the model has none.
-    fn at(&self, name: &str) -> u64 {
+    pub(super) fn at(&self, name: &str) -> u64 {
         self.wpk.tensor(name).map_or(0, |t| self.base + t.offset)
     }
 
     /// Q4 matrix `name`.
-    fn mat(&self, name: &str) -> Mat {
+    pub(super) fn mat(&self, name: &str) -> Mat {
         let shape = self.wpk.tensor(&format!("{name}.w")).map_or(&[0, 0][..], |t| &t.shape);
         Mat { w: [self.at(&format!("{name}.w")), self.at(&format!("{name}.s"))], rows: shape[0] as u32, cols: 2 * shape[1] as u32 }
     }
@@ -175,11 +199,11 @@ impl Weights<'_> {
 impl Decoder {
     /// Loads the model directory `dir` (see [`super::convert`]) onto `ctx`'s GPU, with room for `context` positions.
     pub fn open(ctx: &Context, dir: &Path, settings: &Settings) -> Result<Decoder> {
-        let context = settings.context;
         let (stream, module, mut loader) = (ctx.stream()?, ctx.load(&crate::ptx::module())?, Loader::new(ctx)?);
         let (cfg, [wpk, hpk], weights, host, scalars) = load(ctx, dir, &mut loader)?;
-        let (tokens, ctl, arena, mut b) = scratch(ctx, &stream, &cfg, context)?;
-        let (w, hw) = (Weights { wpk: &wpk, base: weights.ptr() }, Weights { wpk: &hpk, base: host.device_ptr()? });
+        let ([tokens, ids], ctl, arena, mut b, chunk) = scratch(ctx, &stream, &cfg, settings)?;
+        let bases = [weights.ptr(), host.device_ptr()?];
+        let (w, hw) = (Weights { wpk: &wpk, base: bases[0] }, Weights { wpk: &hpk, base: bases[1] });
         // Two recordings with the token words traded: steps alternate between them, so one can be queued while the
         // other runs and the CPU reads each token from its own word.
         let mut steps = Vec::new();
@@ -188,8 +212,10 @@ impl Decoder {
             b.token.reverse();
         }
         let (graphs, done) = record(&stream, &module, &steps)?;
-        let ops = steps.swap_remove(0);
-        let mut dec = Decoder { graphs, cfg, stream, done, at: 0, tokens, control: ctl, arena, logits: b.logits, loader, ops, module, _keep: (weights, host) };
+        let (ops, logits) = (steps.swap_remove(0), b.logits);
+        let pre = Pre { files: [wpk, hpk], bases, scalars, bufs: b, chunk, ids, size: settings.chunk };
+        let mut dec =
+            Decoder { graphs, cfg, stream, done, at: 0, tokens, pos: 0, control: ctl, arena, logits, loader, ops, module, pre, _keep: (weights, host) };
         dec.reset(&Sampling::default())?;
         Ok(dec)
     }
@@ -203,13 +229,14 @@ impl Decoder {
     /// a generation still running stops first.
     pub fn reset(&mut self, sampling: &Sampling) -> Result<()> {
         self.stop()?;
+        self.pos = 0;
         self.loader.upload(&control(&self.cfg, &Sampling { softcap: self.cfg.softcap, ..*sampling }).0, &self.control)
     }
 
     /// Runs one step on `token` at the next position and returns the token sampled after it. Not while a generation
     /// runs: [`Decoder::stop`] it first.
     pub fn step(&mut self, token: u32) -> Result<u32> {
-        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        self.tokens[4..8].copy_from_slice(&token.to_ne_bytes());
         self.queue(0)?;
         self.done[0].sync()?;
         Ok(self.token(0))
@@ -217,7 +244,7 @@ impl Decoder {
 
     /// Starts generating from `token` at the next position: queues its step, which [`Decoder::next_token`] waits for.
     pub fn start(&mut self, token: u32) -> Result<()> {
-        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        self.tokens[4..8].copy_from_slice(&token.to_ne_bytes());
         self.at = 0;
         self.queue(0)
     }
@@ -238,8 +265,30 @@ impl Decoder {
         self.stream.sync()
     }
 
+    /// Feeds `tokens` at the next positions through prefill, [`Settings::chunk`] at a time: each kernel runs over
+    /// every token of a chunk, the matrix products on tensor cores, and only the layers that write a key-value cache
+    /// run (a later step needs nothing else from these tokens). Nothing is sampled: a prompt's last token goes
+    /// through [`Decoder::step`]. Not while a generation runs.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        for part in tokens.chunks(self.pre.size) {
+            part.iter().enumerate().for_each(|(i, t)| self.pre.ids[4 * i..4 * i + 4].copy_from_slice(&t.to_ne_bytes()));
+            let p = &self.pre;
+            let (w, hw) = (Weights { wpk: &p.files[0], base: p.bases[0] }, Weights { wpk: &p.files[1], base: p.bases[1] });
+            for op in super::prefill::ops(&self.cfg, [&w, &hw], &p.bufs, (&p.chunk, &p.scalars), part.len() as u32) {
+                launch(&self.stream, &self.module, &op)?;
+            }
+            self.pos += part.len() as u32;
+            self.tokens[8..12].copy_from_slice(&self.pos.to_ne_bytes());
+            // SAFETY: the word is pinned memory this decoder owns, and `sync` completes the copy before it changes.
+            unsafe { self.stream.upload(&self.control, 0, &self.tokens[8..12]) }?;
+            self.stream.sync()?;
+        }
+        Ok(())
+    }
+
     /// Queues recording `g`, which writes token word `g`, and marks its end.
-    fn queue(&self, g: usize) -> Result<()> {
+    fn queue(&mut self, g: usize) -> Result<()> {
+        self.pos += 1;
         // SAFETY: the graphs read and write only buffers this decoder owns, laid out for them when they were recorded.
         unsafe { self.stream.replay(&self.graphs[g]) }?;
         self.stream.record(&self.done[g])
@@ -278,9 +327,9 @@ impl Decoder {
     /// for a matrix product with its shape) and time, in order. A [`SPIN`] kernel first holds the GPU while the CPU
     /// queues the whole step, so the kernels run back to back, as in the recorded step, each with its launch gap.
     pub fn timeline(&mut self, token: u32) -> Result<Vec<(String, std::time::Duration)>> {
-        self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
+        self.tokens[4..8].copy_from_slice(&token.to_ne_bytes());
         let marks = (0..=self.ops.len()).map(|_| self.stream.context().event(true)).collect::<Result<Vec<_>>>()?;
-        launch(&self.stream, &self.module, &(SPIN, [1, 1], 32, vec![A::P(50_000_000)]))?;
+        launch(&self.stream, &self.module, &(SPIN, [1, 1, 1], 32, vec![A::P(50_000_000)]))?;
         self.stream.record(&marks[0])?;
         for (op, mark) in self.ops.iter().zip(&marks[1..]) {
             launch(&self.stream, &self.module, op)?;
@@ -313,15 +362,17 @@ fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded> {
     Ok((cfg, [wpk, hpk], weights, host, scalars))
 }
 
-/// The token words, the control buffer and the arena, and the step's buffers in them.
-fn scratch(ctx: &Context, stream: &Stream, cfg: &Config, context: usize) -> Result<Scratch> {
+/// The token words (in, out, and the position for prefill to set), the control buffer, the arena, the buffers
+/// laid out in them, and prefill's buffers with its token IDs in pinned memory.
+fn scratch(ctx: &Context, stream: &Stream, cfg: &Config, settings: &Settings) -> Result<Scratch> {
     let (ctl, at) = control(cfg, &Sampling::default());
-    let (tokens, ctl, arena) = (ctx.alloc_host(8)?, ctx.alloc(ctl.len())?, ctx.alloc(layout(cfg, context, 0).1)?);
+    let (tokens, ids) = (ctx.alloc_host(12)?, ctx.alloc_host(4 * settings.chunk)?);
+    let (ctl, arena) = (ctx.alloc(ctl.len())?, ctx.alloc(layout(cfg, settings, 0).2)?);
     stream.fill(&arena, 0)?;
-    let (mut b, _) = layout(cfg, context, arena.ptr());
+    let (mut b, mut chunk, _) = layout(cfg, settings, arena.ptr());
     let word = tokens.device_ptr()?;
-    (b.control, b.token) = (at.map(|at| ctl.ptr() + at as u64), [word + 4, word]);
-    Ok((tokens, ctl, arena, b))
+    (b.control, b.token, chunk.ids) = (at.map(|at| ctl.ptr() + at as u64), [word + 4, word], ids.device_ptr()?);
+    Ok(([tokens, ids], ctl, arena, b, chunk))
 }
 
 /// The kind of `op`: its kernel, or for a matrix product its shape.
@@ -363,30 +414,30 @@ fn launch(s: &Stream, m: &crate::cuda::Module, (name, grid, threads, args): &Op)
         .collect();
     // SAFETY: every op passes its kernel's arguments in order and with their types, as `crate::ptx` documents them,
     // and every buffer was laid out for the model by `layout`.
-    unsafe { s.launch(&m.function(name)?, [grid[0], grid[1], 1], [*threads, 1, 1], 0, &ptrs) }
+    unsafe { s.launch(&m.function(name)?, *grid, [*threads, 1, 1], 0, &ptrs) }
 }
 
 /// `y = M·x`, reading the Q8 input `q`.
 fn gemv(m: Mat, q: [u64; 2], y: u64) -> Op {
     let args = vec![A::P(m.w[0]), A::P(m.w[1]), A::P(q[0]), A::P(q[1]), A::P(y), A::U(m.rows), A::U(m.cols)];
-    if m.cols <= 256 { (GEMV_Q4_NARROW, [m.rows.div_ceil(16), 1], 128, args) } else { (GEMV_Q4, [m.rows.div_ceil(GEMV_ROWS), 1], 32 * GEMV_ROWS, args) }
+    if m.cols <= 256 { (GEMV_Q4_NARROW, [m.rows.div_ceil(16), 1, 1], 128, args) } else { (GEMV_Q4, [m.rows.div_ceil(GEMV_ROWS), 1, 1], 32 * GEMV_ROWS, args) }
 }
 
 /// [`NORM_Q8`] on `p = [h, h_out, y, w1, w2]` over `shape = [len, chunks]` with `k = [eps, scale]`:
 /// `h_out = (h + w1 ⊙ rmsnorm(y)) · scale`, then Q8 of `w2 ⊙ rmsnorm(h_out)`.
 fn norm(p: [u64; 5], q: [u64; 2], shape: [usize; 2], k: [f32; 2]) -> Op {
     let args = p.into_iter().chain(q).map(A::P).chain([A::U(shape[0] as u32), A::F(k[0]), A::F(k[1])]).collect();
-    (NORM_Q8, [shape[0] as u32 / NORM_THREADS, shape[1] as u32], NORM_THREADS, args)
+    (NORM_Q8, [shape[0] as u32 / NORM_THREADS, shape[1] as u32, 1], NORM_THREADS, args)
 }
 
 /// Q8 of `gelu(a) · b` over `len` values.
 fn geglu(a: u64, b: u64, q: [u64; 2], len: usize) -> Op {
-    (GEGLU_Q8, [(len as u32).div_ceil(256), 1], 256, vec![A::P(a), A::P(b), A::P(q[0]), A::P(q[1]), A::U(len as u32)])
+    (GEGLU_Q8, [(len as u32).div_ceil(256), 1, 1], 256, vec![A::P(a), A::P(b), A::P(q[0]), A::P(q[1]), A::U(len as u32)])
 }
 
 /// Row `*token` of Q4 table `m`, times `scale`, into `out`.
 fn embed(m: Mat, token: u64, out: u64, scale: f32) -> Op {
-    (EMBED_Q4, [m.cols.div_ceil(256), 1], 256, vec![A::P(m.w[0]), A::P(m.w[1]), A::P(token), A::P(out), A::U(m.cols), A::F(scale)])
+    (EMBED_Q4, [m.cols.div_ceil(256), 1, 1], 256, vec![A::P(m.w[0]), A::P(m.w[1]), A::P(token), A::P(out), A::U(m.cols), A::F(scale)])
 }
 
 /// The whole step.
@@ -409,7 +460,7 @@ fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u3
     let blocks = sms.min((cfg.vocab as u32).div_ceil(4 * SAMPLE_THREADS));
     let [state, sampling, .., seen] = b.control;
     let args = [b.logits, b.work].map(A::P).into_iter().chain([A::U(cfg.vocab as u32)]);
-    ops.push((SAMPLE, [blocks, 1], SAMPLE_THREADS, args.chain([sampling, state, seen, b.token[1], b.partial[1], b.count[1]].map(A::P)).collect()));
+    ops.push((SAMPLE, [blocks, 1, 1], SAMPLE_THREADS, args.chain([sampling, state, seen, b.token[1], b.partial[1], b.count[1]].map(A::P)).collect()));
     ops
 }
 
@@ -418,13 +469,13 @@ fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u3
 fn attention(cfg: &Config, w: &Weights, b: &Bufs, i: usize, sms: u32) -> Vec<Op> {
     let (g, n) = (usize::from(cfg.global[i]), |name: &str| w.at(&format!("{i}.{name}")));
     let (d, kv, fresh) = (cfg.head_dim[g], cfg.kv_heads as u32, cfg.source(i) == i);
-    let (cap, splits) = if g == 1 { (b.context, sms / kv) } else { (cfg.window as u32, 2 * sms / kv) };
+    let (cap, win, splits) = if g == 1 { (b.context, b.context, sms / kv) } else { (b.ring, cfg.window as u32, 2 * sms / kv) };
     let ptrs = [b.qkv, n("q_norm"), if fresh { n("k_norm") } else { 0 }, b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]];
-    let args = ptrs.map(A::P).into_iter().chain([A::U(cap), A::U(cap), A::U(u32::from(fresh))]).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
+    let args = ptrs.map(A::P).into_iter().chain([A::U(cap), A::U(win), A::U(u32::from(fresh))]).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
     let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
     vec![
         gemv(w.mat(&format!("{i}.qkv")), b.q, b.qkv),
-        (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [kv, splits.clamp(1, 256)], 32 * ATTEND_WARPS, args.collect()),
+        (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [kv, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
         gemv(w.mat(&format!("{i}.o")), b.q, b.y),
         norm([x0, x1, b.y, n("post_attention_layernorm"), n("pre_feedforward_layernorm")], b.q, [cfg.hidden, 1], [cfg.eps, 1.0]),
     ]
@@ -449,7 +500,7 @@ fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
 }
 
 /// `v` rounded to bfloat16, as Gemma's embedding scale is applied.
-fn bf16(v: f32) -> f32 {
+pub(super) fn bf16(v: f32) -> f32 {
     let b = v.to_bits();
     f32::from_bits((b + 0x7fff + (b >> 16 & 1)) & 0xffff_0000)
 }

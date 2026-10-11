@@ -59,7 +59,7 @@ fn tiny_model_decodes_as_the_reference() {
     let dst = src.join("out");
     convert(&src, &dst).unwrap();
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64 }).unwrap();
+    let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64, ..Default::default() }).unwrap();
     dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
     let tokens: Vec<u32> = (0..20).map(|i| (i * 797 + 11) % tiny::VOCAB as u32).collect();
     let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();
@@ -90,5 +90,32 @@ fn tiny_model_decodes_as_the_reference() {
         }
     }
     assert_eq!(runs[0], runs[1], "queued generation and single steps agree");
+    std::fs::remove_dir_all(src).unwrap();
+}
+
+/// Prefill of the tiny model: 19 tokens through prefill and the 20th through a decode step give the logits of the
+/// CPU reference (within the error of Q8P activations and an `f16` cache), and the same logits, bit for bit, whether
+/// prefill runs them in chunks of 8 (so sliding caches wrap their ring) or all at once.
+#[cfg(feature = "gpu")]
+#[test]
+fn tiny_model_prefills_as_the_reference_in_any_chunks() {
+    let src = common::tiny::checkpoint("prefill", 4);
+    let dst = src.join("out");
+    convert(&src, &dst).unwrap();
+    let ctx = tachyon::cuda::Context::new(0).unwrap();
+    let tokens: Vec<u32> = (0..20).map(|i| (i * 1013 + 7) % tiny::VOCAB as u32).collect();
+    let logits = |chunk| {
+        let mut dec = tachyon::model::Decoder::open(&ctx, &dst, &tachyon::model::Settings { context: 64, chunk }).unwrap();
+        dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
+        dec.prefill(&tokens[..19]).unwrap();
+        dec.step(tokens[19]).unwrap();
+        dec.logits().unwrap()
+    };
+    let (small, whole) = (logits(8), logits(64));
+    assert_eq!(small, whole, "chunks of 8 and one chunk agree exactly");
+    let want = tiny::reference(4, &tokens).pop().unwrap();
+    let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();
+    let (scale, err) = (rms(&mut want.iter().copied()), rms(&mut whole.iter().zip(&want).map(|(a, b)| a - b)));
+    assert!(err <= 0.04 * scale, "logits differ by {err} RMS (logits {scale} RMS)");
     std::fs::remove_dir_all(src).unwrap();
 }
