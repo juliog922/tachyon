@@ -1,9 +1,9 @@
 [
     {
         "name": "vram read ceiling, 4 blocks/SM",
-        "median_ns": 2208960,
-        "p99_ns": 2217760,
-        "rate": 729.127,
+        "median_ns": 2208768,
+        "p99_ns": 2213312,
+        "rate": 729.191,
         "unit": "GB/s",
         "cycles": null,
         "instructions": null,
@@ -12,9 +12,9 @@
     },
     {
         "name": "vram read ceiling, 8 blocks/SM",
-        "median_ns": 2215104,
-        "p99_ns": 2216512,
-        "rate": 727.105,
+        "median_ns": 2213792,
+        "p99_ns": 2216736,
+        "rate": 727.536,
         "unit": "GB/s",
         "cycles": null,
         "instructions": null,
@@ -23,9 +23,9 @@
     },
     {
         "name": "decode",
-        "median_ns": 4384841,
-        "p99_ns": 4408652,
-        "rate": 228.058,
+        "median_ns": 4391922,
+        "p99_ns": 4416961,
+        "rate": 227.691,
         "unit": "tok/s",
         "cycles": null,
         "instructions": null,
