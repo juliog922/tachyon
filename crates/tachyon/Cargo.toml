@@ -43,6 +43,11 @@ harness = false
 required-features = ["gpu"]
 
 [[bench]]
+name = "prefill"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
 name = "generate"
 harness = false
 required-features = ["gpu"]

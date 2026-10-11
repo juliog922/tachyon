@@ -5,10 +5,10 @@
 
 mod common;
 
-use common::{Gpu, values};
+use common::{Gpu, product, values};
 use tachyon::cuda::{DevBuf, arg};
 use tachyon::ptx::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, QUANT_Q8};
-use tachyon::quant::{Q4, f16_value, q4, q8};
+use tachyon::quant::{Q4, q4, q8};
 
 /// Every column count of a Gemma 4 E4B decode projection (only `cols` changes the kernel's path; rows only add
 /// warps), and edge shapes: rows not a multiple of the block, one group, and fewer chunks than lanes. Rows of at most
@@ -40,27 +40,6 @@ fn gpu_gemv(gpu: &Gpu, w: &Q4, x: &[f32], rows: usize) -> Vec<f32> {
     gpu.floats(&y)
 }
 
-/// What the kernel computes, in `f64`: per row, Σ over chunks of `d · (s · Σ n·q − 8 · s·Σq)`; and the bound on its
-/// rounding error, a small multiple of the terms' magnitudes.
-fn reference(w: &Q4, x: &[f32], rows: usize) -> Vec<(f64, f64)> {
-    let (q, s) = q8(x);
-    let cols = x.len();
-    let nibble = |r: usize, j: usize| {
-        let (g, k) = ((r * cols + j) / 64, j % 64);
-        f64::from(w.packed[g * 32 + k / 8 * 4 + k % 4] >> (k % 8 / 4 * 4) & 15)
-    };
-    (0..rows)
-        .map(|r| {
-            (0..cols / 32).fold((0.0, 0.0), |(sum, bound), c| {
-                let dot: f64 = (0..32).map(|j| nibble(r, c * 32 + j) * f64::from(q[c * 32 + j])).sum();
-                let d = f64::from(f16_value(w.scales[(r * cols + c * 32) / 64]));
-                let term = d * (f64::from(s[c][0]) * dot - 8.0 * f64::from(s[c][1]));
-                (sum + term, bound + term.abs() + d * f64::from(s[c][0]) * dot.abs())
-            })
-        })
-        .collect()
-}
-
 #[test]
 fn quant_q8_matches_the_cpu_exactly() {
     let gpu = Gpu::new();
@@ -80,7 +59,7 @@ fn gemv_matches_the_reference_on_every_shape() {
         let (wf, x) = (values(rows * cols, 11 + i as u64), values(cols, 99 + i as u64));
         let w = q4(&wf, cols);
         let y = gpu_gemv(&gpu, &w, &x, rows);
-        for (r, (&got, (want, bound))) in y.iter().zip(reference(&w, &x, rows)).enumerate() {
+        for (r, (&got, (want, bound))) in y.iter().zip(product(&w, &x, rows)).enumerate() {
             assert!((f64::from(got) - want).abs() <= 1e-5 * bound + 1e-6, "{rows}×{cols} row {r}: {got} vs {want}");
         }
     }

@@ -89,3 +89,24 @@ pub fn assert_q8(q: &[u8], s: &[f32], want: &[f64], slack: f64) {
         assert_eq!(pair[1], sum as f32 * pair[0], "block {b}: the stored sum");
     }
 }
+
+/// What the Q4 × Q8 kernels compute, in `f64`: per row, Σ over chunks of `d · (s · Σ n·q − 8 · s·Σq)`; and the bound on its
+/// rounding error, a small multiple of the terms' magnitudes.
+pub fn product(w: &tachyon::quant::Q4, x: &[f32], rows: usize) -> Vec<(f64, f64)> {
+    let (q, s) = tachyon::quant::q8(x);
+    let cols = x.len();
+    let nibble = |r: usize, j: usize| {
+        let (g, k) = ((r * cols + j) / 64, j % 64);
+        f64::from(w.packed[g * 32 + k / 8 * 4 + k % 4] >> (k % 8 / 4 * 4) & 15)
+    };
+    (0..rows)
+        .map(|r| {
+            (0..cols / 32).fold((0.0, 0.0), |(sum, bound), c| {
+                let dot: f64 = (0..32).map(|j| nibble(r, c * 32 + j) * f64::from(q[c * 32 + j])).sum();
+                let d = f64::from(tachyon::quant::f16_value(w.scales[(r * cols + c * 32) / 64]));
+                let term = d * (f64::from(s[c][0]) * dot - 8.0 * f64::from(s[c][1]));
+                (sum + term, bound + term.abs() + d * f64::from(s[c][0]) * dot.abs())
+            })
+        })
+        .collect()
+}

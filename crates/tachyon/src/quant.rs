@@ -10,6 +10,8 @@
 //! **Q8 activations.** A vector, a multiple of [`BLOCK`] long, as `i8` values and, per block of 32, the pair
 //! `[s, s·Σq]` with `x ≈ q·s`. The sum lets a kernel apply the weights' zero point of 8 once per block.
 //!
+//! **Q8P activations**, the prefill layout: the same `i8` values, per block of 64 the pair `[s, z]` of [`q8p`].
+//!
 //! **Sources.** [`Safetensors`] reads the checkpoints models ship as, rows at a time, as `f32`.
 
 use crate::json::Json;
@@ -21,6 +23,11 @@ use std::os::unix::fs::FileExt;
 pub const GROUP: usize = 64;
 /// Activations per Q8 scale.
 pub const BLOCK: usize = 32;
+/// Activations per Q8P scale, the prefill layout ([`q8p`]).
+pub const PREFILL_BLOCK: usize = 64;
+/// The float `1.5·2²³` (bits `0x4B400000`): the prefill product starts its integer sums from these bits, so a sum
+/// `i` reads as `MAGIC + i` with no conversion.
+pub const MAGIC: f32 = 12_582_912.0;
 
 /// A Q4 matrix: packed weights and their f16 scales (as bits).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,9 +89,24 @@ fn inverse(d: f32) -> f32 {
 /// # Panics
 /// When the vector is not a multiple of [`BLOCK`] long.
 pub fn q8(x: &[f32]) -> (Vec<i8>, Vec<[f32; 2]>) {
-    assert!(x.len() % BLOCK == 0, "a whole number of {BLOCK}-value blocks");
-    let (mut q, mut s) = (Vec::with_capacity(x.len()), Vec::with_capacity(x.len() / BLOCK));
-    for block in x.chunks_exact(BLOCK) {
+    blocks(x, BLOCK)
+}
+
+/// Quantizes a vector to Q8P, the prefill activations: `i8` values and, per block of [`PREFILL_BLOCK`] (one Q4
+/// group), `[s, z]` with `z = −8·s·Σq − MAGIC·s`, what [`crate::ptx::GEMM_Q4`] adds to its biased integer sums.
+///
+/// # Panics
+/// When the vector is not a multiple of [`PREFILL_BLOCK`] long.
+pub fn q8p(x: &[f32]) -> (Vec<i8>, Vec<[f32; 2]>) {
+    let (q, s) = blocks(x, PREFILL_BLOCK);
+    (q, s.into_iter().map(|[scale, sum]| [scale, scale.mul_add(-MAGIC, sum * -8.0)]).collect())
+}
+
+/// `i8` values and `[s, s·Σq]` per block of `n`.
+fn blocks(x: &[f32], n: usize) -> (Vec<i8>, Vec<[f32; 2]>) {
+    assert!(x.len() % n == 0, "a whole number of {n}-value blocks");
+    let (mut q, mut s) = (Vec::with_capacity(x.len()), Vec::with_capacity(x.len() / n));
+    for block in x.chunks_exact(n) {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
         let (scale, inv) = (amax / 127.0, if amax > 0.0 { 127.0 / amax } else { 0.0 });
         let start = q.len();

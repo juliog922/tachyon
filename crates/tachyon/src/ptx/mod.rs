@@ -12,6 +12,8 @@
 //!
 //! - [`QUANT_Q8`] quantizes an `f32` vector to Q8. Arguments: `x`, Q8 out, `len: u32`.
 //!   Launch `len.div_ceil(256)` blocks of 256.
+//! - [`QUANT_Q8P`] quantizes an `f32` vector to Q8P, the prefill layout ([`crate::quant::q8p`]). Arguments as
+//!   [`QUANT_Q8`]; `len` is a multiple of 64. Launch `len.div_ceil(512)` blocks of 256.
 //! - [`GEGLU_Q8`] quantizes `gelu(a[i]) · b[i]`, GELU in its tanh form, to Q8. Arguments: `a`, `b`, Q8 out,
 //!   `len: u32`. Launch as [`QUANT_Q8`].
 //! - [`NORM_Q8`] is the residual step: when `y` is not null, `h' = (h + w1 ⊙ rmsnorm(y)) · scale` is written to
@@ -24,16 +26,18 @@
 //! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`. Arguments:
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
-//! - [`GEMV_Q4`]: see [`gemv`].
+//! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`]: see [`gemm`].
 //! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
 //! Lengths are multiples of 32.
 
 pub mod attend;
+pub mod gemm;
 pub mod gemv;
 pub mod sample;
 
 pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_KV, rope};
+pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
 
@@ -41,6 +45,8 @@ use std::fmt::Write;
 
 /// Name of the activation quantizer.
 pub const QUANT_Q8: &str = "quant_q8";
+/// Name of the quantizer to the prefill layout, Q8P.
+pub const QUANT_Q8P: &str = "quant_q8p";
 /// Name of the GELU-gated quantizer.
 pub const GEGLU_Q8: &str = "geglu_q8";
 /// Name of the residual and normalization step.
@@ -58,10 +64,13 @@ pub fn module() -> String {
     let kernels = [
         quant(QUANT_Q8, ""),
         quant(GEGLU_Q8, GELU),
+        quant_p(),
         norm(),
         EMBED.into(),
         gemv::gemv_q4(UNROLL, 32),
         gemv::gemv_q4(UNROLL, 8),
+        gemm::gemm_q4(),
+        gemm::mma_peak(),
         attend::attend(256),
         attend::attend(512),
         SPIN_PTX.into(),
@@ -112,7 +121,7 @@ const BLOCK: &str = "
 /// Registers of [`q8`]; `%qp` and `%sp` hold the Q8 output pointers.
 const Q8: &str = "
     .reg .pred %qz;
-    .reg .b32 %qn, %qm, %qt;
+    .reg .b32 %qn, %qm, %qt, %qk;
     .reg .f32 %qa, %qb, %qd, %qi, %qv, %qf;
     .reg .b64 %qo, %qp, %sp;
 ";
@@ -139,6 +148,70 @@ fn q8(x: &str, i: &str) -> String {
     @%qz st.global.v2.f32 [%qo], {{%qd, %qf}};\n",
         warp("max.f32", "%qa", "%qb"),
         warp("add.s32", "%qn", "%qm")
+    )
+}
+
+/// Stores `x0, x1`, values `i, i + 1` of a vector (`i` even), as Q8P ([`crate::quant::q8p`]): each warp holds 64
+/// consecutive values, one block, quantized as in [`q8`], and its first lane writes `[s, z]`.
+fn q8p(x0: &str, x1: &str, i: &str) -> String {
+    format!(
+        "    abs.f32 %qa, {x0};\n    abs.f32 %qb, {x1};\n    max.f32 %qa, %qa, %qb;\n{}    div.rn.f32 %qd, %qa, 0f42FE0000;
+    setp.gt.f32 %qz, %qa, 0f00000000;
+    div.rn.f32 %qi, 0f42FE0000, %qa;
+    selp.f32 %qi, %qi, 0f00000000, %qz;
+    mul.rn.f32 %qv, {x0}, %qi;
+    cvt.rni.s32.f32 %qn, %qv;
+    mul.rn.f32 %qv, {x1}, %qi;
+    cvt.rni.s32.f32 %qk, %qv;
+    cvt.u64.u32 %qo, {i};
+    add.u64 %qo, %qp, %qo;
+    st.global.v2.s8 [%qo], {{%qn, %qk}};
+    add.s32 %qn, %qn, %qk;\n{}    and.b32 %qt, {i}, 63;
+    setp.eq.u32 %qz, %qt, 0;
+    cvt.rn.f32.s32 %qf, %qn;
+    mul.rn.f32 %qf, %qf, %qd;
+    mul.rn.f32 %qf, %qf, 0fC1000000;
+    fma.rn.f32 %qf, %qd, 0fCB400000, %qf;
+    shr.u32 %qt, {i}, 6;
+    mul.wide.u32 %qo, %qt, 8;
+    add.u64 %qo, %sp, %qo;
+    @%qz st.global.v2.f32 [%qo], {{%qd, %qf}};\n",
+        warp("max.f32", "%qa", "%qb"),
+        warp("add.s32", "%qn", "%qm")
+    )
+}
+
+/// [`QUANT_Q8P`]: two values per thread.
+fn quant_p() -> String {
+    format!(
+        ".visible .entry {QUANT_Q8P}(.param .u64 px, .param .u64 pq, .param .u64 ps, .param .u32 plen)
+{{{Q8}
+    .reg .pred %p;
+    .reg .b32 %i, %n, %len;
+    .reg .f32 %x0, %x1;
+    .reg .b64 %a;
+    mov.u32 %i, %ctaid.x;
+    mov.u32 %n, %ntid.x;
+    mov.u32 %len, %tid.x;
+    mad.lo.u32 %i, %i, %n, %len;
+    shl.b32 %i, %i, 1;
+    ld.param.u32 %len, [plen];
+    setp.ge.u32 %p, %i, %len;
+    @%p bra EXIT;
+    ld.param.u64 %qp, [pq];
+    ld.param.u64 %sp, [ps];
+    cvta.to.global.u64 %qp, %qp;
+    cvta.to.global.u64 %sp, %sp;
+    ld.param.u64 %a, [px];
+    cvta.to.global.u64 %a, %a;
+    mul.wide.u32 %qo, %i, 4;
+    add.u64 %a, %a, %qo;
+    ld.global.v2.f32 {{%x0, %x1}}, [%a];
+{}EXIT:
+    ret;
+}}
+",
+        q8p("%x0", "%x1", "%i")
     )
 }
 

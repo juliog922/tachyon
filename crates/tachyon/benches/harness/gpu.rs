@@ -120,3 +120,19 @@ impl Shape {
 pub fn token_bytes() -> f64 {
     SHAPES.iter().map(|s| f64::from(s.per_token) * s.bytes() as f64).sum()
 }
+
+impl Gpu {
+    /// The integer tensor-core rate of [`tachyon::ptx::MMA_PEAK`], in TOPS: the ceiling prefill is measured against.
+    pub fn mma_peak(&self, suite: &mut Suite) -> f64 {
+        let (peak, iters, blocks) = (self.module.function(tachyon::ptx::MMA_PEAK).unwrap(), 4096u32, self.ctx.info().sms * 8);
+        let out = self.ctx.alloc(blocks as usize * 128 * 4).unwrap();
+        let ptr = out.ptr();
+        let t = suite.run("int8 mma peak", 20, || {
+            // SAFETY: two arguments of the kernel's types; `out` holds a word for each of the grid's threads.
+            self.time(|s| unsafe { s.launch(&peak, [blocks, 1, 1], [128, 1, 1], 0, &[arg(&ptr), arg(&iters)]) }.unwrap())
+        });
+        let tops = f64::from(blocks) * 4.0 * f64::from(iters) * 8.0 * 8192.0 / t.as_secs_f64() / 1e12;
+        suite.rate(tops, "TOPS");
+        tops
+    }
+}
