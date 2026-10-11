@@ -21,7 +21,7 @@ fn gpu_q8p(gpu: &Gpu, x: &[f32], cols: usize) -> (tachyon::cuda::DevBuf, tachyon
     let (px, pq, ps, len) = (xd.ptr(), q.ptr(), s.ptr(), x.len() as u32);
     // SAFETY: four arguments of the kernel's types; `q` and `s` hold `len` bytes and `len / 64` pairs.
     unsafe {
-        gpu.stream.launch(&gpu.module.function(QUANT_Q8P).unwrap(), [len.div_ceil(512), 1, 1], [256, 1, 1], 0, &[arg(&px), arg(&pq), arg(&ps), arg(&len)])
+        gpu.stream.launch(&gpu.module.function(QUANT_Q8P).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &[arg(&px), arg(&pq), arg(&ps), arg(&len)])
     }
     .unwrap();
     let (qv, sv) = (gpu.download(&q), gpu.floats(&s));

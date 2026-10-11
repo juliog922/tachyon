@@ -110,3 +110,34 @@ pub fn product(w: &tachyon::quant::Q4, x: &[f32], rows: usize) -> Vec<(f64, f64)
         })
         .collect()
 }
+
+/// `1 / √(mean(x²) + eps)`.
+pub fn rms(x: impl ExactSizeIterator<Item = f64>, eps: f64) -> f64 {
+    let n = x.len() as f64;
+    1.0 / (x.map(|v| v * v).sum::<f64>() / n + eps).sqrt()
+}
+
+/// `x / √(mean(x²) + 1e-6)`, times `w` when given.
+pub fn normalize(x: &mut [f64], w: Option<&[f32]>) {
+    let r = rms(x.iter().copied(), 1e-6);
+    x.iter_mut().enumerate().for_each(|(i, v)| *v *= r * w.map_or(1.0, |w| f64::from(w[i])));
+}
+
+/// RoPE at `pos`: pairs `(i, i + d/2)` turn by `pos · freq[i]`, the angle computed in `f32` as the model does.
+pub fn rotate(x: &mut [f64], freq: &[f32], pos: u32) {
+    let half = x.len() / 2;
+    for (i, &f) in freq.iter().enumerate() {
+        let (s, c) = f64::from(pos as f32 * f).sin_cos();
+        let (a, b) = (x[i], x[i + half]);
+        (x[i], x[i + half]) = (a * c - b * s, b * c + a * s);
+    }
+}
+
+/// `softmax(q·k) · v` over the positions.
+pub fn attention(q: &[f64], kv: &[(Vec<f64>, Vec<f64>)]) -> Vec<f64> {
+    let scores: Vec<f64> = kv.iter().map(|(k, _)| q.iter().zip(k).map(|(a, b)| a * b).sum()).collect();
+    let m = scores.iter().fold(f64::NEG_INFINITY, |m, &s| m.max(s));
+    let p: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+    let z: f64 = p.iter().sum();
+    (0..q.len()).map(|i| kv.iter().zip(&p).map(|((_, v), p)| p * v[i]).sum::<f64>() / z).collect()
+}

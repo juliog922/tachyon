@@ -1,0 +1,214 @@
+//! The prefill kernels on a real GPU: the small steps run over many tokens at once, writing Q8P for
+//! `GEMM_Q4`. `cargo test --features gpu --test prefill`
+#![cfg(feature = "gpu")]
+// The names follow the math of the kernels (h, y, w, q, s), as in their documentation.
+#![allow(clippy::many_single_char_names, clippy::float_cmp, clippy::needless_range_loop)]
+
+mod common;
+
+use common::{Gpu, attention, normalize, rotate, values};
+use tachyon::cuda::{DevBuf, arg};
+use tachyon::ptx::{ATTEND_256P, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8P, KV_256, NORM_Q8, NORM_Q8P, NORM_THREADS, rope};
+use tachyon::quant::{MAGIC, f16_bits, f16_value, q4};
+
+/// Q8P buffers for `len` values, and their contents.
+fn out(gpu: &Gpu, len: usize) -> (DevBuf, DevBuf) {
+    (gpu.zeros(len), gpu.zeros(len / 8))
+}
+
+/// Checks a Q8P vector against `want`: every value within half a quantum of its block plus `slack`, and each block's
+/// second word `z` as the layout defines it.
+fn assert_q8p(q: &[u8], s: &[f32], want: &[f64], slack: f64) {
+    for (i, w) in want.iter().enumerate() {
+        let scale = f64::from(s[i / 64 * 2]);
+        let got = f64::from(q[i] as i8) * scale;
+        assert!((got - w).abs() <= 0.5 * scale * 1.001 + slack, "value {i}: {got} vs {w} (scale {scale})");
+    }
+    for (b, pair) in s.chunks_exact(2).enumerate() {
+        let sum: i32 = q[b * 64..b * 64 + 64].iter().map(|&v| i32::from(v as i8)).sum();
+        assert_eq!(pair[1], pair[0].mul_add(-MAGIC, sum as f32 * pair[0] * -8.0), "block {b}: z");
+    }
+}
+
+/// One norm launch over rows of `len`: `kernel` with Q8 or Q8P out, `blocks` values per scale pair. Returns the new
+/// `h`, and the values and scales.
+fn norm(gpu: &Gpu, kernel: &str, inputs: [&[f32]; 4], len: usize, blocks: usize) -> (Vec<f32>, Vec<u8>, Vec<f32>) {
+    let [h, y, w1, w2] = inputs;
+    let (hd, ho, yd, w1d, w2d) = (gpu.upload(h), gpu.upload(h), gpu.upload(y), gpu.upload(w1), gpu.upload(w2));
+    let (q, s) = (gpu.zeros(h.len()), gpu.zeros(h.len() / blocks * 8));
+    let ptrs = [hd.ptr(), ho.ptr(), yd.ptr(), w1d.ptr(), w2d.ptr(), q.ptr(), s.ptr()];
+    let (n, eps, scale) = (len as u32, 1e-6f32, 0.75f32);
+    let mut args: Vec<_> = ptrs.iter().map(arg).collect();
+    args.extend([arg(&n), arg(&eps), arg(&scale)]);
+    let grid = [n / NORM_THREADS, (h.len() / len) as u32, 1];
+    // SAFETY: ten arguments of the kernel's types; every buffer holds `tokens × len` values or one row of weights.
+    unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), grid, [NORM_THREADS, 1, 1], 0, &args) }.unwrap();
+    (gpu.floats(&ho), gpu.download(&q), gpu.floats(&s))
+}
+
+#[test]
+fn norm_q8p_matches_norm_q8_on_many_tokens() {
+    let gpu = Gpu::new();
+    let (len, tokens) = (2560, 5);
+    let h: Vec<f32> = values(len * tokens, 5).iter().map(|x| 20.0 * x).collect();
+    let y: Vec<f32> = values(len * tokens, 6).iter().map(|x| 300.0 * x).collect();
+    let (w1, w2): (Vec<f32>, Vec<f32>) = (values(len, 3).iter().map(|x| 1.0 + x).collect(), values(len, 4).iter().map(|x| 0.5 + x).collect());
+    let (h8, q8, s8) = norm(&gpu, NORM_Q8, [&h, &y, &w1, &w2], len, 32);
+    let (hp, qp, sp) = norm(&gpu, NORM_Q8P, [&h, &y, &w1, &w2], len, 64);
+    assert_eq!(hp, h8, "the residual is the same");
+    let want: Vec<f64> = q8.iter().enumerate().map(|(i, &v)| f64::from(v as i8) * f64::from(s8[i / 32 * 2])).collect();
+    let slack: Vec<f64> = (0..want.len()).map(|i| 0.5 * f64::from(s8[i / 32 * 2])).collect();
+    assert_q8p(&qp, &sp, &want, slack.iter().fold(0f64, |m, &v| m.max(v)));
+}
+
+fn gelu(x: f64) -> f64 {
+    0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+#[test]
+fn geglu_q8p_gates_strided_rows() {
+    let gpu = Gpu::new();
+    // Three tokens of gate and up stacked in one row of 2·width, and a per-layer table of rows 3·width wide.
+    let (width, tokens) = (512, 3);
+    let gate_up: Vec<f32> = values(2 * width * tokens, 1).iter().map(|x| 6.0 * x).collect();
+    let table = values(3 * width * tokens, 2);
+    let (a, b, (q, s)) = (gpu.upload(&gate_up), gpu.upload(&table), out(&gpu, width * tokens));
+    let (pa, pb, pq, ps) = (a.ptr(), b.ptr() + 4 * width as u64, q.ptr(), s.ptr());
+    let (len, w, sa, sb) = ((width * tokens) as u32, width as u32, 2 * width as u32, 3 * width as u32);
+    let args = [arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len), arg(&w), arg(&sa), arg(&sb)];
+    // SAFETY: eight arguments of the kernel's types; every row read lies inside its buffer, the outputs hold `len`.
+    unsafe { gpu.stream.launch(&gpu.module.function(GEGLU_Q8P).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &args) }.unwrap();
+    let want: Vec<f64> = (0..width * tokens)
+        .map(|i| {
+            let (t, j) = (i / width, i % width);
+            gelu(f64::from(gate_up[t * 2 * width + j])) * f64::from(table[t * 3 * width + width + j])
+        })
+        .collect();
+    assert_q8p(&gpu.download(&q), &gpu.floats(&s), &want, 1e-5);
+}
+
+#[test]
+fn embed_decodes_a_row_per_token() {
+    let gpu = Gpu::new();
+    let (rows, cols) = (9, 2560);
+    let w = q4(&values(rows * cols, 11), cols);
+    let tokens = [5u32, 0, 8, 5];
+    let (tok, y) = (gpu.upload(&tokens), gpu.zeros(tokens.len() * cols * 4));
+    let (wd, sd) = (gpu.upload(&w.packed), gpu.upload(&w.scales));
+    let (pw, ps, pt, py, n, scale) = (wd.ptr(), sd.ptr(), tok.ptr(), y.ptr(), cols as u32, 2.0f32);
+    let args = [arg(&pw), arg(&ps), arg(&pt), arg(&py), arg(&n), arg(&scale)];
+    // SAFETY: six arguments of the kernel's types; the table holds `rows × cols` weights, `y` a row per token.
+    unsafe { gpu.stream.launch(&gpu.module.function(EMBED_Q4).unwrap(), [n.div_ceil(256), tokens.len() as u32, 1], [256, 1, 1], 0, &args) }.unwrap();
+    let y = gpu.floats(&y);
+    for (t, &token) in tokens.iter().enumerate() {
+        for i in (0..cols).step_by(97) {
+            let (g, k) = ((token as usize * cols + i) / 64, i % 64);
+            let n = i32::from(w.packed[g * 32 + k / 8 * 4 + k % 4] >> (k % 8 / 4 * 4) & 15) - 8;
+            assert_eq!(y[t * cols + i], n as f32 * tachyon::quant::f16_value(w.scales[g]) * 2.0, "token {t} value {i}");
+        }
+    }
+}
+
+/// Key-value heads in the attention test (each serves four query heads), new tokens, head size, ring, window, and
+/// the first new position.
+const KV: usize = 2;
+const TOKENS: usize = 40;
+const D: usize = 256;
+const CAP: u32 = 1024;
+const WIN: u32 = 512;
+const P0: u32 = 600;
+
+/// What prefill attention reads: the tokens' projections, the norm weights, the RoPE frequencies, the caches as
+/// they were.
+struct Chunk {
+    qkv: Vec<f32>,
+    qn: Vec<f32>,
+    kn: Vec<f32>,
+    freq: Vec<f32>,
+    k: Vec<u16>,
+    v: Vec<u16>,
+}
+
+impl Chunk {
+    fn new() -> Chunk {
+        let weights = |seed| values(D, seed).iter().map(|x| 0.2 + 0.1 * x).collect();
+        let cache = |seed| values(KV * CAP as usize * D, seed).iter().map(|&x| f16_bits(0.3 * x)).collect();
+        Chunk { qkv: values(TOKENS * 6 * KV * D, 3), qn: weights(4), kn: weights(5), freq: rope(10_000.0, D, 1.0), k: cache(6), v: cache(7) }
+    }
+
+    /// [`KV_256`] then [`ATTEND_256P`] on the GPU: the Q8P output, and the counters after.
+    fn gpu(&self, gpu: &Gpu) -> (Vec<u8>, Vec<f32>, Vec<u32>) {
+        let bufs = [
+            gpu.upload(&self.qkv),
+            gpu.upload(&self.qn),
+            gpu.upload(&self.kn),
+            gpu.upload(&self.freq),
+            gpu.upload(&self.k),
+            gpu.upload(&self.v),
+            gpu.upload(&[P0]),
+        ];
+        let [pqkv, pqn, pkn, pfreq, pk, pv, ppos] = bufs.each_ref().map(DevBuf::ptr);
+        let (work, counters, (q, s)) = (gpu.zeros(TOKENS * KV * (8 + 4 * D) * 4), gpu.zeros(TOKENS * KV * 4), out(gpu, TOKENS * 4 * KV * D));
+        let (ptrs, fresh, (cap, win)) = ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], 0u32, (CAP, WIN));
+        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap)];
+        let mut attend: Vec<_> = ptrs[..7].iter().map(arg).collect();
+        attend.extend([arg(&cap), arg(&win), arg(&fresh)]);
+        attend.extend(ptrs[7..].iter().map(arg));
+        // SAFETY: each launch passes its kernel's arguments in order and with their types; every buffer is sized as
+        // the kernels' documentation gives for `TOKENS` tokens.
+        unsafe {
+            gpu.stream.launch(&gpu.module.function(KV_256).unwrap(), [KV as u32, TOKENS as u32, 1], [32, 1, 1], 0, &store).unwrap();
+            gpu.stream.launch(&gpu.module.function(ATTEND_256P).unwrap(), [KV as u32, 1, TOKENS as u32], [32 * ATTEND_WARPS, 1, 1], 0, &attend).unwrap();
+        }
+        (gpu.download(&q), gpu.floats(&s), gpu.words(&counters))
+    }
+
+    /// Head `i` of token `t`.
+    fn head(&self, t: usize, i: usize) -> Vec<f64> {
+        self.qkv[(t * 6 * KV + i) * D..][..D].iter().map(|&v| f64::from(v)).collect()
+    }
+
+    /// Key and value of key-value head `g` at age `age` for token `t`: a new token's, normalized and rotated, or the
+    /// cache's.
+    fn kv(&self, t: usize, age: usize, g: usize) -> (Vec<f64>, Vec<f64>) {
+        let at = P0 as usize + t - age;
+        if age > t {
+            let old = |c: &[u16]| c[(g * CAP as usize + at % CAP as usize) * D..][..D].iter().map(|&h| f64::from(f16_value(h))).collect();
+            return (old(&self.k), old(&self.v));
+        }
+        let (mut k, mut v) = (self.head(t - age, 4 * KV + g), self.head(t - age, 5 * KV + g));
+        normalize(&mut k, Some(&self.kn));
+        rotate(&mut k, &self.freq, at as u32);
+        normalize(&mut v, None);
+        (k, v)
+    }
+
+    /// Every token's heads over its window, in `f64`.
+    fn cpu(&self) -> Vec<f64> {
+        let mut want = Vec::new();
+        for t in 0..TOKENS {
+            let at = P0 as usize + t;
+            for g in 0..KV {
+                let kv: Vec<_> = (0..(at + 1).min(WIN as usize)).map(|age| self.kv(t, age, g)).collect();
+                for h in 4 * g..4 * g + 4 {
+                    let mut q = self.head(t, h);
+                    normalize(&mut q, Some(&self.qn));
+                    rotate(&mut q, &self.freq, at as u32);
+                    want.extend(attention(&q, &kv));
+                }
+            }
+        }
+        want
+    }
+}
+
+/// Prefill attention over a sliding window: [`KV_256`] stores the keys and values of `TOKENS` new tokens at
+/// positions `P0..`, then [`ATTEND_256P`], one block per token and key-value head, attends each over its own window of
+/// a ring longer than the window (older positions from the cache as it was), with Q8P out.
+#[test]
+fn prefill_attention_stores_then_attends_causally() {
+    let (gpu, chunk) = (Gpu::new(), Chunk::new());
+    let ((q, s, counters), want) = (chunk.gpu(&gpu), chunk.cpu());
+    assert_q8p(&q, &s, &want, 1e-3 * want.iter().fold(0f64, |m, v| m.max(v.abs())));
+    assert_eq!(counters, vec![0; TOKENS * KV], "the counters are left at zero");
+}

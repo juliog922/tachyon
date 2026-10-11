@@ -420,7 +420,7 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, i: usize, sms: u32) -> Vec<Op>
     let (d, kv, fresh) = (cfg.head_dim[g], cfg.kv_heads as u32, cfg.source(i) == i);
     let (cap, splits) = if g == 1 { (b.context, sms / kv) } else { (cfg.window as u32, 2 * sms / kv) };
     let ptrs = [b.qkv, n("q_norm"), if fresh { n("k_norm") } else { 0 }, b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]];
-    let args = ptrs.map(A::P).into_iter().chain([A::U(cap), A::U(u32::from(fresh))]).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
+    let args = ptrs.map(A::P).into_iter().chain([A::U(cap), A::U(cap), A::U(u32::from(fresh))]).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
     let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
     vec![
         gemv(w.mat(&format!("{i}.qkv")), b.q, b.qkv),

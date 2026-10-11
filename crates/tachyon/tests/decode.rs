@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Gpu, assert_q8, values};
+use common::{Gpu, assert_q8, attention, normalize, rms, rotate, values};
 use tachyon::cuda::{DevBuf, arg};
 use tachyon::ptx::{ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, NORM_Q8, NORM_THREADS, QUANT_Q8, rope};
 use tachyon::quant::{f16_bits, f16_value, q4, q8};
@@ -97,12 +97,6 @@ impl Norm<'_> {
     }
 }
 
-/// `1 / √(mean(x²) + eps)`.
-fn rms(x: impl ExactSizeIterator<Item = f64>, eps: f64) -> f64 {
-    let n = x.len() as f64;
-    1.0 / (x.map(|v| v * v).sum::<f64>() / n + eps).sqrt()
-}
-
 fn check_norm(gpu: &Gpu, case: &Norm<'_>) {
     let ((h, out), (want_h, want_x)) = (case.gpu(gpu), case.cpu());
     for (i, (&got, want)) in h.iter().zip(&want_h).enumerate() {
@@ -185,12 +179,13 @@ fn embed_decodes_a_row_from_device_or_host_memory() {
 /// Key-value heads in the attention tests; each serves four query heads.
 const KV: usize = 2;
 
-/// One attention launch: head size, cache slots, position of the new token, blocks per key-value head, and whether
+/// One attention launch: head size, cache slots, positions attended, position of the new token, blocks per key-value head, and whether
 /// the layer writes its own key and value.
 #[derive(Debug, Clone, Copy)]
 struct Attend {
     d: usize,
     cap: u32,
+    win: u32,
     pos: u32,
     splits: u32,
     fresh: bool,
@@ -222,7 +217,7 @@ impl Attend {
         let [pqkv, pqn, pkn, pfreq, pk, pv] = bufs.each_ref().map(DevBuf::ptr);
         let (pos, part, count, out) = (gpu.upload(&[self.pos]), gpu.zeros(KV * splits as usize * (8 + 4 * d) * 4), gpu.zeros(4 * KV), q8_out(gpu, 4 * KV * d));
         let (ppos, ppart, pcount, pq, ps) = (pos.ptr(), part.ptr(), count.ptr(), out.0.ptr(), out.1.ptr());
-        let (cap, fresh) = (self.cap, u32::from(self.fresh));
+        let (cap, win, fresh) = (self.cap, self.win, u32::from(self.fresh));
         let args = [
             arg(&pqkv),
             arg(&pqn),
@@ -232,6 +227,7 @@ impl Attend {
             arg(&pv),
             arg(&ppos),
             arg(&cap),
+            arg(&win),
             arg(&fresh),
             arg(&ppart),
             arg(&pcount),
@@ -240,7 +236,7 @@ impl Attend {
         ];
         let f = gpu.module.function(if d == 256 { ATTEND_256 } else { ATTEND_512 }).unwrap();
         for _ in 0..times {
-            // SAFETY: thirteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
+            // SAFETY: fourteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
             unsafe { gpu.stream.launch(&f, [KV as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }.unwrap();
         }
         assert_eq!(gpu.words(&count), [0; KV], "the counters are left at zero");
@@ -249,7 +245,7 @@ impl Attend {
 
     /// The output in `f64`, and the new token's key and value for each key-value head.
     fn cpu(&self, x: &Inputs) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>) {
-        let (d, n, cur) = (self.d, (self.pos + 1).min(self.cap) as usize, (self.pos % self.cap) as usize);
+        let (d, n, cur, cap) = (self.d, (self.pos + 1).min(self.win) as usize, (self.pos % self.cap) as usize, self.cap as usize);
         let head = |i: usize| x.qkv[i * d..][..d].iter().map(|&v| f64::from(v)).collect::<Vec<f64>>();
         let (mut out, mut keys, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         for g in 0..KV {
@@ -260,8 +256,10 @@ impl Attend {
                 normalize(&mut v, None);
             }
             let cached = |c: &[u16], t: usize| -> Vec<f64> { c[(g * self.cap as usize + t) * d..][..d].iter().map(|&h| f64::from(f16_value(h))).collect() };
-            let kv: Vec<(Vec<f64>, Vec<f64>)> =
-                (0..n).map(|t| if self.fresh && t == cur { (k.clone(), v.clone()) } else { (cached(&x.k, t), cached(&x.v, t)) }).collect();
+            let kv: Vec<(Vec<f64>, Vec<f64>)> = (0..n)
+                .map(|age| (cur + cap - age) % cap)
+                .map(|t| if self.fresh && t == cur { (k.clone(), v.clone()) } else { (cached(&x.k, t), cached(&x.v, t)) })
+                .collect();
             for h in 4 * g..4 * g + 4 {
                 let mut q = head(h);
                 normalize(&mut q, Some(&x.qn));
@@ -273,31 +271,6 @@ impl Attend {
         }
         (out, keys, vals)
     }
-}
-
-/// `x / √(mean(x²) + 1e-6)`, times `w` when given.
-fn normalize(x: &mut [f64], w: Option<&[f32]>) {
-    let r = rms(x.iter().copied(), 1e-6);
-    x.iter_mut().enumerate().for_each(|(i, v)| *v *= r * w.map_or(1.0, |w| f64::from(w[i])));
-}
-
-/// RoPE at `pos`: pairs `(i, i + d/2)` turn by `pos · freq[i]`, the angle computed in `f32` as the model does.
-fn rotate(x: &mut [f64], freq: &[f32], pos: u32) {
-    let half = x.len() / 2;
-    for (i, &f) in freq.iter().enumerate() {
-        let (s, c) = f64::from(pos as f32 * f).sin_cos();
-        let (a, b) = (x[i], x[i + half]);
-        (x[i], x[i + half]) = (a * c - b * s, b * c + a * s);
-    }
-}
-
-/// `softmax(q·k) · v` over the positions.
-fn attention(q: &[f64], kv: &[(Vec<f64>, Vec<f64>)]) -> Vec<f64> {
-    let scores: Vec<f64> = kv.iter().map(|(k, _)| q.iter().zip(k).map(|(a, b)| a * b).sum()).collect();
-    let m = scores.iter().fold(f64::NEG_INFINITY, |m, &s| m.max(s));
-    let p: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
-    let z: f64 = p.iter().sum();
-    (0..q.len()).map(|i| kv.iter().zip(&p).map(|((_, v), p)| p * v[i]).sum::<f64>() / z).collect()
 }
 
 fn check_attend(gpu: &Gpu, case: Attend) {
@@ -323,19 +296,21 @@ fn check_attend(gpu: &Gpu, case: Attend) {
 #[test]
 fn attention_over_a_short_context() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 256, cap: 512, pos: 0, splits: 16, fresh: true });
-    check_attend(&gpu, Attend { d: 256, cap: 512, pos: 100, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 0, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 100, splits: 16, fresh: true });
 }
 
 #[test]
 fn attention_over_a_full_sliding_window() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 256, cap: 512, pos: 700, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 700, splits: 16, fresh: true });
+    // A ring longer than the window, as prefill keeps: the 512 newest positions only.
+    check_attend(&gpu, Attend { d: 256, cap: 1024, win: 512, pos: 1700, splits: 16, fresh: true });
 }
 
 #[test]
 fn global_attention_with_its_own_or_a_shared_cache() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 512, cap: 2048, pos: 1500, splits: 32, fresh: true });
-    check_attend(&gpu, Attend { d: 512, cap: 2048, pos: 1500, splits: 256, fresh: false });
+    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 32, fresh: true });
+    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 256, fresh: false });
 }

@@ -13,17 +13,21 @@
 //! - [`QUANT_Q8`] quantizes an `f32` vector to Q8. Arguments: `x`, Q8 out, `len: u32`.
 //!   Launch `len.div_ceil(256)` blocks of 256.
 //! - [`QUANT_Q8P`] quantizes an `f32` vector to Q8P, the prefill layout ([`crate::quant::q8p`]). Arguments as
-//!   [`QUANT_Q8`]; `len` is a multiple of 64. Launch `len.div_ceil(512)` blocks of 256.
+//!   [`QUANT_Q8`]; `len` is a multiple of 64. Launch `len.div_ceil(256)` blocks of 256. [`GEGLU_Q8P`] quantizes
+//!   `gelu(a)·b` to Q8P over rows: value `i` reads `a[(i / width)·sa + i % width]` and `b` alike with `sb`, so
+//!   gate and up stacked in one row, or one layer's slice of the per-layer inputs, are read in place. Arguments:
+//!   `a, b`, Q8P out, `len, width, sa, sb: u32`. Launch as [`QUANT_Q8P`].
 //! - [`GEGLU_Q8`] quantizes `gelu(a[i]) · b[i]`, GELU in its tanh form, to Q8. Arguments: `a`, `b`, Q8 out,
 //!   `len: u32`. Launch as [`QUANT_Q8`].
-//! - [`NORM_Q8`] is the residual step: when `y` is not null, `h' = (h + w1 ⊙ rmsnorm(y)) · scale` is written to
+//! - [`NORM_Q8`] is the residual step (and [`NORM_Q8P`] the same with Q8P out, chunks being tokens): when `y` is not null, `h' = (h + w1 ⊙ rmsnorm(y)) · scale` is written to
 //!   `h_out` (another buffer: every block reads all of `h`); then Q8 out of `w2 ⊙ rmsnorm(h')`, or of `h'` when
 //!   `w2` is null, where `h'` is `h` when `y` is null; no Q8 when `q` is null. `rmsnorm(x) = x / √(mean(x²) + eps)`.
 //!   Arguments: `h, h_out, y, w1, w2: *f32`, Q8 out, `len: u32, eps: f32, scale: f32`. `len` is a multiple of
 //!   [`NORM_THREADS`] up to 16 times it; vectors may hold several chunks of `len`, each normalized on its own with
 //!   the same weights. Launch a grid of `(len / NORM_THREADS, chunks)` blocks of [`NORM_THREADS`]: every block
 //!   reduces its whole chunk and writes one slice of it, so a vector spreads over several multiprocessors.
-//! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`. Arguments:
+//! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`; with a grid `y` of
+//!   several, block row `y` takes `token[y]` and writes row `y` of `out`. Arguments:
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
 //! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`]: see [`gemm`].
@@ -36,7 +40,7 @@ pub mod gemm;
 pub mod gemv;
 pub mod sample;
 
-pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_KV, rope};
+pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_KV, KV_256, KV_512, rope};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -47,6 +51,10 @@ use std::fmt::Write;
 pub const QUANT_Q8: &str = "quant_q8";
 /// Name of the quantizer to the prefill layout, Q8P.
 pub const QUANT_Q8P: &str = "quant_q8p";
+/// Name of the GELU-gated quantizer to Q8P.
+pub const GEGLU_Q8P: &str = "geglu_q8p";
+/// Name of the residual and normalization step with Q8P out.
+pub const NORM_Q8P: &str = "norm_q8p";
 /// Name of the GELU-gated quantizer.
 pub const GEGLU_Q8: &str = "geglu_q8";
 /// Name of the residual and normalization step.
@@ -64,15 +72,21 @@ pub fn module() -> String {
     let kernels = [
         quant(QUANT_Q8, ""),
         quant(GEGLU_Q8, GELU),
-        quant_p(),
-        norm(),
+        quant_p(QUANT_Q8P, false),
+        quant_p(GEGLU_Q8P, true),
+        norm(false),
+        norm(true),
         EMBED.into(),
         gemv::gemv_q4(UNROLL, 32),
         gemv::gemv_q4(UNROLL, 8),
         gemm::gemm_q4(),
         gemm::mma_peak(),
-        attend::attend(256),
-        attend::attend(512),
+        attend::attend(256, false),
+        attend::attend(512, false),
+        attend::attend(256, true),
+        attend::attend(512, true),
+        attend::store(256),
+        attend::store(512),
         SPIN_PTX.into(),
     ];
     kernels.iter().fold(String::from(".version 7.1\n.target sm_80\n.address_size 64\n"), |m, k| m + "\n" + k) + &sample::sample()
@@ -105,7 +119,7 @@ fn block(op: &str, xs: &[&str], warps: u32) -> String {
 
 /// Thread, lane and warp, and the shared slots [`block`] reduces through.
 const BLOCK: &str = "
-    .shared .align 4 .f32 red[128];
+    .shared .align 8 .f32 red[128];
     .reg .pred %lane0, %bp;
     .reg .b32 %th, %lane, %warp, %rw, %rl;
     .reg .f32 %bt;
@@ -151,29 +165,36 @@ fn q8(x: &str, i: &str) -> String {
     )
 }
 
-/// Stores `x0, x1`, values `i, i + 1` of a vector (`i` even), as Q8P ([`crate::quant::q8p`]): each warp holds 64
-/// consecutive values, one block, quantized as in [`q8`], and its first lane writes `[s, z]`.
-fn q8p(x0: &str, x1: &str, i: &str) -> String {
+/// Stores `x`, value `i` of a vector, as Q8P ([`crate::quant::q8p`]): a block of 64 values is two consecutive
+/// warps, which trade their maxima and sums through [`BLOCK`]'s shared slots; the even warp's first lane writes
+/// `[s, z]`. Every thread of the block must run it; threads where predicate `valid` (if any) is false store nothing.
+fn q8p(x: &str, i: &str, valid: &str) -> String {
+    let (guard, both) = if valid.is_empty() { (String::new(), String::new()) } else { (format!("@{valid} "), format!("    and.pred %qz, %qz, {valid};\n")) };
     format!(
-        "    abs.f32 %qa, {x0};\n    abs.f32 %qb, {x1};\n    max.f32 %qa, %qa, %qb;\n{}    div.rn.f32 %qd, %qa, 0f42FE0000;
+        "    abs.f32 %qa, {x};\n{}    @%lane0 st.shared.f32 [%rw], %qa;
+    bar.sync 0;
+    xor.b32 %qt, %rw, 4;
+    ld.shared.f32 %qb, [%qt];
+    max.f32 %qa, %qa, %qb;
+    div.rn.f32 %qd, %qa, 0f42FE0000;
     setp.gt.f32 %qz, %qa, 0f00000000;
     div.rn.f32 %qi, 0f42FE0000, %qa;
     selp.f32 %qi, %qi, 0f00000000, %qz;
-    mul.rn.f32 %qv, {x0}, %qi;
+    mul.rn.f32 %qv, {x}, %qi;
     cvt.rni.s32.f32 %qn, %qv;
-    mul.rn.f32 %qv, {x1}, %qi;
-    cvt.rni.s32.f32 %qk, %qv;
     cvt.u64.u32 %qo, {i};
     add.u64 %qo, %qp, %qo;
-    st.global.v2.s8 [%qo], {{%qn, %qk}};
-    add.s32 %qn, %qn, %qk;\n{}    and.b32 %qt, {i}, 63;
-    setp.eq.u32 %qz, %qt, 0;
-    cvt.rn.f32.s32 %qf, %qn;
+    {guard}st.global.s8 [%qo], %qn;\n{}    @%lane0 st.shared.u32 [%rw+64], %qn;
+    bar.sync 0;
+    ld.shared.u32 %qm, [%qt+64];
+    add.s32 %qn, %qn, %qm;
+    and.b32 %qk, {i}, 63;
+    setp.eq.u32 %qz, %qk, 0;\n{both}    cvt.rn.f32.s32 %qf, %qn;
     mul.rn.f32 %qf, %qf, %qd;
     mul.rn.f32 %qf, %qf, 0fC1000000;
     fma.rn.f32 %qf, %qd, 0fCB400000, %qf;
-    shr.u32 %qt, {i}, 6;
-    mul.wide.u32 %qo, %qt, 8;
+    shr.u32 %qk, {i}, 6;
+    mul.wide.u32 %qo, %qk, 8;
     add.u64 %qo, %sp, %qo;
     @%qz st.global.v2.f32 [%qo], {{%qd, %qf}};\n",
         warp("max.f32", "%qa", "%qb"),
@@ -181,39 +202,57 @@ fn q8p(x0: &str, x1: &str, i: &str) -> String {
     )
 }
 
-/// [`QUANT_Q8P`]: two values per thread.
-fn quant_p() -> String {
+/// [`QUANT_Q8P`] and [`GEGLU_Q8P`]: value `i` of `len` per thread, `x = a[i]`, or `gelu(a[ia])·b[ib]` with
+/// `ia = (i / width)·sa + i % width`, `ib` alike with `sb`. Threads past `len` take 0 and store nothing.
+fn quant_p(name: &str, gate: bool) -> String {
+    let params = if gate { ".param .u64 pb, " } else { "" };
+    let extra = if gate { ", .param .u32 pwidth, .param .u32 psa, .param .u32 psb" } else { "" };
+    let (mut index, mut load) = ("    mul.wide.u32 %qo, %i, 4;\n    add.u64 %a, %a, %qo;\n".to_string(), String::new());
+    if gate {
+        index = "    ld.param.u32 %w, [pwidth];\n    div.u32 %t, %i, %w;\n    rem.u32 %j, %i, %w;\n    ld.param.u32 %sa, [psa];
+    mad.lo.u32 %sa, %t, %sa, %j;\n    mul.wide.u32 %qo, %sa, 4;\n    add.u64 %a, %a, %qo;\n    ld.param.u32 %sb, [psb];
+    mad.lo.u32 %sb, %t, %sb, %j;\n    mul.wide.u32 %qo, %sb, 4;\n    ld.param.u64 %b, [pb];\n    cvta.to.global.u64 %b, %b;\n    add.u64 %b, %b, %qo;\n"
+            .into();
+        load = "    @%in ld.global.f32 %y, [%b];\n".to_string() + GELU_P;
+    }
     format!(
-        ".visible .entry {QUANT_Q8P}(.param .u64 px, .param .u64 pq, .param .u64 ps, .param .u32 plen)
-{{{Q8}
-    .reg .pred %p;
-    .reg .b32 %i, %n, %len;
-    .reg .f32 %x0, %x1;
-    .reg .b64 %a;
+        ".visible .entry {name}(.param .u64 px, {params}.param .u64 pq, .param .u64 ps, .param .u32 plen{extra})
+{{{BLOCK}{Q8}
+    .reg .pred %in;
+    .reg .b32 %i, %n, %len, %w, %t, %j, %sa, %sb;
+    .reg .f32 %x, %y, %u;
+    .reg .b64 %a, %b;
     mov.u32 %i, %ctaid.x;
     mov.u32 %n, %ntid.x;
-    mov.u32 %len, %tid.x;
-    mad.lo.u32 %i, %i, %n, %len;
-    shl.b32 %i, %i, 1;
+    mad.lo.u32 %i, %i, %n, %th;
     ld.param.u32 %len, [plen];
-    setp.ge.u32 %p, %i, %len;
-    @%p bra EXIT;
+    setp.lt.u32 %in, %i, %len;
     ld.param.u64 %qp, [pq];
     ld.param.u64 %sp, [ps];
     cvta.to.global.u64 %qp, %qp;
     cvta.to.global.u64 %sp, %sp;
     ld.param.u64 %a, [px];
     cvta.to.global.u64 %a, %a;
-    mul.wide.u32 %qo, %i, 4;
-    add.u64 %a, %a, %qo;
-    ld.global.v2.f32 {{%x0, %x1}}, [%a];
-{}EXIT:
-    ret;
+{index}    mov.f32 %x, 0f00000000;
+    mov.f32 %y, 0f00000000;
+    @%in ld.global.f32 %x, [%a];
+{load}{}    ret;
 }}
 ",
-        q8p("%x0", "%x1", "%i")
+        q8p("%x", "%i", "%in")
     )
 }
+
+/// `%x ← gelu(%x) · %y`, as [`GELU`] computes it, with `%u` for scratch.
+const GELU_P: &str = "    mul.f32 %u, %x, %x;
+    fma.rn.f32 %u, %u, 0f3D372713, 0f3F800000;
+    mul.f32 %u, %u, %x;
+    mul.f32 %u, %u, 0fC0135761;
+    ex2.approx.f32 %u, %u;
+    add.f32 %u, %u, 0f3F800000;
+    div.rn.f32 %x, %x, %u;
+    mul.f32 %x, %x, %y;
+";
 
 /// One value per thread: `%x = a[i]`, with `%qo` the byte offset of `i`; `EXIT` for threads past the end.
 const QUANT: &str = "
@@ -354,7 +393,7 @@ fn dot(sum: &str, a: &str, b: &str) -> String {
     })
 }
 
-fn norm() -> String {
+fn norm(prefill: bool) -> String {
     let (mut loads, mut loads2, mut residual, mut own) = (String::new(), String::new(), String::new(), String::new());
     for k in 0..PER_THREAD {
         let (at, t) = (1024 * k, 256 * k);
@@ -372,7 +411,8 @@ fn norm() -> String {
         .replace("SUM\n", &block("add.f32", &["%ss", "%sh", "%su", "%uu"], NORM_THREADS / 32))
         .replace("RESIDUAL\n", &residual)
         .replace("OWN\n", &own)
-        .replace("Q8\n", &q8("%x", "%gi"))
+        .replace("Q8\n", &if prefill { q8p("%x", "%gi", "") } else { q8("%x", "%gi") })
+        .replace("norm_q8(", if prefill { "norm_q8p(" } else { "norm_q8(" })
 }
 
 /// [`EMBED_Q4`]: thread `i` decodes weight `i` of row `token`, as [`crate::quant`] packs it.
@@ -410,6 +450,9 @@ const EMBED: &str = "
     @%p bra EXIT;
     ld.param.u64 %a, [ptok];
     cvta.to.global.u64 %a, %a;
+    mov.u32 %tok, %ctaid.y;
+    mul.wide.u32 %o, %tok, 4;
+    add.u64 %a, %a, %o;
     ld.global.u32 %tok, [%a];
     shr.u32 %g, %i, 6;
     shr.u32 %t, %cols, 6;
@@ -449,6 +492,8 @@ const EMBED: &str = "
     mul.f32 %x, %x, %scale;
     ld.param.u64 %a, [py];
     cvta.to.global.u64 %a, %a;
+    mov.u32 %t, %ctaid.y;
+    mad.lo.u32 %i, %t, %cols, %i;
     mul.wide.u32 %o, %i, 4;
     add.u64 %a, %a, %o;
     st.global.f32 [%a], %x;
