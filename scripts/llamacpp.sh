@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# The step-6 comparison: llama.cpp with CUDA, built at a pinned commit, decoding Gemma 4 E4B in Q4_0 (4.5 bits per
-# weight; Tachyon's Q4 is 4.25), measured by llama-bench as Tachyon's `generate` bench measures it: batch 1, 256 tokens.
+# The step-6 and step-7 comparisons: llama.cpp with CUDA, built at a pinned commit, running Gemma 4 E4B in Q4_0 (4.5
+# bits per weight; Tachyon's Q4 is 4.25), measured by llama-bench as Tachyon's `generate` bench measures it: decoding
+# 256 tokens at batch 1 (tg256), and prompts of 64 to 8192 tokens (pp64…pp8192) for the time to first token, which
+# Tachyon's figure exceeds by one decode step.
 # Needs git, cmake, a C++ compiler, the CUDA Toolkit (nvcc) and Python with torch and transformers.
 #
 #   scripts/llamacpp.sh ~/models/gemma-4-E4B-it
@@ -22,4 +24,4 @@ if [[ ! -f $q4 ]]; then
     [[ -f $bf16 ]] || python3 "$dir/convert_hf_to_gguf.py" "$src" --outtype bf16 --outfile "$bf16"
     "$dir/build/bin/llama-quantize" "$bf16" "$q4" Q4_0 >/dev/null
 fi
-"$dir/build/bin/llama-bench" -m "$q4" -ngl 99 -fa 1 -p 0 -n 256 -r 5
+"$dir/build/bin/llama-bench" -m "$q4" -ngl 99 -fa 1 -p 64,256,512,1024,2048,4096,8192 -n 256 -r 5
