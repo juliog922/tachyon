@@ -13,15 +13,18 @@
 //!
 //! # Status
 //!
-//! Development step 5 of the spec: [`cuda`], the driver layer every later
-//! module builds on; [`wpk`], the weight file format and its loader; [`ptx`],
-//! the decode kernels, with [`quant`] their weight layouts; and [`token`], the
-//! tokenizer, with [`json`] to read model files. The inference API comes in later steps.
+//! Development step 6 of the spec: [`engine`], the chat API, on [`model`],
+//! Gemma 4's decoder and its conversion from Hugging Face checkpoints;
+//! [`cuda`], the driver layer every other module builds on; [`wpk`], the
+//! weight file format and its loader; [`ptx`], the decode kernels, with
+//! [`quant`] their weight layouts; and [`token`], the tokenizer and chat
+//! template, with [`json`] to read model files.
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("tachyon targets x86_64 Linux only");
 
 pub mod cuda;
+pub mod engine;
 mod error;
 pub mod json;
 pub mod model;

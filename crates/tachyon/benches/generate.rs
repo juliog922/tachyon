@@ -26,12 +26,13 @@ const STEPS: usize = 256;
 fn steps(gpu: &Gpu, suite: &mut Suite, dir: &std::path::Path) -> Duration {
     let mut dec = Decoder::open(&gpu.ctx, dir, &Settings::default()).unwrap();
     let (mut times, mut last) = (Vec::new(), Instant::now());
-    dec.generate(2, |_| {
+    dec.start(2).unwrap();
+    for _ in 0..WARM + STEPS {
+        dec.next_token().unwrap();
         times.push(last.elapsed());
         last = Instant::now();
-        times.len() < WARM + STEPS
-    })
-    .unwrap();
+    }
+    dec.stop().unwrap();
     let mut times = times.into_iter().skip(WARM);
     suite.run("decode", STEPS, || times.next().unwrap_or_default())
 }

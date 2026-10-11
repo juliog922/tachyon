@@ -22,6 +22,20 @@ On WSL2 the driver lives on Windows and is found at `/usr/lib/wsl/lib/libcuda.so
 ```sh
 cargo run --release -p tachyon-cli -- gpu          # the GPUs the driver sees
 cargo run --release -p tachyon-cli -- gpu --json
+hf download google/gemma-4-E4B-it --local-dir ~/models/gemma-4-E4B-it
+cargo run --release -p tachyon-cli -- convert ~/models/gemma-4-E4B-it ~/.local/share/tachyon/gemma-4-e4b
+cargo run --release -p tachyon-cli -- run ~/.local/share/tachyon/gemma-4-e4b "Why is the sky blue?"
+```
+
+In your program, `tachyon::engine` is the API (see its documentation):
+
+```rust
+let mut engine = Engine::open("gemma-4-e4b".as_ref(), &Default::default())?;
+let messages = [Message { role: Role::User, text: "Why is the sky blue?" }];
+let mut answer = engine.chat(&Request::new(&messages))?;
+while let Some(text) = answer.next_text()? {
+    print!("{text}");
+}
 ```
 
 ## Layout
@@ -76,6 +90,13 @@ TACHYON_MODELS=~/models cargo test -p tachyon --features models --test token
 TACHYON_MODELS=~/models cargo bench -p tachyon --bench token
 ```
 
+The engine's agreement test compares the converted Gemma 4 E4B (`$TACHYON_MODEL`, by default `~/.local/share/tachyon/gemma-4-e4b`) with Hugging Face's answers in bfloat16, made once on a 20 GB GPU by `scripts/reference.py` and committed:
+
+```sh
+python3 scripts/reference.py ~/models/gemma-4-E4B-it > crates/tachyon/tests/fixtures/gemma-4-e4b.ref
+cargo test --release -p tachyon --features gpu,models --test engine -- --nocapture
+```
+
 ## Tests and benchmarks on a GPU
 
 ```sh
@@ -99,8 +120,8 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 2 | Weight file format and `io_uring` loader | done |
 | 3 | 4-bit GEMV kernel at ≥ 90% of VRAM bandwidth | done |
 | 4 | Remaining decode kernels | done |
-| 5 | Tokenizer and chat template | built; speed gate pending on your machines |
-| 6 | Gemma 4 E4B text generation | |
+| 5 | Tokenizer and chat template | done |
+| 6 | Gemma 4 E4B text generation | decode at 81% of the roofline on the RTX 3060 Laptop; chat API built |
 | 7 | Prefill on tensor cores | |
 | 8 | Residency, keep-alive, model switching | |
 | 9 | `pull`, catalog, conversion | |

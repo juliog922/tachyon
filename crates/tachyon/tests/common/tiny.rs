@@ -84,7 +84,10 @@ pub fn checkpoint(name: &str, seed: u64) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tachyon-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::copy(fixtures.join("toy.json"), dir.join("tokenizer.json")).unwrap();
+    // The toy tokenizer, with Gemma 4's chat markers in place of three of its special tokens.
+    let toy = std::fs::read_to_string(fixtures.join("toy.json")).unwrap();
+    let toy = toy.replace("<start_of_turn>", "<|turn>").replace("<end_of_turn>", "<turn|>").replace("<pad>", "<|think|>");
+    std::fs::write(dir.join("tokenizer.json"), toy).unwrap();
     std::fs::write(dir.join("config.json"), config()).unwrap();
     let (mut head, mut data) = (String::from("{"), Vec::new());
     for (name, shape, values) in tensors(seed) {

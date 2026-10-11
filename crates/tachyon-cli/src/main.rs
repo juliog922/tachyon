@@ -5,8 +5,8 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 use tachyon::cuda::{self, DeviceInfo};
-use tachyon::model::Decoder;
-use tachyon::token::{Chat, Detokenizer, Message, Role, Tokenizer};
+use tachyon::engine::{Engine, Request};
+use tachyon::token::{Message, Role};
 
 const HELP: &str = "tachyon: embedded inference on NVIDIA GPUs
 
@@ -54,50 +54,23 @@ fn done(r: tachyon::Result<()>) -> ExitCode {
     )
 }
 
-/// Answers `prompt` with the model in `dir`: the prompt through the chat template, then greedy tokens to the end of
-/// the turn (at most 512), printed as they come.
+/// Answers `prompt` with the model in `dir`, greedily, printing the text as it comes, then the speed.
 fn run(dir: &std::path::Path, prompt: &str) -> tachyon::Result<()> {
-    let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok"))?)?;
-    let chat = Chat::gemma4(&tok)?;
-    let mut ids = Vec::new();
-    chat.encode(&tok, &[Message { role: Role::User, text: prompt }], false, &mut ids);
-    let ctx = cuda::Context::new(0)?;
-    let mut dec = Decoder::open(&ctx, dir, &tachyon::model::Settings::default())?;
-    let start = std::time::Instant::now();
-    let first = ids.iter().map(|&t| dec.step(t)).last().unwrap_or(Ok(0))?;
-    let (prefill, mid) = (start.elapsed(), std::time::Instant::now());
-    let count = generate(&mut dec, &tok, first, chat.end_of_turn())?;
-    let (decode, rate) = (mid.elapsed(), |n: f64, t: std::time::Duration| n / t.as_secs_f64());
-    let n = ids.len();
-    eprintln!(
-        "\n{n} prompt tokens in {prefill:.2?} ({:.1} tok/s); {count} tokens in {decode:.2?} ({:.1} tok/s)",
-        rate(n as f64, prefill),
-        rate(count as f64, decode)
-    );
-    Ok(())
-}
-
-/// Prints the text of `first` and the tokens after it until `end` or 512 tokens; returns how many it printed.
-fn generate(dec: &mut Decoder, tok: &Tokenizer, first: u32, end: u32) -> tachyon::Result<usize> {
     use std::io::Write as _;
-    let (mut text, mut detok, mut count) = (String::new(), Detokenizer::default(), 0);
-    let mut show = |t: u32| {
-        let more = t != end && t != 1 && count < 512;
-        if more {
-            detok.push(tok, t, &mut text);
-            print!("{text}");
-            let _ = std::io::stdout().flush();
-            text.clear();
-            count += 1;
-        }
-        more
-    };
-    if show(first) {
-        dec.generate(first, &mut show)?;
+    let mut engine = Engine::open(dir, &tachyon::model::Settings::default())?;
+    let messages = [Message { role: Role::User, text: prompt }];
+    let start = std::time::Instant::now();
+    let mut answer = engine.chat(&Request::new(&messages))?;
+    let (prefill, mid) = (start.elapsed(), std::time::Instant::now());
+    while let Some(text) = answer.next_text()? {
+        print!("{text}");
+        let _ = std::io::stdout().flush();
     }
-    detok.finish(&mut text);
-    println!("{text}");
-    Ok(count)
+    let (decode, n, count) = (mid.elapsed(), answer.prompt(), answer.tokens());
+    let rate = |n: usize, t: std::time::Duration| n as f64 / t.as_secs_f64();
+    println!();
+    eprintln!("{n} prompt tokens in {prefill:.2?} ({:.1} tok/s); {count} tokens in {decode:.2?} ({:.1} tok/s)", rate(n, prefill), rate(count, decode));
+    Ok(())
 }
 
 fn gpu(json: bool) -> ExitCode {

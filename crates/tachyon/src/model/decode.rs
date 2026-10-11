@@ -77,6 +77,8 @@ pub struct Decoder {
     cfg: Config,
     stream: Stream,
     done: Vec<Event>,
+    /// The recording [`Decoder::next_token`] waits for.
+    at: usize,
     tokens: HostBuf,
     control: DevBuf,
     arena: DevBuf,
@@ -187,7 +189,7 @@ impl Decoder {
         }
         let (graphs, done) = record(&stream, &module, &steps)?;
         let ops = steps.swap_remove(0);
-        let mut dec = Decoder { graphs, cfg, stream, done, tokens, control: ctl, arena, logits: b.logits, loader, ops, module, _keep: (weights, host) };
+        let mut dec = Decoder { graphs, cfg, stream, done, at: 0, tokens, control: ctl, arena, logits: b.logits, loader, ops, module, _keep: (weights, host) };
         dec.reset(&Sampling::default())?;
         Ok(dec)
     }
@@ -197,12 +199,15 @@ impl Decoder {
         &self.cfg
     }
 
-    /// Starts a new sequence at position 0, with `sampling` (its soft cap replaced by the model's) and nothing seen.
+    /// Starts a new sequence at position 0, with `sampling` (its soft cap replaced by the model's) and nothing seen;
+    /// a generation still running stops first.
     pub fn reset(&mut self, sampling: &Sampling) -> Result<()> {
+        self.stop()?;
         self.loader.upload(&control(&self.cfg, &Sampling { softcap: self.cfg.softcap, ..*sampling }).0, &self.control)
     }
 
-    /// Runs one step on `token` at the next position and returns the token sampled after it.
+    /// Runs one step on `token` at the next position and returns the token sampled after it. Not while a generation
+    /// runs: [`Decoder::stop`] it first.
     pub fn step(&mut self, token: u32) -> Result<u32> {
         self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
         self.queue(0)?;
@@ -210,20 +215,26 @@ impl Decoder {
         Ok(self.token(0))
     }
 
-    /// Generates from `token` at the next position, handing each sampled token to `next` until it returns false.
-    /// One step is always queued behind the running one, so the GPU never waits for the CPU. The token `next`
-    /// refuses has still been fed to the model by the step queued behind it, whose own sample is dropped: the
-    /// sequence continues after the refused token.
-    pub fn generate(&mut self, token: u32, mut next: impl FnMut(u32) -> bool) -> Result<()> {
+    /// Starts generating from `token` at the next position: queues its step, which [`Decoder::next_token`] waits for.
+    pub fn start(&mut self, token: u32) -> Result<()> {
         self.tokens[4..].copy_from_slice(&token.to_ne_bytes());
-        self.queue(0)?;
-        for i in 0.. {
-            self.queue((i + 1) % 2)?;
-            self.done[i % 2].sync()?;
-            if !next(self.token(i % 2)) {
-                break;
-            }
-        }
+        self.at = 0;
+        self.queue(0)
+    }
+
+    /// The token the running step samples. Queues the step on it first, so the GPU never waits for the CPU: one
+    /// step is always queued behind the running one.
+    pub fn next_token(&mut self) -> Result<u32> {
+        let g = self.at;
+        self.queue(1 - g)?;
+        self.done[g].sync()?;
+        self.at = 1 - g;
+        Ok(self.token(g))
+    }
+
+    /// Ends a generation: waits for the step still queued, which feeds the model the last token [`Decoder::next_token`]
+    /// returned (its own sample is dropped), so the sequence continues after that token.
+    pub fn stop(&mut self) -> Result<()> {
         self.stream.sync()
     }
 

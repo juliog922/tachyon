@@ -415,6 +415,7 @@ impl Detokenizer {
                 }
             }
         }
-        self.pending = rest.to_vec();
+        let used = self.pending.len() - rest.len();
+        self.pending.drain(..used);
     }
 }

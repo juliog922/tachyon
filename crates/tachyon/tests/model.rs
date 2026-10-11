@@ -78,11 +78,11 @@ fn tiny_model_decodes_as_the_reference() {
         let mut token = dec.step(tokens[0]).unwrap();
         run.push(token);
         if i == 0 {
-            dec.generate(token, |t| {
-                run.push(t);
-                run.len() < 5
-            })
-            .unwrap();
+            dec.start(token).unwrap();
+            while run.len() < 5 {
+                run.push(dec.next_token().unwrap());
+            }
+            dec.stop().unwrap();
         }
         while run.len() < 5 {
             token = dec.step(token).unwrap();

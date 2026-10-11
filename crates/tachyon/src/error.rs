@@ -27,6 +27,13 @@ pub enum Error {
     Io(i32),
     /// A file is not a valid `.wpk`, or its contents do not match their checksums.
     Format(String),
+    /// A prompt does not fit the context the model was loaded with.
+    TooLong {
+        /// The prompt's tokens.
+        tokens: usize,
+        /// Positions the context holds.
+        context: usize,
+    },
 }
 
 /// `Result` with [`Error`].
@@ -43,6 +50,7 @@ impl fmt::Display for Error {
             Error::Cuda(code) => write!(f, "CUDA error {code} ({})", crate::cuda::error_name(*code)),
             Error::Io(errno) => write!(f, "{}", std::io::Error::from_raw_os_error(*errno)),
             Error::Format(why) => write!(f, "invalid weight file: {why}"),
+            Error::TooLong { tokens, context } => write!(f, "the prompt has {tokens} tokens; the context holds {context} positions"),
         }
     }
 }
