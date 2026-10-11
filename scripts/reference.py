@@ -52,6 +52,9 @@ PROMPTS = [
 
 
 def main(src):
+    gpu = torch.cuda.get_device_properties(0)
+    if gpu.total_memory < 20e9:
+        sys.exit(f"the bfloat16 model needs a GPU with 20 GB; {gpu.name} has {gpu.total_memory / 1e9:.0f} GB")
     tok = AutoTokenizer.from_pretrained(src)
     model = Gemma4ForConditionalGeneration.from_pretrained(src, dtype=torch.bfloat16).to("cuda").eval()
     for text in PROMPTS:

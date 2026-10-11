@@ -7,13 +7,14 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Changed
 
 - The `generate` bench checks the step-6 gate (≥ 80% of the roofline) on the RTX 3060 only; on other GPUs it prints the figure.
+- Q4 conversion picks each group's scale among 13 candidates by least rounding error, instead of the largest weight over 7: top-1 agreement with bfloat16 Gemma 4 E4B rises from 83% to 88% at the same size and speed (`scripts/agreement.py` measures it). Quantization runs on every core.
 - `Detokenizer` keeps its unfinished bytes in place instead of reallocating them per token.
 - Attention gives each block at least 24 positions and loads a chunk of positions' keys and values at once, instead of relying on prefetch hints, which the RTX 3060 ignores: 11 µs → 8 µs per sliding layer at short contexts.
 
 ### Added
 
 - `tachyon::engine`: the chat API. `Engine::open` loads a model directory on GPU 0; `Engine::chat` takes a `Request` (messages, thinking, sampling, most tokens) and returns a `TokenStream`, whose `next_text` hands out the answer's text as it is generated, allocating nothing; dropping the stream cancels the answer. A prompt longer than the context is `Error::TooLong`. `tachyon run` is built on it.
-- `scripts/reference.py`, which writes Hugging Face's bfloat16 answers for the engine's top-1 agreement test.
+- `scripts/reference.py`, which writes Hugging Face's bfloat16 answers for the engine's top-1 agreement test (≥ 86%), and `scripts/agreement.py`, which measures what each way of rounding the weights allows.
 - `Decoder::start`, `next_token` and `stop`: decoding with the next step always queued behind the running one (two recordings of the step trade the token words), so the GPU never waits for the CPU. `Decoder::timeline` and `Decoder::alone` profile a step kernel by kernel and each kind of kernel alone; the `generate` benchmark reports both and gates decode at ≥ 80% of the roofline: 107–109 tok/s on the RTX 3060 Laptop (81–83%), against 61–77 tok/s for Ollama (llama.cpp) on the same machine.
 - `ptx::GEMV_Q4_NARROW`, the decode GEMV for rows of 256 weights: 8 lanes per row. `ptx::SPIN`, a kernel that holds the GPU, for profiling.
 - `tachyon::model::Decoder`: Gemma 4 on the GPU. One decode step (embedding, per-layer inputs, 42 layers of sliding or global attention with shared caches, LM head, sampler) is recorded once as a CUDA Graph; the token goes in and comes out through one pinned host word, so the CPU only waits. Tested against a CPU reference that matches Hugging Face transformers to 1e-5, on a generated tiny Gemma 4. `tachyon run <model> <prompt>` answers a prompt greedily and reports the speed.

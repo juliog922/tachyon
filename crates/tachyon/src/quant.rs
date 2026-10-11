@@ -2,7 +2,7 @@
 //! the same code is the reference the GPU tests check the kernels against.
 //!
 //! **Q4 weights.** A `rows × cols` matrix, row-major, `cols` a multiple of [`GROUP`]. Each group of 64 weights
-//! along a row shares one f16 scale `d`; weight `w ≈ (n − 8)·d` with `n` in 0..=15. Packed: 32 bytes per group,
+//! along a row shares one f16 scale `d`, the one whose rounding errs least; weight `w ≈ (n − 8)·d` with `n` in 0..=15. Packed: 32 bytes per group,
 //! as 8 words of 4 bytes; word `m` holds weights `8m..8m+8`, byte `b` of it weight `8m+b` in the low nibble and
 //! `8m+4+b` in the high one. Masking a word with `0x0F0F0F0F` then gives four weights that line up with four
 //! consecutive activation bytes, ready for `dp4a`. Scales are a separate `rows × cols/64` array.
@@ -31,25 +31,50 @@ pub struct Q4 {
     pub scales: Vec<u16>,
 }
 
-/// Quantizes a row-major matrix whose rows are `cols` long.
+/// Quantizes a row-major matrix whose rows are `cols` long, on every core.
 ///
 /// # Panics
 /// When `cols` is not a multiple of [`GROUP`], or `w` not a whole number of rows.
 pub fn q4(w: &[f32], cols: usize) -> Q4 {
     assert!(cols % GROUP == 0 && w.len() % cols == 0, "rows are a whole number of {GROUP}-weight groups");
-    let mut packed = vec![0u8; w.len() / 2];
-    let mut scales = Vec::with_capacity(w.len() / GROUP);
+    let (mut packed, mut scales) = (vec![0u8; w.len() / 2], vec![0u16; w.len() / GROUP]);
+    let per = (w.len() / GROUP).div_ceil(std::thread::available_parallelism().map_or(1, usize::from)).max(1) * GROUP;
+    std::thread::scope(|s| {
+        for ((w, packed), scales) in w.chunks(per).zip(packed.chunks_mut(per / 2)).zip(scales.chunks_mut(per / GROUP)) {
+            s.spawn(move || pack(w, packed, scales));
+        }
+    });
+    Q4 { packed, scales }
+}
+
+/// Quantizes whole groups of `w` into `packed` and `scales`.
+fn pack(w: &[f32], packed: &mut [u8], scales: &mut [u16]) {
     for (g, group) in w.chunks_exact(GROUP).enumerate() {
-        let scale = f16_bits(group.iter().fold(0f32, |m, v| m.max(v.abs())) / 7.0);
-        let d = f16_value(scale);
-        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+        scales[g] = scale(group);
+        let inv = inverse(f16_value(scales[g]));
         for (j, v) in group.iter().enumerate() {
             let n = ((v * inv).round_ties_even() as i32).clamp(-8, 7) + 8;
             packed[g * 32 + j / 8 * 4 + j % 4] |= (n as u8) << (j % 8 / 4 * 4);
         }
-        scales.push(scale);
     }
-    Q4 { packed, scales }
+}
+
+/// The f16 scale of a Q4 group whose rounding errs least, among `amax / k` for `k` = 6, 6.25, …, 9: rounding to the
+/// largest magnitude (`k` = 7) wastes levels on one outlier, and its choice alone agrees with bfloat16 Gemma 4 E4B's
+/// best token on 83% of positions, the search on 88% (`scripts/agreement.py`).
+fn scale(group: &[f32]) -> u16 {
+    let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let err = |s: u16| {
+        let (d, inv) = (f16_value(s), inverse(f16_value(s)));
+        group.iter().map(|v| (((v * inv).round_ties_even()).clamp(-8.0, 7.0) * d - v).powi(2)).sum::<f32>()
+    };
+    let candidates = (0..13).map(|i| f16_bits(amax / (6.0 + i as f32 / 4.0)));
+    candidates.map(|s| (err(s), s)).fold((f32::INFINITY, 0), |best, c| if c.0 < best.0 { c } else { best }).1
+}
+
+/// `1 / d`, or 0 for a zero scale.
+fn inverse(d: f32) -> f32 {
+    if d > 0.0 { 1.0 / d } else { 0.0 }
 }
 
 /// Quantizes a vector to `i8` values and per-block `[s, s·Σq]`.
