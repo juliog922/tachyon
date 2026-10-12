@@ -179,6 +179,8 @@ impl Engine {
     pub fn unload(&mut self, name: &str) -> bool {
         let before = self.models.len();
         self.models.retain(|m| m.name != name);
+        // The VRAM goes back to the system, not only to this engine's pool.
+        let _ = self.ctx.trim();
         self.models.len() < before
     }
 
@@ -197,16 +199,19 @@ impl Engine {
         self.models.iter().find(|m| m.name == name).map(|m| &m.tok)
     }
 
-    /// Moves out of VRAM every model whose keep-alive has run out, but pinned ones. Every call does it first.
+    /// Moves out of VRAM every model whose keep-alive has run out, but pinned ones, and gives their VRAM back to the
+    /// system. Every call does it first. A model moved out to make room keeps its VRAM in the pool for the next.
     pub fn expire(&mut self) -> Result<()> {
         let now = Instant::now();
+        let mut freed = false;
         for i in 0..self.models.len() {
             let m = &self.models[i];
             if matches!(m.at, Place::Vram(_)) && !m.load.pin && m.until.is_some_and(|t| t <= now) {
                 self.evict(i)?;
+                freed = true;
             }
         }
-        Ok(())
+        if freed { self.ctx.trim() } else { Ok(()) }
     }
 
     /// Feeds the conversation of `req` to model `name` and returns its answer, as a stream: every prompt token but

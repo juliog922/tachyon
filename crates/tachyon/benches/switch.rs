@@ -74,7 +74,7 @@ fn host_tier(ctx: &Context, suite: &mut Suite, dir: &Path) -> f64 {
     bytes / back.as_secs_f64() / 1e9
 }
 
-/// What a model's moves cost besides copies: memory taken and given back, 1 GiB at a time.
+/// What a model's moves cost besides copies: pinned memory taken and given back, 1 GiB at a time.
 fn memory(ctx: &Context, suite: &mut Suite) {
     let len = 1 << 30;
     suite.run("pinned alloc, 1 GiB", 3, || {
@@ -87,6 +87,11 @@ fn memory(ctx: &Context, suite: &mut Suite) {
         let buf = ctx.alloc_host(len).unwrap();
         cpu(|| drop(buf))
     });
+}
+
+/// What VRAM costs to take from the memory pool, give back to it, and give back to the system, 1 GiB at a time.
+fn vram(ctx: &Context, suite: &mut Suite) {
+    let len = 1 << 30;
     suite.run("VRAM alloc, 1 GiB", RUNS, || {
         let mut buf = None;
         let t = cpu(|| buf = Some(ctx.alloc(len).unwrap()));
@@ -97,11 +102,15 @@ fn memory(ctx: &Context, suite: &mut Suite) {
         let buf = ctx.alloc(len).unwrap();
         cpu(|| drop(buf))
     });
+    suite.run("VRAM given back from the pool, 1 GiB", RUNS, || {
+        drop(ctx.alloc(len).unwrap());
+        cpu(|| ctx.trim().unwrap())
+    });
 }
 
-/// 2.5 GiB copied from pinned memory into VRAM allocated once (the ceiling), and into VRAM allocated just before
-/// (untimed), as a parked model returns; in GB/s. Under WSL2 the second is slower: fresh VRAM is committed on first
-/// write.
+/// 2.5 GiB copied from pinned memory into VRAM allocated once (the ceiling), and into fresh VRAM, the memory pool
+/// given back to the system and the buffer allocated just before (untimed); in GB/s. Fresh VRAM is slower: the
+/// driver clears it first (the L40S copies into it at 70%), and WSL2 commits it on first write.
 fn copies(ctx: &Context, suite: &mut Suite) -> [f64; 2] {
     const LEN: usize = 5 << 29;
     let (host, stream, mut dev) = (ctx.alloc_host(LEN).unwrap(), ctx.stream().unwrap(), None);
@@ -109,6 +118,7 @@ fn copies(ctx: &Context, suite: &mut Suite) -> [f64; 2] {
         let t = suite.run(name, RUNS, || {
             if !reuse || dev.is_none() {
                 dev = None;
+                ctx.trim().unwrap();
                 dev = Some(ctx.alloc(LEN).unwrap());
             }
             let to = dev.as_ref().unwrap();
@@ -149,6 +159,7 @@ fn main() -> ExitCode {
     let added = resident(&mut suite, &dirs);
     let back = host_tier(&ctx, &mut suite, &dirs[0]);
     memory(&ctx, &mut suite);
+    vram(&ctx, &mut suite);
     let [ceiling, fresh] = copies(&ctx, &mut suite);
     swaps(&mut suite, &dirs);
     // Under WSL2 a returning model pays for committing fresh VRAM, which native Linux does at allocation: the gate is

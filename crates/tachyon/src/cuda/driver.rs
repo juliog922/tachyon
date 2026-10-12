@@ -48,6 +48,7 @@ macro_rules! api {
 }
 
 api! {
+    // #lizard forgives: a table of declarations, which lizard reads as one long function.
     cuInit(c_uint);
     cuGetErrorName(Status, *mut *const c_char);
     cuDeviceGetCount(*mut c_int);
@@ -58,6 +59,12 @@ api! {
     cuDevicePrimaryCtxRetain(*mut Handle, c_int);
     cuDevicePrimaryCtxRelease(c_int);
     cuCtxSetCurrent(Handle);
+    cuCtxSynchronize();
+    cuDeviceGetDefaultMemPool(*mut Handle, c_int);
+    cuMemPoolSetAttribute(Handle, c_int, *mut c_void);
+    cuMemPoolTrimTo(Handle, usize);
+    cuMemAllocAsync(*mut DevPtr, usize, Handle);
+    cuMemFreeAsync(DevPtr, Handle);
     cuMemGetInfo(*mut usize, *mut usize);
     cuMemAlloc(*mut DevPtr, usize);
     cuMemFree(DevPtr);

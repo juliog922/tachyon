@@ -6,6 +6,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Changed
 
+- `tachyon run` takes a catalog name (`gemma-4-e4b`) as well as a model directory.
+- Device memory comes from the GPU's memory pool, which keeps freed VRAM for the process until `Context::trim` gives it back: a model returning from the host tier reuses the VRAM the last one left instead of fresh VRAM, which the driver clears first (the L40S copies into fresh VRAM at 70% of the rate). `Engine::unload`, and `Engine::expire` when a keep-alive runs out, give VRAM back to the system; a model moved out to make room does not. GPUs without memory pools allocate as before. The `switch` bench reports the cost of giving VRAM back.
+
 - Attention kernels take a `group` argument and launch a block per four query heads (`ptx::HEADS_PER_BLOCK`, was `HEADS_PER_KV`); `KV_256`/`KV_512` take `group` too. The `decode` bench passes the window it had been missing since step 7.
 - `Engine::open` is gone: an engine is made with `Engine::new` and loads models by name.
 - The `generate` bench checks the step-6 gate (≥ 80% of the roofline) on the RTX 3060 only; on other GPUs it prints the figure.
@@ -14,6 +17,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - Attention gives each block at least 24 positions and loads a chunk of positions' keys and values at once, instead of relying on prefetch hints, which the RTX 3060 ignores: 11 µs → 8 µs per sliding layer at short contexts.
 
 ### Added
+
+- `tachyon pull [model] [--keep]`, `catalog`, `list`, `rm` and `doctor`. `pull` downloads a Hugging Face checkpoint over 8 connections (`TACHYON_CONNECTIONS`) in 32 MiB ranges, hashes it in order with SHA-256 and flushes it to disk as it arrives, each on its own thread, resumes an interrupted download from its `.part` file, follows the Hub's redirects and asks again when a signed CDN link expires, then converts it into `$TACHYON_HOME` and removes the checkpoint unless `--keep`. Without a name it pulls the largest model that fits in 70% of GPU 0. `TACHYON_HUB` names a mirror.
+- `tachyon_cli::net`, networking with `std` only: SHA-256 (SHA-NI when the CPU has it), HMAC and HKDF, AES-128-GCM (AES-NI and PCLMULQDQ), X25519, P-256 ECDSA and RSA (PKCS#1 v1.5 and PSS) verification, X.509 chains checked against the system's trust anchors, a TLS 1.3 client (`TLS_AES_128_GCM_SHA256`, X25519), and HTTP/1.1 with keep-alive, chunked bodies, redirects and ranges. Ported in part from caudal.
+- `download` benchmark: SHA-256 and AES-GCM rates, a checkpoint range fetched by `curl` and by Tachyon over one and over eight connections, and conversion time per model. Step-9 gate: over one connection, within 5% of `curl`; SHA-256 faster than any download.
 
 - Gemma 4 E2B: attention takes any multiple of four query heads per key-value head (a block per four heads, `group` blocks per key-value head; E2B has eight over one), and the shared layers' MLPs of a model with `use_double_wide_mlp` are twice as wide (`Config::mlp`). `Config` refuses, as `Error::Unsupported`, what the larger models add (mixture of experts, values equal to keys, no per-layer inputs, other key-value heads in global layers, fewer than four query heads per key-value head), instead of converting a model it would run wrong.
 - Several models on one GPU: `Engine::new(gpu, Limits)`, then `Engine::load(name, dir, &Load)` and `Engine::chat(name, &Request)`; `unload`, `tier`, `expire`. Models stay in VRAM within `Limits::vram` (70% of the GPU's by default) and their keep-alive (`Load::keep_alive`, five minutes by default, or `Request::keep_alive` per answer; zero moves a model out at once, `Duration::MAX` keeps it); to make room the least recently used model moves out first, never a pinned one (`Load::pin`) or the one answering. A model moved out is parked in the host-RAM tier within `Limits::host` (half the RAM by default), the oldest parked models freed to disk to make room. A model that cannot fit is `Error::OutOfMemory`; an unknown name `Error::NoModel`.

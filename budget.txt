@@ -3,8 +3,9 @@
 # A budget grows only by a written decision in the spec.
 #
 # limit  paths
-# cuda: raised from 350 in step 1 (38 driver signatures, one safe method each).
-430      crates/tachyon/src/cuda
+# cuda: raised from 350 in step 1 (38 driver signatures, one safe method each), and to 460 in step 8 (the device
+# memory pool: six driver functions, pooled allocation and trimming).
+460      crates/tachyon/src/cuda
 450      crates/tachyon/src/lib.rs crates/tachyon/src/error.rs crates/tachyon/src/json.rs
 # wpk: raised from 300 in step 2 (format, checked index, writer, CRC32C, verify, a loader with three paths, page-cache choice).
 375      crates/tachyon/src/wpk
@@ -15,4 +16,8 @@
 500      crates/tachyon/src/token
 900      crates/tachyon/src/model
 450      crates/tachyon/src/engine.rs
-500      crates/tachyon-cli/src
+500      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs
+# net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
+950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs
+1050     crates/tachyon-cli/src/net/tls.rs crates/tachyon-cli/src/net/x509.rs
+500      crates/tachyon-cli/src/net/http.rs crates/tachyon-cli/src/net/hub.rs crates/tachyon-cli/src/net/mod.rs

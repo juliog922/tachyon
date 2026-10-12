@@ -130,6 +130,19 @@ pub fn device(ordinal: u32) -> Result<DeviceInfo> {
     })
 }
 
+/// The default memory pool of `device`, set to keep what is freed into it until trimmed; null if the GPU has no
+/// memory pools.
+fn pool(device: c_int) -> Handle {
+    const MEMORY_POOLS_SUPPORTED: c_int = 115;
+    const RELEASE_THRESHOLD: c_int = 4;
+    let (mut pool, mut keep) = (null_mut(), u64::MAX);
+    let supported = attributes(device, [MEMORY_POOLS_SUPPORTED]).is_ok_and(|[s]| s == 1);
+    let ready = supported
+        && cu!(cuDeviceGetDefaultMemPool(&raw mut pool, device)).is_ok()
+        && cu!(cuMemPoolSetAttribute(pool, RELEASE_THRESHOLD, (&raw mut keep).cast())).is_ok();
+    if ready { pool } else { null_mut() }
+}
+
 /// Device attributes, by `CUdevice_attribute` number.
 fn attributes<const N: usize>(dev: c_int, ids: [c_int; N]) -> Result<[u32; N]> {
     let mut out = [0; N];
@@ -148,6 +161,8 @@ pub struct Context(Rc<Primary>);
 struct Primary {
     device: c_int,
     info: DeviceInfo,
+    /// The device's memory pool, which keeps freed VRAM for this process; null when the GPU has none.
+    pool: Handle,
 }
 
 impl Drop for Primary {
@@ -167,9 +182,8 @@ impl Context {
         let (mut device, mut handle) = (0, null_mut());
         cu!(cuDeviceGet(&raw mut device, ordinal as c_int))?;
         cu!(cuDevicePrimaryCtxRetain(&raw mut handle, device))?;
-        let ctx = Context(Rc::new(Primary { device, info }));
         cu!(cuCtxSetCurrent(handle))?;
-        Ok(ctx)
+        Ok(Context(Rc::new(Primary { device, info, pool: pool(device) })))
     }
 
     /// The GPU this context drives.
@@ -183,10 +197,24 @@ impl Context {
         cu!(cuMemGetInfo(&raw mut free, &raw mut total)).map(|()| (free, total))
     }
 
-    /// `len` bytes of device memory, uninitialized.
+    /// `len` bytes of device memory, uninitialized. It comes from the device's memory pool, which keeps the VRAM
+    /// of freed buffers for the next ones: written before, it takes copies at full speed, where fresh VRAM is
+    /// cleared by the driver first (and committed on first write under WSL2). [`Context::trim`] gives it back.
     pub fn alloc(&self, len: usize) -> Result<DevBuf> {
         let mut ptr = 0;
-        cu!(cuMemAlloc(&raw mut ptr, len)).map(|()| DevBuf { ptr, len, _ctx: self.clone() })
+        if self.0.pool.is_null() {
+            cu!(cuMemAlloc(&raw mut ptr, len))?;
+        } else {
+            // Allocated in the order of the legacy stream, and ready for every stream once it is synchronized.
+            cu!(cuMemAllocAsync(&raw mut ptr, len, null_mut()))?;
+            cu!(cuStreamSynchronize(null_mut()))?;
+        }
+        Ok(DevBuf { ptr, len, ctx: self.clone() })
+    }
+
+    /// Gives the VRAM the memory pool keeps from freed buffers back to the system.
+    pub fn trim(&self) -> Result<()> {
+        if self.0.pool.is_null() { Ok(()) } else { cu!(cuMemPoolTrimTo(self.0.pool, 0)) }
     }
 
     /// `len` bytes of zeroed page-locked host memory, which the GPU reaches by DMA and can map.
@@ -234,7 +262,7 @@ impl Context {
 pub struct DevBuf {
     ptr: DevPtr,
     len: usize,
-    _ctx: Context,
+    ctx: Context,
 }
 
 impl DevBuf {
@@ -256,7 +284,12 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        let _ = cu!(cuMemFree(self.ptr));
+        if self.ctx.0.pool.is_null() {
+            let _ = cu!(cuMemFree(self.ptr));
+        } else {
+            // Like `cuMemFree`, waits for the work that may use it; then it returns to the pool.
+            let _ = cu!(cuCtxSynchronize()).and_then(|()| cu!(cuMemFreeAsync(self.ptr, null_mut())));
+        }
     }
 }
 
