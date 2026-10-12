@@ -28,6 +28,7 @@ pub mod encoder;
 pub mod engine;
 mod error;
 pub mod json;
+pub mod media;
 pub mod model;
 pub mod ptx;
 pub mod quant;

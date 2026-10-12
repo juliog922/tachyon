@@ -45,6 +45,8 @@ pub enum Error {
     NoModel(String),
     /// A model needs a feature Tachyon does not run yet; carries the feature.
     Unsupported(String),
+    /// An image or a recording is damaged, or in a format Tachyon does not decode; carries what.
+    Media(String),
 }
 
 /// `Result` with [`Error`].
@@ -62,7 +64,7 @@ impl fmt::Display for Error {
             Error::Io(errno) => write!(f, "{}", std::io::Error::from_raw_os_error(*errno)),
             Error::Format(why) => write!(f, "invalid weight file: {why}"),
             Error::TooLong { tokens, context } => write!(f, "the prompt has {tokens} tokens; the context holds {context} positions"),
-            Error::OutOfMemory { .. } | Error::NoModel(_) | Error::Unsupported(_) => self.engine(f),
+            Error::OutOfMemory { .. } | Error::NoModel(_) | Error::Unsupported(_) | Error::Media(_) => self.engine(f),
         }
     }
 }
@@ -74,6 +76,7 @@ impl Error {
             Error::OutOfMemory { need, free } => write!(f, "the model needs {} MiB of VRAM; {} MiB can be freed under the limit", need >> 20, free >> 20),
             Error::NoModel(name) => write!(f, "no model named {name:?} is loaded"),
             Error::Unsupported(what) => write!(f, "the model has {what}, which tachyon does not run yet"),
+            Error::Media(what) => write!(f, "media: {what}"),
             _ => Ok(()),
         }
     }
