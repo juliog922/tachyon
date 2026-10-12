@@ -16,6 +16,10 @@ bf16 and to f16, and prints how far the soft tokens move and the largest value a
 (f16 ends at 65504). Then it writes crates/tachyon/tests/fixtures/media/vision.ref: per image and budget the prompt's
 tokens through the chat template, the float32 soft tokens' file (`soft-<image>-<budget>.f16`, `f16 [n, 2560]`, for
 the 70-token runs) and the decoder's greedy answer in bfloat16 to those soft tokens, with the margin of each token.
+
+`python3 scripts/media.py inspect ~/models/gemma-4-E4B-it` prints what converting the vision tower needs to know: its
+tensors (layer 0's, as every layer has the same), whether the clip bounds of linear layers reading the same input
+agree (so they can share one product), and the pad token's embedding row.
 """
 
 import io
@@ -322,9 +326,43 @@ def greedy(model, ids, soft):
     return answer, margins
 
 
+def inspect(checkpoint):
+    """What the vision tower's conversion needs to know of the checkpoint: its tensors' names, shapes and types,
+    whether the clip bounds of linear layers that read the same input agree, and the pad token's embedding row."""
+    import glob
+    import torch
+    from safetensors import safe_open
+    tensors = {}
+    for path in sorted(glob.glob(os.path.join(checkpoint, "*.safetensors"))):
+        with safe_open(path, "pt") as f:
+            for k in f.keys():
+                if "vision" in k or k.endswith("embed_tokens.weight"):
+                    tensors[k] = f.get_tensor(k)
+    for k, t in sorted(tensors.items()):
+        if "layers." in k and "layers.0." not in k:
+            continue
+        print("%-90s %-14s %s" % (k, str(t.dtype).replace("torch.", ""), list(t.shape) if t.dim() else float(t)))
+    bound = lambda k: float(tensors[k]) if k in tensors else None
+    layers = sorted({int(k.split("layers.")[1].split(".")[0]) for k in tensors if "layers." in k})
+    for group in (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"), ("mlp.gate_proj", "mlp.up_proj")):
+        same = 0
+        for i in layers:
+            pre = [k for k in tensors if k.endswith("layers.%d.%s.input_min" % (i, group[0]))][0][: -len(group[0] + ".input_min")]
+            ins = [(bound(pre + g + ".input_min"), bound(pre + g + ".input_max")) for g in group]
+            same += len(set(ins)) == 1
+            if i in (0, layers[-1]):
+                print("layer %d %s input bounds: %s" % (i, "/".join(g.split(".")[-1] for g in group), ins))
+        print("%s: input bounds equal in %d of %d layers" % ("/".join(g.split(".")[-1] for g in group), same, len(layers)))
+    emb = [t for k, t in tensors.items() if k.endswith("language_model.embed_tokens.weight") or k == "model.embed_tokens.weight"]
+    if emb:
+        print("pad (token 0) embedding row: max |v| %.6g, norm %.6g" % (float(emb[0][0].abs().max()), float(emb[0][0].float().norm())))
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "images"
     if mode == "vision":
         vision(os.path.expanduser(sys.argv[2]))
+    elif mode == "inspect":
+        inspect(os.path.expanduser(sys.argv[2]))
     else:
         images()
