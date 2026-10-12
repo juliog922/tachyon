@@ -30,7 +30,8 @@
 //!   several, block row `y` takes `token[y]` and writes row `y` of `out`. Arguments:
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
-//! - The encoder's kernels, [`GEMM_F16`] to [`ATTEND_F16`]: see [`encoder`].
+//! - The encoder's kernels, [`GEMM_F16`] to [`ATTEND_F16`]: see [`encoder`]. The vision tower's, [`RMS_F16`],
+//!   [`HEADS_F16`] and [`POOL_F16`]: see [`vision`].
 //! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`] and its `f16` forms: see [`gemm`].
 //! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
@@ -41,12 +42,17 @@ pub mod encoder;
 pub mod gemm;
 pub mod gemv;
 pub mod sample;
+pub mod vision;
 
 pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
-pub use encoder::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE, NORM_F16, ROPE_F16};
+pub use encoder::{
+    ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE,
+    NORM_F16, ROPE_F16,
+};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
+pub use vision::{HEADS_F16, POOL_F16, RMS_F16};
 
 use std::fmt::Write;
 
@@ -93,12 +99,18 @@ pub fn module() -> String {
         attend::store(256),
         attend::store(512),
         SPIN_PTX.into(),
-        encoder::gemm_f16(GEMM_F16, 64),
-        encoder::gemm_f16(GEMM_F16_128, 128),
+        encoder::gemm_f16(GEMM_F16, 64, false),
+        encoder::gemm_f16(GEMM_F16_128, 128, false),
+        encoder::gemm_f16(GEMM_CLIP, 64, true),
+        encoder::gemm_f16(GEMM_CLIP_128, 128, true),
         encoder::norm_f16(),
         encoder::rows(EMBED_F16, true, false),
         encoder::rows(ADD_ROWS, false, true),
         encoder::rows(GATHER_ROWS, false, false),
+        encoder::rows(ADD_ROWS_F16, true, true),
+        vision::rms_f16(),
+        vision::heads_f16(),
+        vision::pool_f16(),
         encoder::gelu_f16(),
         encoder::rope_f16(),
         encoder::attend_f16(ATTEND_F16, 64),

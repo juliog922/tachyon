@@ -9,13 +9,15 @@
 //!   mode: u32`. `rows` is a multiple of [`GEMM_F16_TILE`], `cols` of 64; `a` holds whole blocks of tokens. Blocks
 //!   of 64 tokens × 64 rows: launch `tokens.div_ceil(64) · rows / 64` blocks of 128 threads. [`GEMM_F16_128`] is
 //!   the same in blocks of 128 tokens (256 threads), reading fewer bytes per operation: for batches that give it
-//!   enough blocks.
+//!   enough blocks. [`GEMM_CLIP`] and [`GEMM_CLIP_128`] are Gemma 4's clipped linear layers: one more argument,
+//!   `clip: u64`, `f32 [4 + 2·rows]`: the bounds of `a`'s values, two unused, then each row's bounds of `y` (before
+//!   mode 4's GELU, which takes its tanh form).
 //! - [`NORM_F16`]: layer norm of each row of `x` (`f32 [n, h]`): `γ ⊙ (x − mean) / √(var + eps) (+ β)` to `a`
 //!   (`f16`), and to `xo` (`f32`, may be `x`) unless 0. Arguments: `x, γ, β (or 0), a, xo (or 0): u64`, `h: u32,
 //!   eps: f32`. `h` is a multiple of 4, at most 4096. Launch `n` blocks of `(h/4).div_ceil(32)·32` threads.
-//! - [`EMBED_F16`], [`ADD_ROWS`], [`GATHER_ROWS`]: row `r` of `out` (`f32 [n, h]`) becomes row `idx[r]` of
-//!   `table`: converted from `f16` (a token embedding, read from pinned host memory), added (`f32`, a type
-//!   embedding), or copied (`f32`, rows picked out). Arguments: `table, idx: *const u32, out: u64`, `h: u32`.
+//! - [`EMBED_F16`], [`ADD_ROWS`], [`ADD_ROWS_F16`], [`GATHER_ROWS`]: row `r` of `out` (`f32 [n, h]`) becomes row
+//!   `idx[r]` of `table`: converted from `f16` (a token embedding, read from pinned host memory), added (`f32`, a
+//!   type embedding; `f16`, a position embedding), or copied (`f32`, rows picked out). Arguments: `table, idx: *const u32, out: u64`, `h: u32`.
 //!   Launch a grid of `(h.div_ceil(256), n)` blocks of 256.
 //! - [`GELU_F16`]: `gelu(a)·b` to `f16 [n, width]`, GELU exact (through erf, to 1.5e-7), from `x`: with `gated`,
 //!   rows of `[a, b]` (`f32 [n, 2·width]`); otherwise rows of `a` and `b = 1`. Arguments: `x, out: u64`, `width,
@@ -37,6 +39,10 @@ use std::fmt::Write;
 pub const GEMM_F16: &str = "gemm_f16";
 /// Name of the `f16` matrix product in blocks of 128 tokens, 256 threads.
 pub const GEMM_F16_128: &str = "gemm_f16_128";
+/// Name of the clipped `f16` matrix product, for Gemma 4's vision tower.
+pub const GEMM_CLIP: &str = "gemm_clip";
+/// Name of the clipped `f16` matrix product in blocks of 128 tokens.
+pub const GEMM_CLIP_128: &str = "gemm_clip_128";
 /// Rows of weights a [`GEMM_F16`] block takes; batches of tokens are padded to a multiple of it.
 pub const GEMM_F16_TILE: u32 = 64;
 /// Name of the layer norm.
@@ -45,6 +51,8 @@ pub const NORM_F16: &str = "norm_f16";
 pub const EMBED_F16: &str = "embed_f16";
 /// Name of the row-wise add of a table's rows.
 pub const ADD_ROWS: &str = "add_rows";
+/// Name of the row-wise add of an `f16` table's rows.
+pub const ADD_ROWS_F16: &str = "add_rows_f16";
 /// Name of the row gather.
 pub const GATHER_ROWS: &str = "gather_rows";
 /// Name of the GELU, gated or not.
@@ -57,7 +65,7 @@ pub const ATTEND_F16: &str = "attend_f16";
 pub const ATTEND_F16_32: &str = "attend_f16_32";
 
 /// `v` as a PTX `f32` literal.
-fn f(v: f32) -> String {
+pub(super) fn f(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
 
@@ -96,8 +104,9 @@ fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), guard: &str) 
 }
 
 /// The products of stage `buf`: per 16 of `k`, an `ldmatrix` of activations per row tile of 16 tokens (two for
-/// blocks of 64 tokens, one for 32), two of weights (four tiles of 8 rows), and an `mma` per pair of tiles.
-fn products(s: &mut String, tokens: usize, buf: usize) {
+/// blocks of 64 tokens, one for 32), clamped to the input bounds if `clip`, two of weights (four tiles of 8 rows),
+/// and an `mma` per pair of tiles.
+fn products(s: &mut String, tokens: usize, buf: usize, clip: bool) {
     let base = buf * stage(tokens);
     for ks in 0..2 {
         for mi in 0..block(tokens).1 / 16 {
@@ -110,6 +119,7 @@ fn products(s: &mut String, tokens: usize, buf: usize) {
                 a + 3,
                 base + mi * 16 * ROW + 32 * ks
             );
+            (a..a + 4).filter(|_| clip).for_each(|r| _ = writeln!(s, "    max.f16x2 %a{r}, %a{r}, %lo;\n    min.f16x2 %a{r}, %a{r}, %hi;"));
         }
         for pair in 0..2 {
             let b = 4 * pair;
@@ -240,22 +250,48 @@ const STORE_HEAD: &str = "    ld.param.u64 %rd4, [py];
     mul.wide.u32 %rd6, %r13, 4;
     add.u64 %rd6, %rd5, %rd6;\n";
 
-/// Stores accumulators `c`, `c + 1` (rows `8nt + 2t`, `+1` of the warp's) as the mode asks.
-fn store_pair(s: &mut String, c: usize, nt: usize) {
+/// The clipped products' input bounds, as `f16` pairs in `%lo` and `%hi`.
+const CLIP_HEAD: &str = "    ld.param.u64 %rd8, [pclip];
+    cvta.to.global.u64 %rd8, %rd8;
+    ld.global.v2.f32 {%v0, %v1}, [%rd8];
+    cvt.rn.f16.f32 %hg, %v0;
+    mov.b32 %lo, {%hg, %hg};
+    cvt.rn.f16.f32 %hg, %v1;
+    mov.b32 %hi, {%hg, %hg};\n";
+
+/// Stores accumulators `c`, `c + 1` (rows `8nt + 2t`, `+1` of the warp's) as the mode asks, clamped to the rows'
+/// output bounds if `clip`; mode 4 with `clip` takes GELU's tanh form.
+fn store_pair(s: &mut String, c: usize, nt: usize, clip: bool) {
     let _ = writeln!(s, "    add.f32 %v0, %c{c}, %bs{};\n    add.f32 %v1, %c{}, %bs{};", 2 * nt, c + 1, 2 * nt + 1);
+    if clip {
+        let k = 4 * nt;
+        let _ = writeln!(
+            s,
+            "    max.f32 %v0, %v0, %cl{k};\n    min.f32 %v0, %v0, %cl{};\n    max.f32 %v1, %v1, %cl{};\n    min.f32 %v1, %v1, %cl{};",
+            k + 1,
+            k + 2,
+            k + 3
+        );
+    }
     s.push_str("    @%m3 max.f32 %v0, %v0, 0f00000000;\n    @%m3 max.f32 %v1, %v1, 0f00000000;\n");
     let _ = writeln!(s, "    @%sadd ld.global.v2.f32 {{%o0, %o1}}, [%rd6+{}];", 32 * nt);
     s.push_str("    @%sadd add.f32 %v0, %v0, %o0;\n    @%sadd add.f32 %v1, %v1, %o1;\n");
     let _ = writeln!(s, "    @%s32 st.global.v2.f32 [%rd6+{}], {{%v0, %v1}};", 32 * nt);
     let _ = writeln!(s, "    cvt.rn.f16x2.f32 %h, %v1, %v0;\n    @%s16 st.global.b32 [%rd7+{}], %h;", 16 * nt);
-    let _ =
-        writeln!(s, "    mov.f32 %x, %v0;\n{}    mul.f32 %x, %x, %v1;\n    cvt.rn.f16.f32 %hg, %x;\n    @%s4 st.global.b16 [%rd2+{}], %hg;", gelu(), 8 * nt);
+    let gate = if clip { format!("    mov.f32 %y, %v1;\n{}", super::GELU_P) } else { gelu() + "    mul.f32 %x, %x, %v1;\n" };
+    let _ = writeln!(s, "    mov.f32 %x, %v0;\n{gate}    cvt.rn.f16.f32 %hg, %x;\n    @%s4 st.global.b16 [%rd2+{}], %hg;", 8 * nt);
 }
 
 /// Stores the warp's tiles as `mode` asks: tokens `%r12 + 16mi + 8j + g`, rows `%r13 + 8nt + 2t, +1`; for mode 4
 /// the pair's `gelu(even)·odd` as one `f16`, column `(%r13 + 8nt + 2t) / 2` of a row half as wide.
-fn gemm_store(s: &mut String, tokens: usize) {
+fn gemm_store(s: &mut String, tokens: usize, clip: bool) {
     s.push_str(STORE_HEAD);
+    if clip {
+        s.push_str("    mul.wide.u32 %rd9, %r13, 8;\n    add.u64 %rd9, %rd8, %rd9;\n");
+        for (nt, c) in (0..16).step_by(4).enumerate() {
+            let _ = writeln!(s, "    ld.global.v4.f32 {{%cl{c}, %cl{}, %cl{}, %cl{}}}, [%rd9+{}];", c + 1, c + 2, c + 3, 16 + 64 * nt);
+        }
+    }
     for nt in 0..4 {
         let b = 2 * nt;
         let _ = writeln!(
@@ -273,26 +309,28 @@ fn gemm_store(s: &mut String, tokens: usize) {
             s.push_str("    mad.lo.u32 %r14, %r14, %r3, %r13;\n    mul.wide.u32 %rd6, %r14, 4;\n    add.u64 %rd6, %rd4, %rd6;\n");
             s.push_str("    mul.wide.u32 %rd7, %r14, 2;\n    add.u64 %rd7, %rd4, %rd7;\n    and.pred %s4, %pt, %m4;\n    cvt.u64.u32 %rd2, %r14;\n    add.u64 %rd2, %rd4, %rd2;\n");
             for nt in 0..4 {
-                store_pair(s, (mi * 4 + nt) * 4 + 2 * j, nt);
+                store_pair(s, (mi * 4 + nt) * 4 + 2 * j, nt, clip);
             }
         }
     }
 }
 
-/// [`GEMM_F16`] (blocks of 64 tokens) or [`GEMM_F16_128`]: [`stages`] of 32 of `k`, the next
-/// slices' copies in flight while one multiplies, and one barrier per slice: the one that lets a slice in, after which
-/// the stage multiplied before it is free to refill. Each warp takes 32 tokens × 32 rows.
-pub(super) fn gemm_f16(name: &str, tokens: usize) -> String {
+/// [`GEMM_F16`] (blocks of 64 tokens) or [`GEMM_F16_128`], or with `clip` [`GEMM_CLIP`] or [`GEMM_CLIP_128`]:
+/// [`stages`] of 32 of `k`, the next slices' copies in flight while one multiplies, and one barrier per slice: the
+/// one that lets a slice in, after which the stage multiplied before it is free to refill. Each warp takes 32 tokens
+/// × 32 rows.
+pub(super) fn gemm_f16(name: &str, tokens: usize, clip: bool) -> String {
     let mut s = format!(
-        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode)
+        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
     .maxntid {}, 1, 1
 {{
     .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %pt, %s32, %sadd, %s16, %s4, %neg;
     .reg .b16 %hg;
-    .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode;
-    .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %x, %u, %w, %z;
-    .reg .b64 %rd<8>, %ga<2>, %gw<2>;
+    .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
+    .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
+    .reg .b64 %rd<10>, %ga<2>, %gw<2>;
     .shared .align 16 .b8 smem[{}];",
+        if clip { ", .param .u64 pclip" } else { "" },
         32 * block(tokens).0,
         stages(tokens) * stage(tokens)
     );
@@ -305,6 +343,9 @@ pub(super) fn gemm_f16(name: &str, tokens: usize) -> String {
         .replace("GROUP", &GROUP.to_string())
         .replace("PSTRIDE", &(2 * pass).to_string())
         .replace("WSHIFT", &warp.trailing_zeros().to_string());
+    if clip {
+        s += CLIP_HEAD;
+    }
     (0..warp).for_each(|c| _ = writeln!(s, "    mov.f32 %c{c}, 0f00000000;"));
     let n = stages(tokens);
     for p in 0..n - 1 {
@@ -315,14 +356,14 @@ pub(super) fn gemm_f16(name: &str, tokens: usize) -> String {
     for buf in 0..n {
         let _ = writeln!(s, "    cp.async.wait_group {};\n    bar.sync 0;\n    setp.gt.u32 %q, %turns, {};", n - 2, n - 1);
         copy(&mut s, tokens, ((buf + n - 1) % n, 64 * (n - 1)), "@%q ");
-        products(&mut s, tokens, buf);
+        products(&mut s, tokens, buf, clip);
         for p in ["%ga0", "%ga1", "%gw0", "%gw1"] {
             let _ = writeln!(s, "    add.u64 {p}, {p}, 64;");
         }
         s += "    sub.u32 %turns, %turns, 1;\n    setp.eq.u32 %p, %turns, 0;\n    @%p bra STORE;\n";
     }
     s += "    bra TURN;\nSTORE:\n";
-    gemm_store(&mut s, tokens);
+    gemm_store(&mut s, tokens, clip);
     s + "    ret;\n}\n"
 }
 

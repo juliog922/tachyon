@@ -20,6 +20,9 @@
 # tensor-core product, layer norm, attention over packed sequences): spec step 10 decisions. Raised to 1700 in
 # step 10c: the kernel timeline, and the work to answer one Laya question in 5 ms on a laptop GPU.
 1700     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
+# vision: step 11b, Gemma 4's vision tower on the GPU: its conversion, its pipeline, and its own kernels (an RMS norm
+# with the residual step, per-head norms with 2-D RoPE, pooling); the products and attention are the encoder's.
+600      crates/tachyon/src/vision crates/tachyon/src/ptx/vision.rs
 # media: step 11, std-only decoders (PNG with inflate, baseline JPEG), PIL's resize, WAV, resampling, mel: spec step 11
 # decisions. Planned at 700, raised to 1100 in 11a: matching PIL and libjpeg-turbo bit for bit took 890 lines for images.
 1100     crates/tachyon/src/media

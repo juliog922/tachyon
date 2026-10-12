@@ -34,6 +34,7 @@ pub mod ptx;
 pub mod quant;
 mod sys;
 pub mod token;
+pub mod vision;
 pub mod wpk;
 
 pub use error::{Error, Result};
