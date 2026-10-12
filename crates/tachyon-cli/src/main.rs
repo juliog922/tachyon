@@ -19,7 +19,8 @@ Commands:
   pull <name> [--keep]         Download a model from Hugging Face and convert it (--keep: keep the checkpoint)
   list                         List the pulled models
   rm <name>                    Remove a pulled model
-  run <model> <prompt>         Answer one prompt, greedily, and report the speed (a name or a directory)
+  run <model> <prompt>         Answer one prompt, greedily, and report the speed (a name or a directory;
+                               --image=FILE, repeatable: PNG or JPEG files the prompt shows first)
   decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions)
   embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
   gpu                          List the GPUs the driver sees
@@ -62,7 +63,7 @@ fn command(words: &[&str], json: bool) -> ExitCode {
         ["convert", from, to] => done(encoders::convert(from.as_ref(), to.as_ref())),
         ["decide", model, request] => printed(encoders::decide(&model_dir(model), request.as_ref())),
         ["embed", model, rest @ ..] if !rest.is_empty() => embed(model, rest),
-        ["run", model, prompt] => done(run(&model_dir(model), prompt)),
+        ["run", model, rest @ ..] => run_args(model, rest),
         ["version" | "--version" | "-V"] => {
             println!("tachyon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -146,12 +147,24 @@ fn done(r: tachyon::Result<()>) -> ExitCode {
     )
 }
 
-/// Answers `prompt` with the model in `dir`, greedily, printing the text as it comes, then the speed.
-fn run(dir: &std::path::Path, prompt: &str) -> tachyon::Result<()> {
+/// `run` with `rest`: one prompt, and the images among `--image=FILE` words.
+fn run_args(model: &str, rest: &[&str]) -> ExitCode {
+    let files: Vec<&str> = rest.iter().filter_map(|w| w.strip_prefix("--image=")).collect();
+    let [prompt] = rest.iter().filter(|w| !w.starts_with("--image=")).collect::<Vec<_>>()[..] else {
+        eprint!("error: run takes one prompt\n\n{HELP}");
+        return ExitCode::from(2);
+    };
+    done(run(&model_dir(model), prompt, &files))
+}
+
+/// Answers `prompt`, showing the images in `files`, with the model in `dir`, greedily, printing the text as it
+/// comes, then the speed.
+fn run(dir: &std::path::Path, prompt: &str, files: &[&str]) -> tachyon::Result<()> {
     use std::io::Write as _;
+    let images = files.iter().map(|f| tachyon::media::decode(&std::fs::read(f)?)).collect::<tachyon::Result<Vec<_>>>()?;
     let mut engine = Engine::new(0, Limits::default())?;
     engine.load("model", dir, &Load::default())?;
-    let messages = [Message { role: Role::User, text: prompt }];
+    let messages = [Message { images: &images, ..Message::new(Role::User, prompt) }];
     let start = std::time::Instant::now();
     let mut answer = engine.chat("model", &Request::new(&messages))?;
     let (prefill, mid) = (start.elapsed(), std::time::Instant::now());

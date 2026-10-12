@@ -15,13 +15,16 @@
 //! never leaves VRAM, and neither does the one answering: its stream borrows the engine. With no thread, keep-alives
 //! are checked at every call; an application that leaves the engine idle calls [`Engine::expire`] when it likes.
 //!
+//! Messages may show images ([`Message::images`]) to a model converted with its vision tower: the tower comes into
+//! VRAM with the first image the model sees, and leaves with the model.
+//!
 //! ```no_run
 //! use tachyon::engine::{Engine, Limits, Load, Request};
 //! use tachyon::token::{Message, Role};
 //!
 //! let mut engine = Engine::new(0, Limits::default())?;
 //! engine.load("e4b", "gemma-4-e4b".as_ref(), &Load::default())?;
-//! let messages = [Message { role: Role::User, text: "Why is the sky blue?" }];
+//! let messages = [Message::new(Role::User, "Why is the sky blue?")];
 //! let mut answer = engine.chat("e4b", &Request::new(&messages))?;
 //! while let Some(text) = answer.next_text()? {
 //!     print!("{text}");
@@ -32,9 +35,11 @@
 use crate::cuda::Context;
 use crate::encoder::laya::Question;
 use crate::encoder::{self, Encoder};
+use crate::media::DEFAULT_BUDGET;
 use crate::model::{Decoder, Parked, Settings, footprint};
 use crate::ptx::Sampling;
-use crate::token::{Chat, Detokenizer, Message, Tokenizer};
+use crate::token::{Chat, Detokenizer, Message, Role, Tokenizer};
+use crate::vision::Vision;
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -70,11 +75,14 @@ pub struct Load {
     pub keep_alive: Duration,
     /// Never moves out of VRAM, by keep-alive or to make room.
     pub pin: bool,
+    /// The soft tokens an image becomes (one of [`crate::media::BUDGETS`]), 280 by default: more see finer detail
+    /// and take longer.
+    pub budget: usize,
 }
 
 impl Default for Load {
     fn default() -> Load {
-        Load { settings: Settings::default(), keep_alive: Duration::from_secs(300), pin: false }
+        Load { settings: Settings::default(), keep_alive: Duration::from_secs(300), pin: false, budget: DEFAULT_BUDGET }
     }
 }
 
@@ -102,6 +110,8 @@ struct Model {
     used: Instant,
     until: Option<Instant>,
     at: Place,
+    /// Its vision tower, once it has seen an image while in VRAM.
+    vision: Option<Vision>,
 }
 
 // One per model, moved only between tiers: its size does not matter.
@@ -170,11 +180,11 @@ impl Engine {
             return self.load_encoder(name, dir);
         }
         let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok"))?)?;
-        let chat = Chat::gemma4(&tok)?;
+        let chat = Chat::gemma4(&tok)?.with_budget(load.budget);
         let ends = [chat.end_of_turn(), tok.special("<eos>").unwrap_or(chat.end_of_turn())];
         let need = footprint(dir, &load.settings)?;
         let (used, at) = (Instant::now(), Place::Disk);
-        let mut model = Model { name: name.into(), dir: dir.into(), load: load.clone(), tok, chat, ends, need, used, until: None, at };
+        let mut model = Model { name: name.into(), dir: dir.into(), load: load.clone(), tok, chat, ends, need, used, until: None, at, vision: None };
         model.touch(load.keep_alive);
         self.models.push(model);
         let loaded = self.resident(self.models.len() - 1);
@@ -260,21 +270,33 @@ impl Engine {
         self.expire()?;
         let i = self.models.iter().position(|m| m.name == name).ok_or_else(|| Error::NoModel(name.into()))?;
         self.resident(i)?;
+        let soft = self.images(i, req)?;
         let (m, prompt) = (&mut self.models[i], &mut self.prompt);
-        prompt.clear();
-        m.chat.encode(&m.tok, req.messages, req.think, prompt);
+        let slots = encode(m, req, prompt, &soft)?;
         let (tokens, context) = (prompt.len(), m.load.settings.context);
-        if tokens >= context {
-            return Err(Error::TooLong { tokens, context });
-        }
-        let dec = m.dec();
-        dec.reset(&req.sampling)?;
-        let (&last, rest) = prompt.split_last().unwrap_or((&0, &[]));
-        dec.prefill(rest)?;
-        let first = dec.step(last)?;
-        dec.start(first)?;
+        let first = feed(m.dec(), req, prompt, &slots)?;
         let (left, keep) = (req.max_tokens.min(context - tokens), req.keep_alive.unwrap_or(m.load.keep_alive));
         Ok(TokenStream { engine: self, model: i, keep, detok: Detokenizer::default(), text: String::with_capacity(256), next: Some(first), left, tokens: 0 })
+    }
+
+    /// The soft tokens of the images of `req`'s messages, in order, by model `i`'s vision tower (in VRAM by now:
+    /// brought there with the first image).
+    fn images(&mut self, i: usize, req: &Request<'_>) -> Result<Vec<Vec<f32>>> {
+        // The chat template shows a user's images, and a system message's after the first.
+        let shown = |(k, m): &(usize, &Message<'_>)| m.role == Role::User || m.role == Role::System && *k > 0;
+        let images: Vec<_> = req.messages.iter().enumerate().filter(shown).flat_map(|(_, m)| m.images).collect();
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let m = &mut self.models[i];
+        if m.vision.is_none() {
+            if !m.dir.join("vision.wpk").exists() || m.chat.image_token().is_none() {
+                return Err(Error::Unsupported(format!("no vision tower in {}: images", m.dir.display())));
+            }
+            m.vision = Some(Vision::open(&self.ctx, &m.dir, m.load.budget)?);
+        }
+        let vision = m.vision.as_mut().unwrap_or_else(|| unreachable!("opened above"));
+        images.into_iter().map(|image| vision.soft_tokens(image, m.load.budget)).collect()
     }
 
     /// Brings model `i` into VRAM, moving out the least recently used models that may go until it fits.
@@ -311,6 +333,7 @@ impl Engine {
     /// Moves model `i` out of VRAM: to the host tier if it fits there, making room by freeing the least recently
     /// used pinned memory (a resident model's kept copy, or a parked model, which goes to disk), or else to disk.
     fn evict(&mut self, i: usize) -> Result<()> {
+        self.models[i].vision = None;
         let Place::Vram(dec) = std::mem::replace(&mut self.models[i].at, Place::Disk) else { return Ok(()) };
         let bytes = dec.parked_bytes();
         if bytes > self.limits[1] {
@@ -332,7 +355,8 @@ impl Engine {
     /// VRAM the resident models take, encoders included.
     fn used(&self) -> usize {
         let encoders: usize = self.encoders.iter().map(|e| e.1.bytes()).sum();
-        encoders + self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum::<usize>()
+        let towers: usize = self.models.iter().filter_map(|m| m.vision.as_ref()).map(Vision::bytes).sum();
+        encoders + towers + self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum::<usize>()
     }
 
     /// Pinned host memory of the host tier: parked models, and the copies resumed models keep.
@@ -344,6 +368,44 @@ impl Engine {
         };
         self.models.iter().map(held).sum()
     }
+}
+
+/// Feeds `prompt`, with soft tokens at `slots`, to `dec` from the start, sampling as `req` says: every token but
+/// the last through prefill, the last through a step; starts the answer and returns its first token.
+fn feed(dec: &mut Decoder, req: &Request<'_>, prompt: &[u32], slots: &[(usize, &[f32])]) -> Result<u32> {
+    dec.reset(&req.sampling)?;
+    let (&last, rest) = prompt.split_last().unwrap_or((&0, &[]));
+    dec.prefill_with(rest, slots)?;
+    let first = dec.step(last)?;
+    dec.start(first)?;
+    Ok(first)
+}
+
+/// `req`'s conversation as model `m`'s prompt, into `prompt`, and where each image's soft tokens `soft` go in it;
+/// an error if it does not fit the context.
+fn encode<'s>(m: &Model, req: &Request<'_>, prompt: &mut Vec<u32>, soft: &'s [Vec<f32>]) -> Result<Vec<(usize, &'s [f32])>> {
+    prompt.clear();
+    m.chat.encode(&m.tok, req.messages, req.think, prompt);
+    let (tokens, context) = (prompt.len(), m.load.settings.context);
+    if tokens >= context {
+        return Err(Error::TooLong { tokens, context });
+    }
+    slots(prompt, m.chat.image_token(), soft, m.vision.as_ref().map_or(0, Vision::width))
+}
+
+/// Where in `prompt` each image's soft tokens go: its first slot (a run of `slot` tokens), with its rows of `width`.
+/// An error unless the runs and the images match one for one.
+fn slots<'s>(prompt: &[u32], slot: Option<u32>, soft: &'s [Vec<f32>], width: usize) -> Result<Vec<(usize, &'s [f32])>> {
+    let mut runs = Vec::new();
+    for (p, &t) in prompt.iter().enumerate() {
+        if Some(t) == slot && (p == 0 || prompt[p - 1] != t) {
+            runs.push((p, prompt[p..].iter().take_while(|&&u| u == t).count()));
+        }
+    }
+    if runs.len() != soft.len() || runs.iter().zip(soft).any(|(r, s)| r.1 * width != s.len()) {
+        return Err(Error::Media(format!("{} images in the prompt, but {} sets of soft tokens", runs.len(), soft.len())));
+    }
+    Ok(runs.iter().zip(soft).map(|(r, s)| (r.0, s.as_slice())).collect())
 }
 
 /// The machine's RAM, in bytes.

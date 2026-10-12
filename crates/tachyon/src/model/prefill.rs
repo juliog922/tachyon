@@ -8,13 +8,17 @@
 //! and add nothing a later token needs, so a prompt's tokens but its last skip them (18 of E4B's 42 layers). The
 //! last token runs the decode step, which samples the first answer token. The chunk's kernels are launched
 //! directly, not recorded: their count does not depend on the chunk's length, which the matrix products need.
+//! Images' soft tokens replace their positions' embeddings right after the lookup ([`scatter`]), before the
+//! per-layer projection reads them.
 
 // Buffers and dimensions keep their one-letter names from the math, as in `decode`: x, q, y, d, h, l, n.
 #![allow(clippy::many_single_char_names)]
 
 use super::Config;
 use super::decode::{A, Bufs, Mat, Op, Weights};
-use crate::ptx::{ATTEND_256P, ATTEND_512P, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS};
+use crate::ptx::{
+    ATTEND_256P, ATTEND_512P, ATTEND_WARPS, EMBED_Q4, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS,
+};
 
 /// Device addresses of prefill's buffers, each for a chunk of tokens: the residual stream (two), Q8P values and
 /// scales, the query-key-value projections, the other products, the per-layer inputs (embedded, projected,
@@ -57,6 +61,13 @@ fn geglu([a, b]: [u64; 2], q: [u64; 2], n: u32, width: usize, stride: [usize; 2]
     let len = n * width as u32;
     let args = [a, b, q[0], q[1]].map(A::P).into_iter().chain([len, width as u32, stride[0] as u32, stride[1] as u32].map(A::U)).collect();
     (GEGLU_Q8P, [len.div_ceil(256), 1, 1], 256, args)
+}
+
+/// The soft tokens of `run` (its first row in the chunk, its rows) over the chunk's embeddings in `x[0]`, from
+/// `soft` (pinned: the rows, at their place in the chunk, and the row numbers).
+pub(super) fn scatter(cfg: &Config, c: &Chunk, soft: [u64; 2], (first, rows): (u32, u32)) -> Op {
+    let (h, skip) = (cfg.hidden as u32, u64::from(first) * cfg.hidden as u64 * 4);
+    (GATHER_ROWS, [h.div_ceil(256), rows, 1], 256, vec![A::P(soft[0] + skip), A::P(soft[1]), A::P(c.x[0] + skip), A::U(h)])
 }
 
 /// The launches of a chunk of `n` tokens, whose IDs are at `c.ids`; `scalars` holds each layer's `layer_scalar`.

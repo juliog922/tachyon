@@ -23,7 +23,7 @@ use tachyon::token::{Message, Role};
 use tachyon::wpk::Wpk;
 
 const RUNS: usize = 9;
-const MESSAGES: [Message; 1] = [Message { role: Role::User, text: "Name three colors of the rainbow." }];
+const MESSAGES: [Message; 1] = [Message::new(Role::User, "Name three colors of the rainbow.")];
 
 /// The model directory in `$var`, else `name` under `~/.local/share/tachyon`.
 fn dir(var: &str, name: &str) -> PathBuf {

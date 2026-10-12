@@ -116,6 +116,9 @@ struct Pre {
     chunk: Chunk,
     ids: HostBuf,
     size: usize,
+    /// Pinned: the chunk's soft tokens, `f32 [chunk, hidden]` at their positions in it, and the row numbers
+    /// `0..chunk` they are gathered by.
+    soft: [HostBuf; 2],
 }
 
 /// Device addresses of the step's buffers.
@@ -246,7 +249,9 @@ impl Decoder {
         }
         let (graphs, done) = record(&stream, &module, &steps)?;
         let (ops, logits) = (steps.swap_remove(0), b.logits);
-        let pre = Pre { files: [wpk, hpk], bases, scalars, bufs: b, chunk, ids, size: settings.chunk };
+        let mut soft = [ctx.alloc_host(4 * settings.chunk * cfg.hidden)?, ctx.alloc_host(4 * settings.chunk)?];
+        (0..settings.chunk as u32).for_each(|i| soft[1][4 * i as usize..][..4].copy_from_slice(&i.to_ne_bytes()));
+        let pre = Pre { files: [wpk, hpk], bases, scalars, bufs: b, chunk, ids, size: settings.chunk, soft };
         let mem = (weights, host);
         let mut dec = Decoder { graphs, cfg, stream, done, at: 0, tokens, pos: 0, control: ctl, arena, logits, loader, ops, module, pre, mem, shadow: None };
         dec.reset(&Sampling::default())?;
@@ -319,12 +324,22 @@ impl Decoder {
     /// run (a later step needs nothing else from these tokens). Nothing is sampled: a prompt's last token goes
     /// through [`Decoder::step`]. Not while a generation runs.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
-        for part in tokens.chunks(self.pre.size) {
-            part.iter().enumerate().for_each(|(i, t)| self.pre.ids[4 * i..4 * i + 4].copy_from_slice(&t.to_ne_bytes()));
+        self.prefill_with(tokens, &[])
+    }
+
+    /// [`Decoder::prefill`] with soft tokens: each of `soft` is a position in `tokens` and rows (`f32 [n, hidden]`,
+    /// an image's soft tokens) that take the place of the `n` token embeddings from there. Those positions read as
+    /// the pad token for the per-layer inputs, as Gemma 4 has it; the per-layer projection sees the soft tokens.
+    pub fn prefill_with(&mut self, tokens: &[u32], soft: &[(usize, &[f32])]) -> Result<()> {
+        for (k, part) in tokens.chunks(self.pre.size).enumerate() {
+            let runs = self.stage(k * self.pre.size, part, soft);
             let p = &self.pre;
             let (w, hw) = (Weights { wpk: &p.files[0], base: p.bases[0] }, Weights { wpk: &p.files[1], base: p.bases[1] });
-            for op in super::prefill::ops(&self.cfg, [&w, &hw], &p.bufs, (&p.chunk, &p.scalars), part.len() as u32) {
-                launch(&self.stream, &self.module, &op)?;
+            let mut ops = super::prefill::ops(&self.cfg, [&w, &hw], &p.bufs, (&p.chunk, &p.scalars), part.len() as u32);
+            let soft = [p.soft[0].device_ptr()?, p.soft[1].device_ptr()?];
+            ops.splice(1..1, runs.iter().map(|&run| super::prefill::scatter(&self.cfg, &p.chunk, soft, run)));
+            for op in &ops {
+                launch(&self.stream, &self.module, op)?;
             }
             self.pos += part.len() as u32;
             self.tokens[8..12].copy_from_slice(&self.pos.to_ne_bytes());
@@ -333,6 +348,24 @@ impl Decoder {
             self.stream.sync()?;
         }
         Ok(())
+    }
+
+    /// Writes the chunk `part` of the prompt, which starts at prompt position `start`, into the pinned IDs, and the
+    /// soft tokens it holds into the pinned rows, their IDs the pad token's; returns their runs (first row, rows).
+    fn stage(&mut self, start: usize, part: &[u32], soft: &[(usize, &[f32])]) -> Vec<(u32, u32)> {
+        let (h, ids, rows) = (self.cfg.hidden, &mut self.pre.ids, &mut self.pre.soft[0]);
+        part.iter().enumerate().for_each(|(i, t)| ids[4 * i..4 * i + 4].copy_from_slice(&t.to_ne_bytes()));
+        let mut runs = Vec::new();
+        for &(at, src) in soft {
+            let (a, b) = (at.max(start), (at + src.len() / h).min(start + part.len()));
+            if a < b {
+                ids[4 * (a - start)..4 * (b - start)].fill(0);
+                let bytes = src[(a - at) * h..(b - at) * h].iter().flat_map(|v| v.to_ne_bytes());
+                rows[4 * h * (a - start)..4 * h * (b - start)].iter_mut().zip(bytes).for_each(|(d, s)| *d = s);
+                runs.push(((a - start) as u32, (b - a) as u32));
+            }
+        }
+        runs
     }
 
     /// Queues recording `g`, which writes token word `g`, and marks its end.

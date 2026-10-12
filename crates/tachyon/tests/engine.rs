@@ -60,7 +60,7 @@ fn tiny_model_streams_cancels_and_does_not_allocate() {
     let mut engine = Engine::new(0, Limits::default()).unwrap();
     engine.load("tiny", &src.join("out"), &Load { settings: Settings { context: 64, chunk: 8 }, ..Load::default() }).unwrap();
     let tiny = ("tiny", None);
-    let messages = [Message { role: Role::System, text: "Be brief." }, Message { role: Role::User, text: "hello there, how are you" }];
+    let messages = [Message::new(Role::System, "Be brief."), Message::new(Role::User, "hello there, how are you")];
     let (full, tokens) = answer(&mut engine, tiny, &messages, 30);
     assert!(tokens > 0 && tokens <= 30, "{tokens} tokens");
     assert_eq!(answer(&mut engine, tiny, &messages, 30), (full.clone(), tokens), "a second chat repeats the first");
@@ -82,7 +82,7 @@ fn tiny_model_streams_cancels_and_does_not_allocate() {
     assert_eq!(stream.tokens(), 64 - prompt, "the answer fills the context");
     drop(stream);
     let long = "hello ".repeat(80);
-    let err = engine.chat("tiny", &Request::new(&[Message { role: Role::User, text: &long }])).err();
+    let err = engine.chat("tiny", &Request::new(&[Message::new(Role::User, &long)])).err();
     assert!(matches!(err, Some(tachyon::Error::TooLong { context: 64, .. })), "{err:?}");
     std::fs::remove_dir_all(src).unwrap();
 }
@@ -99,9 +99,11 @@ fn models_move_between_tiers_and_answer_the_same() {
     tachyon::model::convert(&src, &dir).unwrap();
     let settings = Settings { context: 64, chunk: 8 };
     let need = tachyon::model::footprint(&dir, &settings).unwrap();
-    let (keep, pin) =
-        (Load { settings, keep_alive: Duration::MAX, pin: false }, Load { settings: Settings { context: 64, chunk: 8 }, keep_alive: Duration::MAX, pin: true });
-    let messages = [Message { role: Role::User, text: "hello there" }];
+    let (keep, pin) = (
+        Load { settings, keep_alive: Duration::MAX, ..Load::default() },
+        Load { settings: Settings { context: 64, chunk: 8 }, keep_alive: Duration::MAX, pin: true, ..Load::default() },
+    );
+    let messages = [Message::new(Role::User, "hello there")];
     let (vram, host, disk) = (Some(Tier::Vram), Some(Tier::Host), Some(Tier::Disk));
     // Room for two: a third moves the least recently used to the host tier, from where it answers the same.
     let mut engine = Engine::new(0, Limits { vram: Some(2 * need + need / 2), host: None }).unwrap();
@@ -164,7 +166,7 @@ fn gemma_agrees_with_hugging_face() {
         let text = j.get("text").and_then(Json::str).unwrap();
         let (prompt, answer, gaps) = (ids(&j, "prompt"), ids(&j, "answer"), nums(&j, "gap"));
         let mut mine = Vec::new();
-        chat.encode(&tok, &[Message { role: Role::User, text }], false, &mut mine);
+        chat.encode(&tok, &[Message::new(Role::User, text)], false, &mut mine);
         assert_eq!(mine, prompt, "the chat template's tokens");
         dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
         let mut pick = mine.iter().map(|&t| dec.step(t).unwrap()).last().unwrap();

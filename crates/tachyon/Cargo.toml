@@ -62,5 +62,10 @@ name = "encoder"
 harness = false
 required-features = ["gpu"]
 
+[[bench]]
+name = "vision"
+harness = false
+required-features = ["gpu"]
+
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

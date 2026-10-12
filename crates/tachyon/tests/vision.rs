@@ -1,5 +1,6 @@
 //! Gemma 4's vision tower: its kernels against the CPU, and on the real checkpoint, its soft tokens against the
-//! float32 tower of Hugging Face (`scripts/media.py vision`, files `soft-*.f16` of `tests/fixtures/media/`).
+//! float32 tower of Hugging Face (`scripts/media.py vision`, files `soft-*.f16` of `tests/fixtures/media/`), and the
+//! decoder's answers about images against Hugging Face's (`vision.ref`).
 #![cfg(feature = "gpu")]
 // Kernel arguments and the maths read as their names: `a`, `w`, `x`, `y`, `h`.
 #![allow(clippy::many_single_char_names)]
@@ -7,6 +8,8 @@
 mod common;
 
 use tachyon::cuda::{DevBuf, arg};
+#[cfg(feature = "models")]
+use tachyon::json::Json;
 use tachyon::quant::{f16_bits, f16_value};
 
 /// `v` rounded to `f16`, as bits and as the values they hold.
@@ -162,20 +165,15 @@ fn the_pool_averages_each_square_of_patches() {
 #[cfg(feature = "models")]
 #[test]
 fn the_tower_matches_hugging_faces_soft_tokens() {
-    use tachyon::json::Json;
-    let dir = std::env::var("TACHYON_MODEL")
-        .map_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/tachyon/gemma-4-e4b"), Into::into);
-    let media = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/media");
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut tower = tachyon::vision::Vision::open(&ctx, &dir, 70).unwrap();
-    for line in std::fs::read_to_string(format!("{media}/vision.ref")).unwrap().lines() {
-        let case = Json::parse(line.as_bytes()).unwrap();
+    let mut tower = tachyon::vision::Vision::open(&ctx, &model_dir(), 70).unwrap();
+    for case in cases() {
         let Some(soft) = case.get("soft").and_then(Json::str) else { continue };
-        let image = tachyon::media::decode(&std::fs::read(format!("{media}/{}", case.get("image").and_then(Json::str).unwrap())).unwrap()).unwrap();
+        let image = image(&case);
         let start = std::time::Instant::now();
         let got = tower.soft_tokens(&image, 70).unwrap();
         let took = start.elapsed();
-        let want: Vec<f32> = std::fs::read(format!("{media}/{soft}")).unwrap().chunks_exact(2).map(|b| f16_value(u16::from_le_bytes([b[0], b[1]]))).collect();
+        let want: Vec<f32> = std::fs::read(format!("{MEDIA}/{soft}")).unwrap().chunks_exact(2).map(|b| f16_value(u16::from_le_bytes([b[0], b[1]]))).collect();
         assert_eq!(got.len(), want.len(), "{soft}: {} soft tokens against {}", got.len() / tower.width(), want.len() / tower.width());
         let (cos, err) = compare(&got, &want, tower.width());
         println!("{soft}: {} soft tokens in {took:.2?}, min cosine {cos:.6}, max error {err:.2e} of the largest", want.len() / tower.width());
@@ -197,4 +195,103 @@ fn compare(got: &[f32], want: &[f32], width: usize) -> (f64, f64) {
     let top = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let err = got.iter().zip(want).fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
     (cos, f64::from(err / top))
+}
+
+/// Where the fixtures are.
+#[cfg(feature = "models")]
+const MEDIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/media");
+
+/// The question `scripts/media.py vision` asks about each image.
+#[cfg(feature = "models")]
+const QUESTION: &str = "Describe this image in one sentence.";
+
+/// E4B's model directory: `$TACHYON_MODEL`, by default `~/.local/share/tachyon/gemma-4-e4b`.
+#[cfg(feature = "models")]
+fn model_dir() -> std::path::PathBuf {
+    std::env::var("TACHYON_MODEL")
+        .map_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/tachyon/gemma-4-e4b"), Into::into)
+}
+
+/// The cases of `vision.ref`: an image at a budget, its prompt's tokens, and Hugging Face's greedy answer.
+#[cfg(feature = "models")]
+fn cases() -> Vec<Json> {
+    std::fs::read_to_string(format!("{MEDIA}/vision.ref")).unwrap().lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect()
+}
+
+/// The image of `case`, decoded.
+#[cfg(feature = "models")]
+fn image(case: &Json) -> tachyon::media::Image {
+    tachyon::media::decode(&std::fs::read(format!("{MEDIA}/{}", case.get("image").and_then(Json::str).unwrap())).unwrap()).unwrap()
+}
+
+/// The numbers of `case`'s field `key`.
+#[cfg(feature = "models")]
+fn numbers(case: &Json, key: &str) -> Vec<f64> {
+    case.get(key).and_then(Json::arr).unwrap().iter().map(|v| v.num().unwrap()).collect()
+}
+
+/// E4B with the tower's soft tokens against Hugging Face's bfloat16 decoder with the float32 tower's, on the 3
+/// images at 70 and 280 soft tokens: the chat template gives the reference's tokens; fed the prompt and each
+/// reference answer token by token, its pick after every token agrees with the reference's on ≥ 80% of the
+/// positions (text alone reaches 86% with 4-bit weights; the answers here are ~170 tokens, so a few picks move the
+/// figure). Prefill takes chunks of 128 tokens, so the 280-token images cross two chunk boundaries. Disagreements
+/// where the reference was sure (a gap of 2 or more) are printed.
+#[cfg(feature = "models")]
+#[test]
+fn the_decoder_answers_about_images_as_hugging_face_does() {
+    use tachyon::token::{Chat, Message, Role, Tokenizer};
+    let (dir, ctx) = (model_dir(), tachyon::cuda::Context::new(0).unwrap());
+    let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok")).unwrap()).unwrap();
+    let mut tower = tachyon::vision::Vision::open(&ctx, &dir, 280).unwrap();
+    let mut dec = tachyon::model::Decoder::open(&ctx, &dir, &tachyon::model::Settings { context: 4096, chunk: 128 }).unwrap();
+    let (mut agree, mut total) = (0usize, 0usize);
+    for case in cases() {
+        let (name, budget) = (case.get("image").and_then(Json::str).unwrap(), case.get("budget").and_then(Json::num).unwrap() as usize);
+        let images = [image(&case)];
+        let mut prompt = Vec::new();
+        Chat::gemma4(&tok).unwrap().with_budget(budget).encode(&tok, &[Message { images: &images, ..Message::new(Role::User, QUESTION) }], false, &mut prompt);
+        assert_eq!(prompt, numbers(&case, "ids").iter().map(|&v| v as u32).collect::<Vec<_>>(), "{name} at {budget}: the chat template's tokens");
+        let soft = tower.soft_tokens(&images[0], budget).unwrap();
+        let at = prompt.iter().position(|&t| t == 258_880).unwrap();
+        dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
+        dec.prefill_with(&prompt[..prompt.len() - 1], &[(at, &soft)]).unwrap();
+        let mut pick = dec.step(prompt[prompt.len() - 1]).unwrap();
+        let (answer, gaps) = (numbers(&case, "answer"), numbers(&case, "margins"));
+        let mut mine = 0usize;
+        for (k, (&want, gap)) in answer.iter().zip(&gaps).enumerate() {
+            let want = want as u32;
+            if pick == want {
+                mine += 1;
+            } else if *gap >= 2.0 {
+                println!("{name} at {budget}, answer token {k}: {pick} against {want} (reference gap {gap:.2})");
+            }
+            pick = dec.step(want).unwrap();
+        }
+        println!("{name} at {budget}: {mine}/{} picks agree", answer.len());
+        (agree, total) = (agree + mine, total + answer.len());
+    }
+    println!("top-1 agreement {agree}/{total} ({:.2}%)", 100.0 * agree as f64 / total as f64);
+    assert!(agree as f64 >= 0.80 * total as f64);
+}
+
+/// The engine answers about an image: E4B, loaded with images at 70 soft tokens, describes the photo; its prompt
+/// is the reference's length.
+#[cfg(feature = "models")]
+#[test]
+fn the_engine_answers_about_an_image() {
+    use tachyon::engine::{Engine, Limits, Load, Request};
+    use tachyon::token::{Message, Role};
+    let case = cases().into_iter().find(|c| c.get("budget").and_then(Json::num) == Some(70.0)).unwrap();
+    let mut engine = Engine::new(0, Limits::default()).unwrap();
+    engine.load("e4b", &model_dir(), &Load { budget: 70, ..Load::default() }).unwrap();
+    let images = [image(&case)];
+    let messages = [Message { images: &images, ..Message::new(Role::User, QUESTION) }];
+    let mut answer = engine.chat("e4b", &Request { max_tokens: 40, ..Request::new(&messages) }).unwrap();
+    let mut text = String::new();
+    while let Some(piece) = answer.next_text().unwrap() {
+        text.push_str(piece);
+    }
+    println!("{text}");
+    assert_eq!(answer.prompt(), numbers(&case, "ids").len());
+    assert!(!text.trim().is_empty());
 }

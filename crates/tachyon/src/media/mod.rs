@@ -18,6 +18,9 @@ pub const POOL: usize = 3;
 /// The soft-token budgets an image may have, as Gemma 4 is trained.
 pub const BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
 
+/// The soft-token budget an image gets unless asked otherwise, as Gemma 4's image processor's.
+pub const DEFAULT_BUDGET: usize = 280;
+
 /// An 8-bit RGB image, rows top to bottom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
@@ -77,6 +80,13 @@ impl Image {
             (w, h) = (side, (self.height / self.width * side).min(most));
         }
         Ok((w, h))
+    }
+
+    /// The soft tokens the vision tower makes of this image for `budget`: one per square of [`POOL`] × [`POOL`]
+    /// patches of its [`Image::fitted_size`].
+    pub fn soft_tokens(&self, budget: usize) -> Result<usize> {
+        let (w, h) = self.fitted_size(budget)?;
+        Ok(w / (PATCH * POOL) * (h / (PATCH * POOL)))
     }
 
     /// This image at its [`Image::fitted_size`] for `budget` soft tokens.
