@@ -124,14 +124,20 @@ pub fn token_bytes() -> f64 {
 impl Gpu {
     /// The integer tensor-core rate of [`tachyon::ptx::MMA_PEAK`], in TOPS: the ceiling prefill is measured against.
     pub fn mma_peak(&self, suite: &mut Suite) -> f64 {
-        let (peak, iters, blocks) = (self.module.function(tachyon::ptx::MMA_PEAK).unwrap(), 4096u32, self.ctx.info().sms * 8);
+        self.peak(suite, tachyon::ptx::MMA_PEAK, "int8 mma peak")
+    }
+
+    /// The rate of peak kernel `kernel` (see [`tachyon::ptx::MMA_PEAK`]), in TOPS, recorded as `label`.
+    pub fn peak(&self, suite: &mut Suite, kernel: &str, label: &str) -> f64 {
+        let (peak, iters, blocks) = (self.module.function(kernel).unwrap(), 4096u32, self.ctx.info().sms * 8);
+        let ops = if kernel == tachyon::ptx::MMA_PEAK { 8192.0 } else { 4096.0 };
         let out = self.ctx.alloc(blocks as usize * 128 * 4).unwrap();
         let ptr = out.ptr();
-        let t = suite.run("int8 mma peak", 20, || {
+        let t = suite.run(label, 20, || {
             // SAFETY: two arguments of the kernel's types; `out` holds a word for each of the grid's threads.
             self.time(|s| unsafe { s.launch(&peak, [blocks, 1, 1], [128, 1, 1], 0, &[arg(&ptr), arg(&iters)]) }.unwrap())
         });
-        let tops = f64::from(blocks) * 4.0 * f64::from(iters) * 8.0 * 8192.0 / t.as_secs_f64() / 1e12;
+        let tops = f64::from(blocks) * 4.0 * f64::from(iters) * 8.0 * ops / t.as_secs_f64() / 1e12;
         suite.rate(tops, "TOPS");
         tops
     }

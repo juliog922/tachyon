@@ -3,15 +3,23 @@
 
 use super::laya::{Head, Kind};
 use super::{Config, Settings};
-use crate::cuda::{Context, DevBuf, HostBuf, Module, Stream, arg};
-use crate::ptx::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_TILE, NORM_F16, ROPE_F32};
+use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Module, Stream, arg};
+use crate::ptx::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE, NORM_F16, ROPE_F16, SPIN};
 use crate::token::Tokenizer;
 use crate::wpk::{Loader, Wpk};
 use crate::{Error, Result};
+use std::cell::RefCell;
 use std::path::Path;
+use std::time::Duration;
 
 /// Rows of the last scorer layer, padded for the matrix product.
 const SCORES: u32 = 64;
+/// The matrix products, largest blocks first: tokens per block, kernel, threads.
+const PRODUCTS: [(u32, &str, u32); 2] = [(128, GEMM_F16_128, 256), (64, GEMM_F16, 128)];
+/// Batch shapes whose graphs an encoder keeps.
+const GRAPHS: usize = 16;
+/// Rows past the capacity in each `f16` buffer, so a product's last block of 128 tokens stays inside it.
+const SLACK: usize = 64;
 
 /// A kernel argument.
 enum A {
@@ -20,8 +28,8 @@ enum A {
     F(f32),
 }
 
-/// Where the activations live: the residual stream `x`, the wide `f32` rows `big` (queries, keys and values, the
-/// MLP's two halves, picked rows), and two buffers of `f16` rows a matrix product reads.
+/// Where the activations live: the residual stream `x`, the wide `f32` rows `big` (the MLP's two halves, picked
+/// rows), and two buffers of `f16` rows: what a matrix product reads, and queries, keys and values (`b`).
 #[derive(Clone, Copy)]
 struct Buffers {
     x: u64,
@@ -61,17 +69,23 @@ pub struct Encoder {
     head: Option<Head>,
     tok: Option<Tokenizer>,
     wpk: Wpk,
+    /// The graphs recorded, by batch shape: padded tokens, tile slots, with the head; dropped first.
+    graphs: Vec<((usize, usize, bool), Graph)>,
     weights: DevBuf,
     table: HostBuf,
     rope: DevBuf,
     scratch: DevBuf,
     bufs: Buffers,
-    /// The batch in the buffers: its tokens and attention tiles.
+    /// The batch in the buffers: its tokens padded to whole tiles of 64, and its tile slots.
     batch: (usize, u32),
     inputs: Inputs,
     module: Module,
     stream: Stream,
     cap: usize,
+    /// The GPU's multiprocessors.
+    sms: u32,
+    /// While [`Encoder::timeline`] runs: each launch's kind and an event recorded after it.
+    marks: RefCell<Option<Vec<(String, Event)>>>,
 }
 
 impl Encoder {
@@ -83,8 +97,26 @@ impl Encoder {
         let cap = capacity(*settings)?;
         let (rope, (scratch, bufs), inputs) = (rope(ctx, &cfg, cap)?, scratch(ctx, &cfg, head.is_some(), cap)?, inputs(ctx, cap)?);
         let (module, stream) = (ctx.load(&crate::ptx::module())?, ctx.stream()?);
-        let enc = Encoder { cfg, head, tok, wpk, weights, table, rope, scratch, bufs, batch: (0, 0), inputs, module, stream, cap };
-        enc.check()?;
+        let enc = Encoder {
+            cfg,
+            head,
+            tok,
+            wpk,
+            graphs: Vec::new(),
+            weights,
+            table,
+            rope,
+            scratch,
+            bufs,
+            batch: (0, 0),
+            inputs,
+            module,
+            stream,
+            cap,
+            sms: ctx.info().sms,
+            marks: RefCell::new(None),
+        };
+        enc.check().and_then(|()| enc.interleave())?;
         Ok(enc)
     }
 
@@ -101,6 +133,16 @@ impl Encoder {
     /// The model's tokenizer, if its directory has one.
     pub fn tokenizer(&self) -> Option<&Tokenizer> {
         self.tok.as_ref()
+    }
+
+    /// The most tokens a batch holds: the longest sequence it takes.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// The VRAM it holds, in bytes: weights, RoPE tables, activations.
+    pub fn bytes(&self) -> usize {
+        self.weights.len() + self.rope.len() + self.scratch.len()
     }
 
     /// Every token's last hidden state, `f32 [tokens, hidden]`, sequence after sequence.
@@ -143,7 +185,6 @@ impl Encoder {
             let part = &questions[done..done + batch.len()];
             let kinds: Vec<u32> = part.iter().map(|q| q.2 as u32).collect();
             self.encode(batch, Some(&kinds))?;
-            self.decide()?;
             let mut at = 0;
             let marks: Vec<u32> = part
                 .iter()
@@ -213,7 +254,32 @@ impl Encoder {
             .collect();
         // SAFETY: every call passes the kernel's arguments in order and with their types, as `crate::ptx::encoder`
         // documents them, on buffers laid out for the capacity this encoder was opened with.
-        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }
+        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }?;
+        if let Some(marks) = self.marks.borrow_mut().as_mut() {
+            let event = self.stream.context().event(true)?;
+            self.stream.record(&event)?;
+            marks.push((name.into(), event));
+        }
+        Ok(())
+    }
+
+    /// Runs `work` kernel by kernel, each timed on the GPU, and returns its result and every kernel's kind (its name;
+    /// for a matrix product `gemm tokens×cols→rows /tile`) and time, in order. A [`SPIN`] kernel first holds the GPU while the CPU
+    /// queues the kernels, up to the first wait for a result, so they run back to back: GPU time without launch gaps.
+    pub fn timeline<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<(T, Vec<(String, Duration)>)> {
+        let start = self.stream.context().event(true)?;
+        self.launch(SPIN, [1, 1, 1], 32, &[A::P(20_000_000)])?;
+        self.stream.record(&start)?;
+        *self.marks.get_mut() = Some(Vec::new());
+        let out = work(self);
+        let marks = self.marks.get_mut().take().unwrap_or_default();
+        let (out, mut last, mut times) = (out?, &start, Vec::with_capacity(marks.len()));
+        self.stream.sync()?;
+        for (kind, event) in &marks {
+            times.push((kind.clone(), Duration::from_secs_f64(f64::from(event.since(last)?) / 1e3)));
+            last = event;
+        }
+        Ok((out, times))
     }
 
     /// `p.y = p.a · wᵀ + bias` for `tokens` rows, stored as `mode` says (see [`crate::ptx::GEMM_F16`]).
@@ -225,22 +291,31 @@ impl Encoder {
         }
         let bias = if p.bias.is_empty() { 0 } else { self.at(p.bias) };
         let args = [A::P(p.a), A::P(self.at(p.w)), A::P(bias), A::P(p.y), A::U(rows), A::U(cols), A::U(tokens as u32), A::U(mode)];
-        self.launch(GEMM_F16, [(tokens as u32).div_ceil(GEMM_F16_TILE), rows / GEMM_F16_TILE, 1], 128, &args)
+        // The largest blocks that still give each multiprocessor two.
+        // Blocks of 128 tokens when they give each multiprocessor four; they are slower on shorter batches.
+        let wide = (tokens as u32).div_ceil(128) * (rows / GEMM_F16_TILE) >= 4 * self.sms;
+        let (tile, kernel, threads) = PRODUCTS[usize::from(!wide)];
+        self.launch(kernel, [(tokens as u32).div_ceil(tile) * (rows / GEMM_F16_TILE), 1, 1], threads, &args)?;
+        if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
+            last.0 = format!("gemm {tokens}×{cols}→{rows} /{tile}");
+        }
+        Ok(())
     }
 
     /// Layer norm of `rows` rows (see [`Norm`]).
     fn norm(&self, n: &Norm, rows: usize, eps: f32) -> Result<()> {
         let bias = if n.bias.is_empty() { 0 } else { self.at(n.bias) };
-        let args = [A::P(n.x), A::P(self.at(n.weight)), A::P(bias), A::P(n.a), A::P(n.xo), A::U(self.cfg.hidden as u32), A::U(rows as u32), A::F(eps)];
-        self.launch(NORM_F16, [(rows as u32).div_ceil(4), 1, 1], 128, &args)
+        let h = self.cfg.hidden as u32;
+        let args = [A::P(n.x), A::P(self.at(n.weight)), A::P(bias), A::P(n.a), A::P(n.xo), A::U(h), A::F(eps)];
+        self.launch(NORM_F16, [rows as u32, 1, 1], (h / 4).div_ceil(32) * 32, &args)
     }
 
-    /// Attention over `qkv` (`big`) into `a`, heads of `d`, within `window` (0: global), on the batch's tiles.
+    /// Attention over `qkv` (`f16` in `b`) into `a`, heads of `d`, within `window` (0: global), on the batch's tiles.
     fn attend(&self, d: usize, window: usize, tiles: u32) -> Result<()> {
         let kernel = if d == 32 { ATTEND_F16_32 } else { ATTEND_F16 };
         let scale = std::f32::consts::LOG2_E / (d as f32).sqrt();
-        let args = [A::P(self.bufs.big), A::P(self.bufs.a), A::P(self.input(3)?), A::U(self.cfg.hidden as u32), A::U(window as u32), A::F(scale)];
-        self.launch(kernel, [tiles, (self.cfg.hidden / d) as u32, 1], 64, &args)
+        let args = [A::P(self.bufs.b), A::P(self.bufs.a), A::P(self.input(3)?), A::U(self.cfg.hidden as u32), A::U(window as u32), A::F(scale)];
+        self.launch(kernel, [tiles, (self.cfg.hidden / d) as u32, 1], 128, &args)
     }
 
     /// Device address of input part `i`.
@@ -248,8 +323,9 @@ impl Encoder {
         Ok(self.inputs.buf.device_ptr()? + self.inputs.at[i] as u64)
     }
 
-    /// Writes the batch's inputs: IDs, positions, kinds (each token its question's), and tiles; their count.
-    fn fill(&mut self, seqs: &[&[u32]], kinds: Option<&[u32]>) -> u32 {
+    /// Writes the batch's inputs: IDs, positions, kinds (each token its question's), and tiles, padded to `n`
+    /// tokens (ID 0, position 0) and `slots` tiles (empty).
+    fn fill(&mut self, seqs: &[&[u32]], kinds: Option<&[u32]>, (n, slots): (usize, usize)) {
         let at = self.inputs.at;
         let words: &mut [u8] = &mut self.inputs.buf;
         let mut put = |part: usize, i: usize, v: u32| words[at[part] + 4 * i..][..4].copy_from_slice(&v.to_le_bytes());
@@ -261,21 +337,45 @@ impl Encoder {
                 put(2, t + p, kinds.map_or(0, |k| k[s]));
             }
             for q in (0..seq.len()).step_by(64) {
-                for (k, v) in [t, seq.len(), q].into_iter().enumerate() {
-                    put(3, 3 * tiles + k, v as u32);
-                }
+                (0..3).for_each(|k| put(3, 3 * tiles + k, [t, seq.len(), q][k] as u32));
                 tiles += 1;
             }
             t += seq.len();
         }
-        tiles as u32
+        (t..n).for_each(|i| (0..3).for_each(|part| put(part, i, 0)));
+        (3 * tiles..3 * slots).for_each(|i| put(3, i, 0));
     }
 
-    /// Runs the encoder over `seqs`, with each sequence's question kind for Laya's head; leaves the last hidden
-    /// states in `x` and returns the number of tokens.
+    /// Runs the encoder over `seqs`, and Laya's head given each sequence's question kind; leaves the last hidden
+    /// states in `x` and returns the number of tokens. The batch runs padded to whole tiles of 64 tokens, with a
+    /// tile slot per 64 of them and one per sequence, as a CUDA graph recorded once for each such shape: one launch
+    /// for the GPU, which reads the inputs as it runs.
     fn encode(&mut self, seqs: &[&[u32]], kinds: Option<&[u32]>) -> Result<usize> {
-        let tiles = self.fill(seqs, kinds);
-        let (n, width, Buffers { x, a, .. }) = (seqs.iter().map(|s| s.len()).sum::<usize>(), self.cfg.hidden as u32, self.bufs);
+        let tokens = seqs.iter().map(|s| s.len()).sum::<usize>();
+        let shape = (tokens.div_ceil(64) * 64, tokens.div_ceil(64) + seqs.len(), kinds.is_some());
+        self.fill(seqs, kinds, (shape.0, shape.1));
+        self.batch = (shape.0, shape.1 as u32);
+        if self.marks.get_mut().is_some() {
+            return self.layers(shape.2).map(|()| tokens);
+        }
+        let at = if let Some(at) = self.graphs.iter().position(|g| g.0 == shape) {
+            at
+        } else {
+            let graph = self.stream.capture(|_| self.layers(shape.2))?;
+            if self.graphs.len() == GRAPHS {
+                self.graphs.remove(0);
+            }
+            self.graphs.push((shape, graph));
+            self.graphs.len() - 1
+        };
+        // SAFETY: the graph reads and writes only this encoder's buffers and inputs, laid out when it was recorded.
+        unsafe { self.stream.replay(&self.graphs[at].1) }?;
+        Ok(tokens)
+    }
+
+    /// The kernels of the batch in the inputs: the embeddings, every layer, the last norm, and Laya's head if `head`.
+    fn layers(&self, head: bool) -> Result<()> {
+        let ((n, tiles), width, Buffers { x, a, .. }) = (self.batch, self.cfg.hidden as u32, self.bufs);
         self.launch(EMBED_F16, [width.div_ceil(256), n as u32, 1], 256, &[A::P(self.table.device_ptr()?), A::P(self.input(0)?), A::P(x), A::U(width)])?;
         self.norm(&Norm { x, a, xo: x, weight: "embed_norm", bias: "" }, n, self.cfg.eps)?;
         for i in 0..self.cfg.layers() {
@@ -283,37 +383,53 @@ impl Encoder {
             self.mlp(i, n)?;
         }
         self.norm(&Norm { x, a, xo: x, weight: "final_norm", bias: "" }, n, self.cfg.eps)?;
-        self.batch = (n, tiles);
-        Ok(n)
+        if head { self.head_pass() } else { Ok(()) }
     }
 
     /// Encoder layer `i`'s attention over the batch's `n` tokens, added to `x`.
     fn attention(&self, i: usize, n: usize, tiles: u32) -> Result<()> {
-        let (cfg, Buffers { x, big, a, .. }) = (&self.cfg, self.bufs);
+        let (cfg, Buffers { x, a, b, .. }) = (&self.cfg, self.bufs);
         if i > 0 {
             self.norm(&Norm { x, a, xo: 0, weight: &format!("{i}.attn_norm"), bias: "" }, n, cfg.eps)?;
         }
-        self.gemm(&Product { a, w: &format!("{i}.qkv"), bias: "", y: big }, n, 0)?;
+        self.gemm(&Product { a, w: &format!("{i}.qkv"), bias: "", y: b }, n, 2)?;
         let (global, d) = (cfg.global[i], cfg.head_dim());
         let table = self.rope.ptr() + if global { 0 } else { (self.cap * d * 4) as u64 };
-        let args = [A::P(big), A::P(table), A::P(self.input(1)?), A::U(cfg.hidden as u32), A::U(d as u32), A::U(n as u32)];
-        self.launch(ROPE_F32, [((n * cfg.hidden / 2) as u32).div_ceil(256), 1, 1], 256, &args)?;
+        let args = [A::P(b), A::P(table), A::P(self.input(1)?), A::U(cfg.hidden as u32), A::U(d as u32)];
+        self.launch(ROPE_F16, [(cfg.hidden as u32 / 2).div_ceil(256), n as u32, 1], 256, &args)?;
         self.attend(d, if global { 0 } else { cfg.window }, tiles)?;
         self.gemm(&Product { a, w: &format!("{i}.o"), bias: "", y: x }, n, 1)
     }
 
-    /// Encoder layer `i`'s gated MLP over the batch's `n` tokens, added to `x`.
+    /// Encoder layer `i`'s gated MLP over the batch's `n` tokens, added to `x`: the GELU in the up product (its rows
+    /// interleaved, see [`Encoder::interleave`]).
     fn mlp(&self, i: usize, n: usize) -> Result<()> {
-        let (cfg, Buffers { x, big, a, .. }) = (&self.cfg, self.bufs);
+        let (cfg, Buffers { x, a, b, .. }) = (&self.cfg, self.bufs);
         self.norm(&Norm { x, a, xo: 0, weight: &format!("{i}.mlp_norm"), bias: "" }, n, cfg.eps)?;
-        self.gemm(&Product { a, w: &format!("{i}.up"), bias: "", y: big }, n, 0)?;
-        let len = (n * cfg.inter) as u32;
-        self.launch(GELU_F16, [len.div_ceil(256), 1, 1], 256, &[A::P(big), A::P(a), A::U(cfg.inter as u32), A::U(len), A::U(1)])?;
-        self.gemm(&Product { a, w: &format!("{i}.down"), bias: "", y: x }, n, 1)
+        self.gemm(&Product { a, w: &format!("{i}.up"), bias: "", y: b }, n, 4)?;
+        self.gemm(&Product { a: b, w: &format!("{i}.down"), bias: "", y: x }, n, 1)
+    }
+
+    /// Interleaves the rows of each layer's up product, the GELU half's row `j` then the gate's, so the product
+    /// stores `gelu(a)·b` itself (mode 4): through a scratch copy, rows as `f32` words.
+    fn interleave(&self) -> Result<()> {
+        let (inter, words) = (self.cfg.inter, self.cfg.hidden as u32 / 2);
+        let ctx = self.stream.context();
+        let (scratch, mut maps) = (ctx.alloc(4 * inter * self.cfg.hidden)?, ctx.alloc_host(16 * inter)?);
+        for (i, r) in (0..inter).flat_map(|j| [j, inter + j]).chain(0..2 * inter).enumerate() {
+            maps[4 * i..][..4].copy_from_slice(&(r as u32).to_le_bytes());
+        }
+        let (there, back, grid) = (maps.device_ptr()?, maps.device_ptr()? + 8 * inter as u64, [words.div_ceil(256), 2 * inter as u32, 1]);
+        for i in 0..self.cfg.layers() {
+            let up = self.at(&format!("{i}.up"));
+            self.launch(GATHER_ROWS, grid, 256, &[A::P(up), A::P(there), A::P(scratch.ptr()), A::U(words)])?;
+            self.launch(GATHER_ROWS, grid, 256, &[A::P(scratch.ptr()), A::P(back), A::P(up), A::U(words)])?;
+        }
+        self.stream.sync()
     }
 
     /// Laya's head over the batch in `x`: the type embedding, then its layers.
-    fn decide(&self) -> Result<()> {
+    fn head_pass(&self) -> Result<()> {
         let (width, (n, tiles)) = (self.cfg.hidden as u32, self.batch);
         self.launch(ADD_ROWS, [width.div_ceil(256), n as u32, 1], 256, &[A::P(self.at("type_emb")), A::P(self.input(2)?), A::P(self.bufs.x), A::U(width)])?;
         (0..self.head.as_ref().map_or(0, |hd| hd.layers)).try_for_each(|l| self.head_layer(l, n, tiles))
@@ -321,9 +437,9 @@ impl Encoder {
 
     /// Head layer `l`: pre-norm attention (heads of 64, no RoPE) and a ReLU MLP, each with biases.
     fn head_layer(&self, l: usize, n: usize, tiles: u32) -> Result<()> {
-        let (Buffers { x, big, a, b }, w) = (self.bufs, |s: &str| format!("h{l}.{s}"));
+        let (Buffers { x, a, b, .. }, w) = (self.bufs, |s: &str| format!("h{l}.{s}"));
         self.norm(&Norm { x, a, xo: 0, weight: &w("norm1.w"), bias: &w("norm1.b") }, n, 1e-5)?;
-        self.gemm(&Product { a, w: &w("qkv.w"), bias: &w("qkv.b"), y: big }, n, 0)?;
+        self.gemm(&Product { a, w: &w("qkv.w"), bias: &w("qkv.b"), y: b }, n, 2)?;
         self.attend(64, 0, tiles)?;
         self.gemm(&Product { a, w: &w("o.w"), bias: &w("o.b"), y: x }, n, 1)?;
         self.norm(&Norm { x, a, xo: 0, weight: &w("norm2.w"), bias: &w("norm2.b") }, n, 1e-5)?;
@@ -385,10 +501,7 @@ fn rope_tables(cfg: &Config, positions: usize) -> Vec<f32> {
 
 /// The activation buffers for `cap` tokens, in one allocation.
 fn scratch(ctx: &Context, cfg: &Config, laya: bool, cap: usize) -> Result<(DevBuf, Buffers)> {
-    let h = cfg.hidden;
-    let wide = (3 * h).max(2 * cfg.inter).max(SCORES as usize);
-    let half = h.max(cfg.inter).max(if laya { 4 * h } else { 0 });
-    let sizes = [4 * cap * h, 4 * cap * wide, 2 * cap * half, 2 * cap * half];
+    let sizes = scratch_sizes(cfg, laya, cap);
     let buf = ctx.alloc(sizes.iter().sum())?;
     let mut at = [buf.ptr(); 4];
     for i in 1..4 {
@@ -450,4 +563,20 @@ fn capacity(settings: Settings) -> Result<usize> {
         return Err(Error::Unsupported(format!("{} tokens at once: from 1 to 65535", settings.tokens)));
     }
     Ok(cap)
+}
+
+/// Bytes of each activation buffer for `cap` tokens: `x`, `big`, `a`, `b`.
+fn scratch_sizes(cfg: &Config, laya: bool, cap: usize) -> [usize; 4] {
+    let h = cfg.hidden;
+    let wide = (3 * h).max(2 * cfg.inter).max(SCORES as usize);
+    let half = h.max(cfg.inter).max(if laya { 4 * h } else { 0 });
+    [4 * cap * h, 4 * cap * wide, 2 * (cap + SLACK) * half, 2 * (cap + SLACK) * half.max(3 * h)]
+}
+
+/// VRAM the encoder in `dir` takes with `settings`: weights, RoPE tables, activations.
+pub fn footprint(dir: &Path, settings: Settings) -> Result<usize> {
+    let (cfg, head, _) = describe(dir)?;
+    let cap = capacity(settings)?;
+    let rope = 2 * cap * cfg.head_dim() * 4;
+    Ok(Wpk::open(dir.join("weights.wpk"))?.data_len() + rope + scratch_sizes(&cfg, head.is_some(), cap).iter().sum::<usize>())
 }

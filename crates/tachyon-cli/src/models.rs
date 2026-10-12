@@ -10,13 +10,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// A model of the catalog: its name, Hugging Face repository, what it is, the VRAM it takes with the default
-/// context (bytes), and the development step that brings it when this build cannot run it yet.
+/// A model of the catalog: its name, Hugging Face repository, what it is for and is, the VRAM it takes with the
+/// default settings (bytes), and the development step that brings it when this build cannot run it yet.
 pub struct Model {
     /// The name `pull` and `run` take.
     pub name: &'static str,
     /// The Hugging Face repository of its checkpoint.
     pub repo: &'static str,
+    /// The command that uses it: `run`, `decide` or `embed`.
+    pub task: &'static str,
     /// One line on what it is.
     pub about: &'static str,
     /// VRAM it takes with the default settings, in bytes.
@@ -25,18 +27,56 @@ pub struct Model {
     pub later: Option<u8>,
 }
 
-/// Every model the catalog knows, smallest first. The embedding and decision models arrive in step 10.
-pub const CATALOG: [Model; 4] = [
-    Model { name: "gemma-4-e2b", repo: "google/gemma-4-E2B-it", about: "Gemma 4 E2B: chat, fastest on small GPUs", vram: 1_700 << 20, later: None },
-    Model { name: "gemma-4-e4b", repo: "google/gemma-4-E4B-it", about: "Gemma 4 E4B: chat, the default on 6–8 GB", vram: 2_900 << 20, later: None },
+/// Every model the catalog knows: the encoders, then the chat models, smallest first.
+pub const CATALOG: [Model; 6] = [
+    Model {
+        name: "granite-embedding-311m",
+        repo: "ibm-granite/granite-embedding-311m-multilingual-r2",
+        task: "embed",
+        about: "Granite Embedding 311M R2: embeddings in 200+ languages, 768 dims",
+        vram: 300 << 20,
+        later: None,
+    },
+    Model {
+        name: "laya-multilingual",
+        repo: "convaiinnovations/laya-multilingual",
+        task: "decide",
+        about: "Laya multilingual: typed decisions in one pass, 100+ languages",
+        vram: 350 << 20,
+        later: None,
+    },
+    Model {
+        name: "gemma-4-e2b",
+        repo: "google/gemma-4-E2B-it",
+        task: "run",
+        about: "Gemma 4 E2B: chat, fastest on small GPUs",
+        vram: 1_700 << 20,
+        later: None,
+    },
+    Model {
+        name: "gemma-4-e4b",
+        repo: "google/gemma-4-E4B-it",
+        task: "run",
+        about: "Gemma 4 E4B: chat, the default on 6–8 GB",
+        vram: 2_900 << 20,
+        later: None,
+    },
     Model {
         name: "gemma-4-26b-a4b",
         repo: "google/gemma-4-26B-A4B-it",
+        task: "run",
         about: "Gemma 4 26B A4B: mixture of experts, the default on 24 GB",
         vram: 15 << 30,
         later: Some(12),
     },
-    Model { name: "gemma-4-31b", repo: "google/gemma-4-31B-it", about: "Gemma 4 31B: the highest quality, 32 GB and up", vram: 19 << 30, later: Some(12) },
+    Model {
+        name: "gemma-4-31b",
+        repo: "google/gemma-4-31B-it",
+        task: "run",
+        about: "Gemma 4 31B: the highest quality, 32 GB and up",
+        vram: 19 << 30,
+        later: Some(12),
+    },
 ];
 
 /// `name` in the catalog.
@@ -64,19 +104,21 @@ pub fn catalog() {
             (None, true) => "pulled".into(),
             (None, false) => String::new(),
         };
-        println!("{:<17} {:>5.1} GB  {:<60} {state}", m.name, m.vram as f64 / 1e9, m.about);
+        println!("{:<23} {:<6} {:>5.1} GB  {:<66} {state}", m.name, m.task, m.vram as f64 / 1e9, m.about);
     }
 }
 
 /// The model to pull for a GPU of `vram` bytes: the largest this build runs that fits in 70% of it.
 pub fn recommend(vram: u64) -> Option<&'static Model> {
-    CATALOG.iter().rev().find(|m| m.later.is_none() && m.vram <= vram / 10 * 7)
+    CATALOG.iter().rev().find(|m| m.task == "run" && m.later.is_none() && m.vram <= vram / 10 * 7)
 }
 
-/// The checkpoint files conversion reads.
+/// The checkpoint files conversion reads: at the top, the configurations, the tokenizer and the weights; a Laya
+/// repository's encoder configuration and tokenizer in their folders.
 fn wanted(f: &Entry) -> bool {
     let p = f.path.as_str();
-    ["config.json", "tokenizer.json"].contains(&p) || p.ends_with(".safetensors") || p.ends_with(".safetensors.index.json")
+    let known = ["config.json", "tokenizer.json", "rl_agent_config.json", "encoder/config.json", "tokenizer/tokenizer.json"];
+    known.contains(&p) || !p.contains('/') && (p.ends_with(".safetensors") || p.ends_with(".safetensors.index.json"))
 }
 
 /// Downloads model `name`'s checkpoint, converts it into the models directory, and removes the download unless
@@ -96,7 +138,7 @@ pub fn pull(name: &str, keep: bool) -> io::Result<()> {
     }
     let seconds = start.elapsed().as_secs_f64();
     eprintln!("downloaded in {seconds:.1} s ({:.0} MB/s); converting", total as f64 / seconds / 1e6);
-    tachyon::model::convert(&dir, &home().join(name)).map_err(|e| io::Error::other(e.to_string()))?;
+    crate::encoders::convert(&dir, &home().join(name)).map_err(|e| io::Error::other(e.to_string()))?;
     if !keep {
         std::fs::remove_dir_all(&dir)?;
     }

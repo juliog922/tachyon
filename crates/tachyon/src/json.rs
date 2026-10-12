@@ -2,6 +2,7 @@
 //! documents into a tree: these files are read once, when a model is converted.
 
 use crate::{Error, Result};
+use std::fmt::Write as _;
 
 /// A JSON value. Objects keep their keys in document order.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,21 @@ impl Json {
     /// The members, if this is an object.
     pub fn obj(&self) -> Option<&[(String, Json)]> {
         if let Json::Obj(o) = self { Some(o) } else { None }
+    }
+
+    /// The value as Python's `json.dumps(value, ensure_ascii=False)` writes it: `", "` between members, `": "`
+    /// before a value, text unescaped but for quotes, backslashes and control characters. This is how Laya turns a
+    /// structured state into text. Numbers are written as they read: a whole `1.0` comes out as `1`.
+    pub fn dumps(&self) -> String {
+        let list = |items: Vec<String>| items.join(", ");
+        match self {
+            Json::Null => "null".into(),
+            Json::Bool(b) => b.to_string(),
+            Json::Num(n) => format!("{n}"),
+            Json::Str(s) => quoted(s),
+            Json::Arr(a) => format!("[{}]", list(a.iter().map(Json::dumps).collect())),
+            Json::Obj(o) => format!("{{{}}}", list(o.iter().map(|(k, v)| format!("{}: {}", quoted(k), v.dumps())).collect())),
+        }
     }
 }
 
@@ -188,6 +204,25 @@ impl Parser<'_> {
         let code = if (0xD800..0xDC00).contains(&hi) && self.eat(b"\\u") { 0x10000 + ((hi - 0xD800) << 10) + (hex(self)? - 0xDC00) } else { hi };
         Ok(char::from_u32(code).unwrap_or('\u{FFFD}'))
     }
+}
+
+/// `s` as a JSON string: quotes, backslashes and control characters escaped.
+fn quoted(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => _ = write!(out, "\\u{:04x}", c as u32),
+            c => out.push(c),
+        }
+    }
+    out + "\""
 }
 
 #[cfg(test)]

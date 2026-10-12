@@ -30,6 +30,21 @@ cargo run --release -p tachyon-cli -- list
 cargo run --release -p tachyon-cli -- run gemma-4-e4b "Why is the sky blue?"
 ```
 
+Laya answers typed questions about a text in one pass, and Granite embeds texts:
+
+```sh
+cargo run --release -p tachyon-cli -- pull laya-multilingual
+cat > request.json <<'JSON'
+{"state": "I was charged twice this month, please refund the second payment.",
+ "questions": {"intent": {"type": "choice", "instructions": "What is the customer's main issue?",
+                          "criteria": {"billing": "charges, invoices, refunds", "technical": "bugs", "other": ""}},
+               "refund": {"type": "noul", "instructions": "The customer asks for a refund."}}}
+JSON
+cargo run --release -p tachyon-cli -- decide laya-multilingual request.json
+cargo run --release -p tachyon-cli -- pull granite-embedding-311m
+cargo run --release -p tachyon-cli -- embed granite-embedding-311m --dims=256 "how do I get a refund"
+```
+
 `pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 32 MiB ranges, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
 
 In your program, `tachyon::engine` is the API (see its documentation):

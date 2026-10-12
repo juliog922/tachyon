@@ -228,8 +228,8 @@ fn halves(v: &[f32]) -> (Vec<u16>, Vec<f32>) {
     (bits, back)
 }
 
-/// The `f16` product in its four modes (store, add, `f16`, `f16` after ReLU), with a bias, for 70 tokens: the second
-/// tile of tokens ends past them, and nothing is stored there.
+/// The `f16` product in its four modes (store, add, `f16`, `f16` after ReLU), with a bias, for 70 tokens, in blocks
+/// of 64 and 128 tokens: the last block of tokens ends past them, and nothing is stored there.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_f16_product_matches_the_cpu_in_every_mode() {
@@ -243,13 +243,14 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
         .map(|(t, r)| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r])
         .collect();
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
-    for mode in 0..4u32 {
+    let kernels = [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)];
+    for (mode, (kernel, blocks, threads)) in (0..4u32).flat_map(|m| kernels.map(|k| (m, k))) {
         let y = gpu.upload(&base);
         // The values live until the launch: `arg` takes their addresses.
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds two tiles of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(tachyon::ptx::GEMM_F16).unwrap(), [2, 2, 1], [128, 1, 1], 0, &args) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [2 * blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let got: Vec<f32> = if mode < 2 { gpu.floats(&y) } else { gpu.halves(&y).iter().map(|&h| tachyon::quant::f16_value(h)).collect() };
         for (i, &v) in want.iter().enumerate() {
             let expect = match mode {
@@ -258,10 +259,36 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
                 _ => v.max(0.0),
             };
             let slack = if mode < 2 { 1e-3 } else { 1e-3 + 2e-3 * expect.abs() };
-            assert!((got[i] - expect).abs() <= slack, "mode {mode}, token {}, row {}: {} against {expect}", i / rows, i % rows, got[i]);
+            assert!((got[i] - expect).abs() <= slack, "{kernel} mode {mode}, token {}, row {}: {} against {expect}", i / rows, i % rows, got[i]);
         }
         let past: Vec<f32> = if mode < 2 { gpu.floats(&y)[tokens * rows..].to_vec() } else { Vec::new() };
-        assert!(past.iter().zip(&base[tokens * rows..]).all(|(a, b)| a.to_bits() == b.to_bits()), "mode {mode}: rows past the tokens were written");
+        assert!(past.iter().zip(&base[tokens * rows..]).all(|(a, b)| a.to_bits() == b.to_bits()), "{kernel} mode {mode}: rows past the tokens were written");
+    }
+}
+
+/// The `f16` product with the gated GELU over interleaved rows (mode 4: `gelu(y[2j])·y[2j+1]`, `f16`, half as wide),
+/// in blocks of 64 and 128 tokens.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_f16_product_gates() {
+    use tachyon::cuda::arg;
+    let gpu = common::Gpu::new();
+    let (rows, cols, tokens) = (128, 256, 70);
+    let ((a16, a), (w16, w)) = (halves(&common::values(128 * cols, 5)), halves(&common::values(rows * cols, 6)));
+    let bias = common::values(rows, 7);
+    let dot = |t: usize, r: usize| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r];
+    let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
+    for (kernel, blocks, threads) in [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)] {
+        let y = gpu.upload(&vec![0f32; tokens * rows]);
+        let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, 4]);
+        let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
+        // SAFETY: the kernel's arguments in order; `a` holds whole blocks of tokens, `y` room for all of them.
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [2 * blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
+        let gated = gpu.halves(&y);
+        for (t, r) in (0..tokens).flat_map(|t| (0..rows / 2).map(move |r| (t, 2 * r))) {
+            let (got, want) = (tachyon::quant::f16_value(gated[t * rows / 2 + r / 2]), gelu(dot(t, r)) * dot(t, r + 1));
+            assert!((got - want).abs() <= 1e-3 + 2e-3 * want.abs(), "{kernel}, token {t}, row {r}: {got} against {want}");
+        }
     }
 }
 
@@ -376,4 +403,25 @@ fn granite_on_the_gpu_matches_the_reference() {
     let (text, low) = cosines.iter().copied().enumerate().fold((0, 1.0), |a, (i, c)| if c < a.1 { (i, c) } else { a });
     println!("Granite on the GPU: lowest cosine {low:.6}, text {text}");
     assert!(low >= 0.9999, "lowest cosine {low:.6}, text {text}");
+}
+
+/// Text in, vectors out: `Engine::embed` on the 54 texts against the float32 references (cosine ≥ 0.9999), and cut to
+/// 256 values, still of unit length.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn the_engine_embeds_text() {
+    use tachyon::engine::{Engine, Limits, Load};
+    let mut engine = Engine::new(0, Limits::default()).unwrap();
+    engine.load("granite", &converted("granite-embedding-311m-multilingual-r2"), &Load::default()).unwrap();
+    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join("granite-311m.ref")).unwrap();
+    let cases: Vec<Json> = lines.lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect();
+    let texts: Vec<&str> = cases.iter().map(|c| c.get("text").and_then(Json::str).unwrap()).collect();
+    for (i, (e, c)) in engine.embed("granite", &texts, None).unwrap().iter().zip(&cases).enumerate() {
+        let cosine: f64 = e.iter().zip(numbers(c.get("embedding"))).map(|(a, b)| f64::from(*a) * b).sum();
+        assert!(cosine >= 0.9999, "text {i}: cosine {cosine}");
+    }
+    for e in engine.embed("granite", &texts, Some(256)).unwrap() {
+        let len: f32 = e.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(e.len() == 256 && (len - 1.0).abs() < 1e-5, "{} values of length {len}", e.len());
+    }
 }

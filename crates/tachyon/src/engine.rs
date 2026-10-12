@@ -30,6 +30,8 @@
 //! ```
 
 use crate::cuda::Context;
+use crate::encoder::laya::Question;
+use crate::encoder::{self, Encoder};
 use crate::model::{Decoder, Parked, Settings, footprint};
 use crate::ptx::Sampling;
 use crate::token::{Chat, Detokenizer, Message, Tokenizer};
@@ -41,6 +43,8 @@ use std::time::{Duration, Instant};
 pub struct Engine {
     ctx: Context,
     models: Vec<Model>,
+    /// Encoders, by name: Laya's decisions and Granite's embeddings, always in VRAM.
+    encoders: Vec<(String, Encoder)>,
     /// The VRAM and host-tier limits, in bytes.
     limits: [usize; 2],
     prompt: Vec<u32>,
@@ -152,14 +156,19 @@ impl Engine {
         let ctx = Context::new(gpu)?;
         let vram = limits.vram.unwrap_or(ctx.memory()?.1 / 10 * 7);
         let host = limits.host.unwrap_or_else(|| ram() / 2);
-        Ok(Engine { ctx, models: Vec::new(), limits: [vram, host], prompt: Vec::new() })
+        Ok(Engine { ctx, models: Vec::new(), encoders: Vec::new(), limits: [vram, host], prompt: Vec::new() })
     }
 
     /// Loads the model directory `dir` (see [`crate::model::convert`]) into VRAM as `name`, kept as `load` says,
-    /// making room as needed; a model of that name is unloaded first.
+    /// making room as needed; a model of that name is unloaded first. An encoder's directory (see
+    /// [`crate::encoder::convert`]) loads for [`Engine::decide`] or [`Engine::embed`] and stays in VRAM until
+    /// unloaded; `load` does not apply to it.
     pub fn load(&mut self, name: &str, dir: &Path, load: &Load) -> Result<()> {
         self.unload(name);
         self.expire()?;
+        if encoder::Config::from_json(&std::fs::read(dir.join("config.json"))?).is_ok() {
+            return self.load_encoder(name, dir);
+        }
         let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok"))?)?;
         let chat = Chat::gemma4(&tok)?;
         let ends = [chat.end_of_turn(), tok.special("<eos>").unwrap_or(chat.end_of_turn())];
@@ -175,17 +184,47 @@ impl Engine {
         loaded
     }
 
+    /// Loads the encoder in `dir` as `name`, moving decoders out to make room.
+    fn load_encoder(&mut self, name: &str, dir: &Path) -> Result<()> {
+        self.room(encoder::footprint(dir, encoder::Settings::default())?, None)?;
+        let enc = Encoder::open(&self.ctx, dir, &encoder::Settings::default())?;
+        self.encoders.push((name.into(), enc));
+        Ok(())
+    }
+
     /// Unloads model `name`, freeing its memory wherever it is; whether it was loaded.
     pub fn unload(&mut self, name: &str) -> bool {
-        let before = self.models.len();
+        let before = self.models.len() + self.encoders.len();
         self.models.retain(|m| m.name != name);
+        self.encoders.retain(|e| e.0 != name);
         // The VRAM goes back to the system, not only to this engine's pool.
         let _ = self.ctx.trim();
-        self.models.len() < before
+        self.models.len() + self.encoders.len() < before
+    }
+
+    /// Encoder `name`.
+    fn encoder(&mut self, name: &str) -> Result<&mut Encoder> {
+        self.encoders.iter_mut().find(|e| e.0 == name).map(|e| &mut e.1).ok_or_else(|| Error::NoModel(name.into()))
+    }
+
+    /// Laya model `name`'s answers to `questions` about `state`: each option's probability (see
+    /// [`Encoder::decide`]).
+    pub fn decide(&mut self, name: &str, state: &str, conversation: bool, questions: &[Question]) -> Result<Vec<Vec<f32>>> {
+        self.expire()?;
+        self.encoder(name)?.decide(state, conversation, questions)
+    }
+
+    /// Embedding model `name`'s vectors of `texts`, cut to `dims` values if asked (see [`Encoder::embed`]).
+    pub fn embed(&mut self, name: &str, texts: &[&str], dims: Option<usize>) -> Result<Vec<Vec<f32>>> {
+        self.expire()?;
+        self.encoder(name)?.embed(texts, dims)
     }
 
     /// Where model `name` is, if it is loaded.
     pub fn tier(&self, name: &str) -> Option<Tier> {
+        if self.encoders.iter().any(|e| e.0 == name) {
+            return Some(Tier::Vram);
+        }
         let m = self.models.iter().find(|m| m.name == name)?;
         Some(match m.at {
             Place::Vram(_) => Tier::Vram,
@@ -240,15 +279,22 @@ impl Engine {
 
     /// Brings model `i` into VRAM, moving out the least recently used models that may go until it fits.
     fn resident(&mut self, i: usize) -> Result<()> {
-        let need = self.models[i].need;
-        while !matches!(self.models[i].at, Place::Vram(_)) && self.used() + need > self.limits[0] {
-            let may_go = |(j, m): &(usize, &Model)| *j != i && !m.load.pin && matches!(m.at, Place::Vram(_));
+        if !matches!(self.models[i].at, Place::Vram(_)) {
+            self.room(self.models[i].need, Some(i))?;
+        }
+        self.bring(i)
+    }
+
+    /// Makes room for `need` bytes of VRAM, moving out the least recently used models that may go, never `keep`.
+    fn room(&mut self, need: usize, keep: Option<usize>) -> Result<()> {
+        while self.used() + need > self.limits[0] {
+            let may_go = |(j, m): &(usize, &Model)| Some(*j) != keep && !m.load.pin && matches!(m.at, Place::Vram(_));
             match self.models.iter().enumerate().filter(may_go).min_by_key(|(_, m)| m.used) {
                 Some((j, _)) => self.evict(j)?,
                 None => return Err(Error::OutOfMemory { need, free: self.limits[0].saturating_sub(self.used()) }),
             }
         }
-        self.bring(i)
+        Ok(())
     }
 
     /// Brings model `i` into VRAM from wherever it is.
@@ -283,9 +329,10 @@ impl Engine {
         Ok(())
     }
 
-    /// VRAM the resident models take.
+    /// VRAM the resident models take, encoders included.
     fn used(&self) -> usize {
-        self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum()
+        let encoders: usize = self.encoders.iter().map(|e| e.1.bytes()).sum();
+        encoders + self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum::<usize>()
     }
 
     /// Pinned host memory of the host tier: parked models, and the copies resumed models keep.

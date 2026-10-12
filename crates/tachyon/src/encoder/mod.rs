@@ -8,9 +8,10 @@
 mod convert;
 pub mod laya;
 mod run;
+mod text;
 
 pub use convert::convert;
-pub use run::Encoder;
+pub use run::{Encoder, footprint};
 
 use crate::json::Json;
 use crate::{Error, Result};

@@ -34,6 +34,16 @@ pub const GEMM_ROWS: u32 = 64;
 /// Name of the kernel that runs `iters` rounds of 8 independent integer `mma` per warp and writes one word per
 /// thread to `out`. Arguments: `out: *mut u32`, `iters: u32`. Each `mma` is 8,192 operations.
 pub const MMA_PEAK: &str = "mma_peak";
+/// [`MMA_PEAK`] for `f16` (`m16n8k16`, 4,096 operations each) with `f32` sums, as the encoder's product runs.
+pub const MMA_PEAK_F16: &str = "mma_peak_f16";
+/// [`MMA_PEAK`] for `f16` with `f16` sums: on consumer Ampere twice the rate of `f32` sums.
+pub const MMA_PEAK_F16H: &str = "mma_peak_f16h";
+/// Each peak kernel: its name, its `mma` and the accumulator registers of one.
+pub(super) const PEAKS: [(&str, &str, usize); 3] = [
+    (MMA_PEAK, "m16n8k32.row.col.s32.s8.u8.s32", 4),
+    (MMA_PEAK_F16, "m16n8k16.row.col.f32.f16.f16.f32", 4),
+    (MMA_PEAK_F16H, "m16n8k16.row.col.f16.f16.f16.f16", 2),
+];
 
 /// Where each part of a shared-memory stage starts: 128 tokens × 64 Q8 bytes, their 128 `[s, z]`, 64 weight rows
 /// × 32 bytes, and the rows' scales (the 4 bytes holding the group's f16 and its neighbour's).
@@ -214,32 +224,24 @@ pub(super) fn gemm_q4() -> String {
     s + "    ret;\n}\n"
 }
 
-/// [`MMA_PEAK`]: 8 independent accumulator chains per warp, so the tensor cores never wait on a result.
-pub(super) fn mma_peak() -> String {
-    let mut s = String::from(
-        ".visible .entry mma_peak(.param .u64 pout, .param .u32 piters)
-{
+/// A peak kernel of [`PEAKS`]: 8 independent accumulator chains per warp, so the tensor cores never wait on a result.
+pub(super) fn mma_peak((name, mma, acc): (&str, &str, usize)) -> String {
+    let mut s = format!(
+        ".visible .entry {name}(.param .u64 pout, .param .u32 piters)
+{{
     .reg .pred %p;
     .reg .b32 %r<4>, %x<4>, %y<2>, %k<32>;
     .reg .b64 %rd<2>;
     mov.u32 %r0, %tid.x;
     add.u32 %x0, %r0, 1;\n    add.u32 %x1, %r0, 2;\n    add.u32 %x2, %r0, 3;\n    add.u32 %x3, %r0, 4;\n    mov.u32 %y0, %r0;\n    mov.u32 %y1, %r0;
-    ld.param.u32 %r1, [piters];\n",
+    ld.param.u32 %r1, [piters];\n"
     );
     (0..32).for_each(|k| _ = writeln!(s, "    mov.u32 %k{k}, 0;"));
     s += "LOOP:\n";
     for c in 0..8 {
-        let k = 4 * c;
-        let _ = writeln!(
-            s,
-            "    mma.sync.aligned.m16n8k32.row.col.s32.s8.u8.s32 {{%k{k}, %k{}, %k{}, %k{}}}, {{%x0, %x1, %x2, %x3}}, {{%y0, %y1}}, {{%k{k}, %k{}, %k{}, %k{}}};",
-            k + 1,
-            k + 2,
-            k + 3,
-            k + 1,
-            k + 2,
-            k + 3
-        );
+        let k: Vec<String> = (acc * c..acc * (c + 1)).map(|k| format!("%k{k}")).collect();
+        let k = k.join(", ");
+        let _ = writeln!(s, "    mma.sync.aligned.{mma} {{{k}}}, {{%x0, %x1, %x2, %x3}}, {{%y0, %y1}}, {{{k}}};");
     }
     s += "    sub.u32 %r1, %r1, 1;\n    setp.ne.u32 %p, %r1, 0;\n    @%p bra LOOP;\n";
     (1..32).for_each(|k| _ = writeln!(s, "    xor.b32 %k0, %k0, %k{k};"));

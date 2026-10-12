@@ -2,43 +2,11 @@
 //! `laya-multilingual.ref`), built with mmBERT's tokenizer from `$TACHYON_MODELS/laya-multilingual/tokenizer/`.
 #![cfg(feature = "models")]
 
-use std::fmt::Write as _;
 use tachyon::encoder::laya::{Budget, Builder, Frame, Kind, Question, probabilities};
 use tachyon::json::Json;
 use tachyon::token::Tokenizer;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/laya-multilingual.ref");
-
-/// `s` as a JSON string with `ensure_ascii=False`: quotes, backslashes and control characters escaped.
-fn quoted(s: &str) -> String {
-    let mut out = String::from('"');
-    for c in s.chars() {
-        match c {
-            '"' | '\\' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => _ = write!(out, "\\u{:04x}", c as u32),
-            c => out.push(c),
-        }
-    }
-    out + "\""
-}
-
-/// `value` as Python's `json.dumps(value, ensure_ascii=False)` writes it, which is how Laya turns a state into text.
-fn dumps(value: &Json) -> String {
-    match value {
-        Json::Str(s) => quoted(s),
-        Json::Num(n) => format!("{n}"),
-        Json::Bool(b) => b.to_string(),
-        Json::Null => "null".into(),
-        Json::Arr(a) => format!("[{}]", a.iter().map(dumps).collect::<Vec<_>>().join(", ")),
-        Json::Obj(o) => format!("{{{}}}", o.iter().map(|(k, v)| format!("{}: {}", quoted(k), dumps(v))).collect::<Vec<_>>().join(", ")),
-    }
-}
 
 fn numbers(v: &Json) -> Vec<f64> {
     v.arr().unwrap().iter().map(|x| x.num().unwrap()).collect()
@@ -66,7 +34,7 @@ fn sequences_match_the_laya_package() {
     for (i, line) in cases.lines().enumerate() {
         let case = Json::parse(line.as_bytes()).unwrap();
         let (state, q) = (case.get("state").unwrap(), case.get("question").unwrap());
-        let text = state.str().map_or_else(|| dumps(state), str::to_string);
+        let text = state.str().map_or_else(|| state.dumps(), str::to_string);
         let kind = [("choice", Kind::Choice), ("score", Kind::Score), ("noul", Kind::Noul)]
             .into_iter()
             .find(|k| Some(k.0) == q.get("type").and_then(Json::str))
@@ -83,6 +51,45 @@ fn sequences_match_the_laya_package() {
         let logits: Vec<f32> = numbers(case.get("logits").unwrap()).iter().map(|&v| v as f32).collect();
         for (p, want) in probabilities(&logits, 1.0).iter().zip(numbers(case.get("probs").unwrap())) {
             assert!((f64::from(*p) - want).abs() < 1e-6, "case {i}: probability {p} against {want}");
+        }
+    }
+}
+
+/// The checkpoint `$TACHYON_MODELS/name`, converted once into the test's temporary directory.
+#[cfg(feature = "gpu")]
+fn converted(name: &str) -> std::path::PathBuf {
+    let dst = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    if !dst.join("host.wpk").exists() {
+        let models = std::env::var("TACHYON_MODELS").expect("TACHYON_MODELS: the models' repositories");
+        tachyon::encoder::convert(&std::path::Path::new(&models).join(name), &dst).unwrap();
+    }
+    dst
+}
+
+/// Text in, answers out: `Engine::decide` on the states and questions of the first 50 cases, as the `laya` package
+/// takes them, against its float32 probabilities (within 1e-2, the GPU's `f16`).
+#[cfg(feature = "gpu")]
+#[test]
+fn the_engine_decides_from_text() {
+    use tachyon::engine::{Engine, Limits, Load};
+    let mut engine = Engine::new(0, Limits::default()).unwrap();
+    engine.load("laya", &converted("laya-multilingual"), &Load::default()).unwrap();
+    let cases = std::fs::read_to_string(FIXTURE).unwrap();
+    for (i, line) in cases.lines().take(50).enumerate() {
+        let case = Json::parse(line.as_bytes()).unwrap();
+        let (state, q) = (case.get("state").unwrap(), case.get("question").unwrap());
+        let text = state.str().map_or_else(|| state.dumps(), str::to_string);
+        let kind = [("choice", Kind::Choice), ("score", Kind::Score), ("noul", Kind::Noul)]
+            .into_iter()
+            .find(|k| Some(k.0) == q.get("type").and_then(Json::str))
+            .unwrap()
+            .1;
+        let owned = options(q);
+        let pairs: Vec<(&str, &str)> = owned.iter().map(|(l, d)| (l.as_str(), d.as_str())).collect();
+        let question = Question { kind, instructions: q.get("instructions").and_then(Json::str).unwrap(), options: &pairs };
+        let p = engine.decide("laya", &text, matches!(state, Json::Arr(_)), &[question]).unwrap().remove(0);
+        for (got, want) in p.iter().zip(numbers(case.get("probs").unwrap())) {
+            assert!((f64::from(*got) - want).abs() < 1e-2, "case {i}: {p:?} against {want}");
         }
     }
 }

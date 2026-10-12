@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use tachyon::cuda::{self, DeviceInfo};
 use tachyon::engine::{Engine, Limits, Load, Request};
 use tachyon::token::{Message, Role};
-use tachyon_cli::models;
+use tachyon_cli::{encoders, models};
 
 const HELP: &str = "tachyon: embedded inference on NVIDIA GPUs
 
@@ -20,9 +20,11 @@ Commands:
   list                         List the pulled models
   rm <name>                    Remove a pulled model
   run <model> <prompt>         Answer one prompt, greedily, and report the speed (a name or a directory)
+  decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions)
+  embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
   gpu                          List the GPUs the driver sees
   doctor                       Check the driver, GPUs, CPU, memory, certificates and the connection to Hugging Face
-  convert <checkpoint> <model> Convert a Hugging Face Gemma 4 checkpoint directory to a model directory
+  convert <checkpoint> <model> Convert a Hugging Face checkpoint directory (Gemma 4, Laya, Granite) to a model
   version                      Print the version
   help                         Print this help
 ";
@@ -57,7 +59,9 @@ fn models_command(words: &[&str], keep: bool) -> Option<ExitCode> {
 fn command(words: &[&str], json: bool) -> ExitCode {
     match words {
         ["gpu"] => gpu(json),
-        ["convert", from, to] => done(tachyon::model::convert(from.as_ref(), to.as_ref())),
+        ["convert", from, to] => done(encoders::convert(from.as_ref(), to.as_ref())),
+        ["decide", model, request] => printed(encoders::decide(&model_dir(model), request.as_ref())),
+        ["embed", model, rest @ ..] if !rest.is_empty() => embed(model, rest),
         ["run", model, prompt] => done(run(&model_dir(model), prompt)),
         ["version" | "--version" | "-V"] => {
             println!("tachyon {}", env!("CARGO_PKG_VERSION"));
@@ -70,6 +74,31 @@ fn command(words: &[&str], json: bool) -> ExitCode {
         [other, ..] => {
             eprint!("error: unknown command or arguments '{other}'\n\n{HELP}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Embeds the texts of `rest` with `model`; a `--dims=N` among them cuts the vectors to `N` values.
+fn embed(model: &str, rest: &[&str]) -> ExitCode {
+    let dims = rest.iter().find_map(|w| w.strip_prefix("--dims=")).map(str::parse::<usize>);
+    let texts: Vec<&str> = rest.iter().copied().filter(|w| !w.starts_with("--dims=")).collect();
+    let Ok(dims) = dims.transpose() else {
+        eprintln!("error: --dims takes a number of values");
+        return ExitCode::from(2);
+    };
+    printed(encoders::embed(&model_dir(model), &texts, dims))
+}
+
+/// The output printed and success, or the error printed and failure.
+fn printed(r: tachyon::Result<String>) -> ExitCode {
+    match r {
+        Ok(out) => {
+            println!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }

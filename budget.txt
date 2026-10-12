@@ -17,9 +17,10 @@
 900      crates/tachyon/src/model
 450      crates/tachyon/src/engine.rs
 # encoder: step 10, ModernBERT for Laya multilingual and Granite Embedding 311M, with its own kernels (an f16
-# tensor-core product, layer norm, attention over packed sequences): spec step 10 decisions.
-1400     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
-500      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs
+# tensor-core product, layer norm, attention over packed sequences): spec step 10 decisions. Raised to 1700 in
+# step 10c: the kernel timeline, and the work to answer one Laya question in 5 ms on a laptop GPU.
+1700     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
+500      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs crates/tachyon-cli/src/encoders.rs
 # net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
 950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs
 1050     crates/tachyon-cli/src/net/tls.rs crates/tachyon-cli/src/net/x509.rs

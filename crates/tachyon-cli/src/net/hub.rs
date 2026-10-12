@@ -66,9 +66,9 @@ impl Hub {
         Hub { base: base.trim_end_matches('/').into(), config: Arc::new(config), connections }
     }
 
-    /// The files at the top of `repo`'s `main` branch.
+    /// The files of `repo`'s `main` branch, in its folders too.
     pub fn files(&self, repo: &str) -> io::Result<Vec<Entry>> {
-        let body = get(&format!("{}/api/models/{repo}/tree/main", self.base), &[], &self.config)?;
+        let body = get(&format!("{}/api/models/{repo}/tree/main?recursive=true", self.base), &[], &self.config)?;
         let json = Json::parse(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("the Hub's file list: {e}")))?;
         Ok(json.arr().unwrap_or_default().iter().filter(|f| f.get("type").and_then(Json::str) == Some("file")).filter_map(entry).collect())
     }
@@ -398,7 +398,7 @@ mod tests {
                 [format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\r\n", body.len()).into_bytes(), body.to_vec()].concat()
             };
             let out = match (path.as_str(), range) {
-                ("/api/models/r/tree/main", _) => reply("200 OK", "", tree.as_bytes()),
+                ("/api/models/r/tree/main?recursive=true", _) => reply("200 OK", "", tree.as_bytes()),
                 ("/r/resolve/main/config.json", _) => reply("200 OK", "", b"{}"),
                 ("/r/resolve/main/model.bin", _) => reply("302 Found", &format!("Location: http://127.0.0.1:{port}/cdn\r\n"), b""),
                 ("/cdn", Some((a, b))) => {

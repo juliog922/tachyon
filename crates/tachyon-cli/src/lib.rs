@@ -4,5 +4,6 @@
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 compile_error!("tachyon targets x86_64 Linux only");
 
+pub mod encoders;
 pub mod models;
 pub mod net;
