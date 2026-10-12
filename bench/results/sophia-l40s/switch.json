@@ -1,0 +1,143 @@
+[
+    {
+        "name": "time to first token, E4B after E4B",
+        "median_ns": 12090071,
+        "p99_ns": 12114613,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "time to first token, E4B after E2B",
+        "median_ns": 12092314,
+        "p99_ns": 12167030,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "E4B back from the host tier",
+        "median_ns": 100896567,
+        "p99_ns": 100898693,
+        "rate": 24.482,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "pinned alloc, 1 GiB",
+        "median_ns": 333254140,
+        "p99_ns": 333985969,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "pinned free, 1 GiB",
+        "median_ns": 66081699,
+        "p99_ns": 66201761,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "VRAM, alloc 1 GiB",
+        "median_ns": 1883970,
+        "p99_ns": 2334006,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "VRAM, free 1 GiB",
+        "median_ns": 2342984,
+        "p99_ns": 2450840,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "VRAM from the pool, alloc 1 GiB",
+        "median_ns": 644,
+        "p99_ns": 2062,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "VRAM from the pool, free 1 GiB",
+        "median_ns": 355,
+        "p99_ns": 360,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "VRAM given back from the pool, 1 GiB",
+        "median_ns": 39,
+        "p99_ns": 73,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "pinned host → VRAM, 2.5 GiB, VRAM reused",
+        "median_ns": 106752927,
+        "p99_ns": 106753862,
+        "rate": 25.145,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "pinned host → VRAM, 2.5 GiB, VRAM fresh",
+        "median_ns": 106752330,
+        "p99_ns": 106757847,
+        "rate": 25.146,
+        "unit": "GB/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "switch E4B ↔ E2B through the host tier",
+        "median_ns": 58818878,
+        "p99_ns": 114360567,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "switch E4B ↔ E2B from disk",
+        "median_ns": 964041744,
+        "p99_ns": 1445129994,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "unload E4B",
+        "median_ns": 103887498,
+        "p99_ns": 108802265,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]

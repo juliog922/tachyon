@@ -1,0 +1,211 @@
+[
+    {
+        "name": "decide, 1 question(s)",
+        "median_ns": 1828022,
+        "p99_ns": 1857235,
+        "rate": 547.039,
+        "unit": "questions/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "decide, 5 question(s)",
+        "median_ns": 4394781,
+        "p99_ns": 4415644,
+        "rate": 1137.713,
+        "unit": "questions/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "decide, 10 question(s)",
+        "median_ns": 7594387,
+        "p99_ns": 7623691,
+        "rate": 1316.762,
+        "unit": "questions/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "embed, 1 text(s)",
+        "median_ns": 1217883,
+        "p99_ns": 1223805,
+        "rate": 821.097,
+        "unit": "embeddings/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "embed, 64 text(s)",
+        "median_ns": 6356162,
+        "p99_ns": 6399929,
+        "rate": 10068.969,
+        "unit": "embeddings/s",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "f16 mma peak, f32 sums",
+        "median_ns": 1684320,
+        "p99_ns": 1694208,
+        "rate": 362.096,
+        "unit": "TOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "f16 mma peak, f16 sums",
+        "median_ns": 1691200,
+        "p99_ns": 1691904,
+        "rate": 360.623,
+        "unit": "TOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×768→2304 /64",
+        "median_ns": 16896,
+        "p99_ns": 17600,
+        "rate": 46.708,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×768→2304 /128",
+        "median_ns": 14464,
+        "p99_ns": 14624,
+        "rate": 54.562,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×768→768 /64",
+        "median_ns": 9632,
+        "p99_ns": 10336,
+        "rate": 27.311,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×768→768 /128",
+        "median_ns": 13248,
+        "p99_ns": 13664,
+        "rate": 19.857,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×1152→768 /64",
+        "median_ns": 12128,
+        "p99_ns": 12416,
+        "rate": 32.536,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 223×1152→768 /128",
+        "median_ns": 17344,
+        "p99_ns": 17888,
+        "rate": 22.751,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×768→2304 /64",
+        "median_ns": 90560,
+        "p99_ns": 91232,
+        "rate": 83.628,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×768→2304 /128",
+        "median_ns": 77184,
+        "p99_ns": 78048,
+        "rate": 98.121,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×768→768 /64",
+        "median_ns": 35136,
+        "p99_ns": 36000,
+        "rate": 71.848,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×768→768 /128",
+        "median_ns": 27392,
+        "p99_ns": 27872,
+        "rate": 92.160,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×1152→768 /64",
+        "median_ns": 50048,
+        "p99_ns": 50688,
+        "rate": 75.661,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "gemm 2140×1152→768 /128",
+        "median_ns": 37600,
+        "p99_ns": 38208,
+        "rate": 100.709,
+        "unit": "TFLOPS",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]
