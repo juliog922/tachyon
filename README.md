@@ -66,6 +66,8 @@ crates/tachyon/          the library
   tests/                 tests; GPU ones behind feature `gpu`, model-file ones behind `models`
   tests/fixtures/        tokenizer fixtures: 10,000 strings and the reference token IDs
   benches/               machine ceilings and the bench harness
+  src/encoder/mod.rs     ModernBERT encoders (Laya multilingual, Granite Embedding 311M): configuration
+  src/encoder/laya.rs    Laya's question sequences, head settings and probabilities
 crates/tachyon-cli/      the `tachyon` command
   src/models.rs          the catalog and pull, list, rm, doctor
   src/net/               downloads with std only: SHA-256 (SHA-NI), HMAC/HKDF, AES-128-GCM (AES-NI), X25519,

@@ -25,13 +25,17 @@ const MAGIC: &[u8; 8] = b"TACHYTOK";
 const META: u32 = 1;
 /// Flag: characters outside the vocabulary become `<0xHH>` byte tokens.
 const BYTES: u32 = 2;
+/// Flag: the text is cut before every space, so no merge crosses one (a Metaspace pre-tokenizer that splits).
+const SPLIT: u32 = 4;
+/// Flag: a text that does not start with a space gets one (Metaspace's `prepend_scheme`).
+const PREPEND: u32 = 8;
 /// Characters with a direct entry in [`Tokenizer::chars`]: the first two Unicode planes.
 const DIRECT: usize = 0x20000;
 
 /// A BPE vocabulary with its merges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tokenizer {
-    /// [`META`], [`BYTES`].
+    /// [`META`], [`BYTES`], [`SPLIT`], [`PREPEND`].
     flags: u32,
     /// The unknown token, or [`NONE`].
     unk: u32,
@@ -49,6 +53,9 @@ pub struct Tokenizer {
     rare: Vec<u32>,
     /// Characters some token joins to a following `▁`, such as `>` in `>▁</`: no cut after them.
     joins: Vec<u32>,
+    /// Added tokens that are not special, such as Granite's `<body>`, by first byte then longest first: found in the
+    /// text before anything merges, as Hugging Face does.
+    added: Vec<u32>,
     /// Open addressing table of `(left, right, rank, merged)`.
     merges: Vec<u32>,
 }
@@ -73,26 +80,24 @@ fn find(table: &[u32], a: u32, b: u32) -> (usize, &[u32]) {
 
 impl Tokenizer {
     /// Reads a Hugging Face `tokenizer.json` of the kind Gemma ships: BPE, optionally with byte fallback, no
-    /// pre-tokenizer, and either no normalizer or one that replaces spaces with `▁`.
+    /// pre-tokenizer, and either no normalizer or one that replaces spaces with `▁`; or of mmBERT's kind, whose
+    /// Metaspace pre-tokenizer splits the text at every space and prepends one.
     pub fn from_json(json: &[u8]) -> Result<Tokenizer> {
         let doc = Json::parse(json)?;
         let model = doc.get("model").filter(|m| m.get("type").and_then(Json::str) == Some("BPE")).ok_or_else(|| unsupported("a model other than BPE"))?;
         let meta = spaces_to_meta(doc.get("normalizer"))?;
-        // Gemma splits on spaces after its normalizer has turned them all into `▁`: it never splits.
-        let split = doc.get("pre_tokenizer").and_then(|p| p.get("pattern")).and_then(|p| p.get("String")).and_then(Json::str) == Some(" ");
-        if doc.get("pre_tokenizer").is_some_and(|p| *p != Json::Null) && !(meta && split) {
-            return Err(unsupported("this pre-tokenizer"));
-        }
+        let pre = pre_tokenizer(doc.get("pre_tokenizer"), meta)?;
         let fallback = model.get("byte_fallback").and_then(Json::bool) == Some(true);
         let mut vocab: Vec<(&str, u32)> =
             model.get("vocab").and_then(Json::obj).unwrap_or_default().iter().map(|(k, v)| (k.as_str(), v.num().unwrap_or(-1.0) as u32)).collect();
-        let special = added(doc.get("added_tokens"), &mut vocab);
+        let (special, plain) = added(doc.get("added_tokens"), &mut vocab);
         let merges: Vec<(&str, &str)> = model.get("merges").and_then(Json::arr).unwrap_or_default().iter().filter_map(pair).collect();
         let unk = model.get("unk_token").and_then(Json::str);
-        Tokenizer::build(&vocab, &merges, special, unk, (u32::from(meta) * META) | (u32::from(fallback) * BYTES))
+        Tokenizer::build(&vocab, &merges, [special, plain], unk, pre | (u32::from(meta) * META) | (u32::from(fallback) * BYTES))
     }
 
-    fn build(vocab: &[(&str, u32)], merges: &[(&str, &str)], mut special: Vec<u32>, unk: Option<&str>, flags: u32) -> Result<Tokenizer> {
+    /// The tokenizer of `vocab` and `merges`, whose added tokens are `[special, plain]`.
+    fn build(vocab: &[(&str, u32)], merges: &[(&str, &str)], [mut special, added]: [Vec<u32>; 2], unk: Option<&str>, flags: u32) -> Result<Tokenizer> {
         let n = vocab.iter().map(|&(_, id)| id as usize + 1).max().unwrap_or(0);
         let mut names = vec![""; n];
         for &(s, id) in vocab {
@@ -110,6 +115,7 @@ impl Tokenizer {
             chars: vec![NONE; DIRECT],
             rare: Vec::new(),
             joins: Vec::new(),
+            added: Vec::new(),
             merges: vec![NONE; 4 * (2 * merges.len()).next_power_of_two().max(2)],
         };
         for (id, name) in names.iter().enumerate() {
@@ -120,6 +126,7 @@ impl Tokenizer {
         t.joins = pairs.filter(|&(c, d)| d == '▁' && c != '▁').map(|(c, _)| c as u32).collect();
         t.joins.sort_unstable();
         t.joins.dedup();
+        t.added = matched(&names, added);
         for (rank, &(a, b)) in merges.iter().enumerate() {
             let get = |s: &str| ids.get(s).copied().ok_or_else(|| Error::Format(format!("tokenizer: merge \"{a}\" + \"{b}\" names an unknown token")));
             let key = [get(a)?, get(b)?, rank as u32, get(&format!("{a}{b}"))?];
@@ -188,19 +195,61 @@ impl Tokenizer {
         (e[0] != NONE).then(|| (e[2], e[3]))
     }
 
-    /// Appends the tokens of `text` to `out`. The text is cut before each space that follows a character no token
-    /// joins to a following `▁`, so no merge can cross a cut, and each piece is merged on its own.
+    /// Appends the tokens of `text` to `out`. Non-special added tokens are found first, the longest at each place;
+    /// the text between them is cut before each space that follows a character no token joins to a following `▁`
+    /// (with a splitting Metaspace pre-tokenizer, before every space), so no merge can cross a cut, and each piece is
+    /// merged on its own.
     pub fn encode(&self, text: &str, out: &mut Vec<u32>) {
-        let (mut work, mut start, mut last) = (Work::default(), 0, '▁');
+        let (mut work, mut from, mut i) = (Work::default(), 0, 0);
+        while let Some(c) = text[i..].chars().next() {
+            match self.added_at(&text.as_bytes()[i..]) {
+                Some((id, len)) => {
+                    self.segment(&text[from..i], &mut work, out);
+                    out.push(id);
+                    (i, from) = (i + len, i + len);
+                }
+                None => i += c.len_utf8(),
+            }
+        }
+        self.segment(&text[from..], &mut work, out);
+    }
+
+    /// The longest non-special added token `rest` starts with, and its length in bytes.
+    fn added_at(&self, rest: &[u8]) -> Option<(u32, usize)> {
+        let first = *rest.first()?;
+        let at = self.added.partition_point(|&id| self.bytes(id)[0] < first);
+        let same = self.added[at..].iter().take_while(|&&id| self.bytes(id)[0] == first);
+        same.map(|&id| (id, self.bytes(id))).find(|(_, t)| rest.starts_with(t)).map(|(id, t)| (id, t.len()))
+    }
+
+    /// Appends the tokens of `text`, which holds no added token: `▁` first if the pre-tokenizer prepends one, then
+    /// each piece between cuts merged on its own.
+    fn segment(&self, text: &str, work: &mut Work, out: &mut Vec<u32>) {
+        let prefixed;
+        let text = if self.flags & PREPEND != 0 && !text.is_empty() && !text.starts_with([' ', '▁']) {
+            prefixed = format!("▁{text}");
+            &prefixed
+        } else {
+            text
+        };
+        let (mut start, mut last) = (0, '▁');
         for (i, c) in text.char_indices() {
-            let space = c == ' ' || c == '▁';
-            if space && self.flags & META != 0 && last != ' ' && last != '▁' && !self.joins.contains(&(last as u32)) {
-                self.merge_all(&text[start..i], &mut work, out);
+            if i > start && self.cuts(last, c) {
+                self.merge_all(&text[start..i], work, out);
                 start = i;
             }
             last = c;
         }
-        self.merge_all(&text[start..], &mut work, out);
+        if start < text.len() {
+            self.merge_all(&text[start..], work, out);
+        }
+    }
+
+    /// Whether the text is cut between `last` and `c`: before a space, unless a token joins `last` to it.
+    fn cuts(&self, last: char, c: char) -> bool {
+        let space = c == ' ' || c == '▁';
+        let joined = last == ' ' || last == '▁' || self.joins.contains(&(last as u32));
+        space && self.flags & META != 0 && (self.flags & SPLIT != 0 || !joined)
     }
 
     /// Merges the symbols of `text`, lowest-ranked pair first, and appends the result to `out`.
@@ -276,7 +325,7 @@ impl Tokenizer {
         let mut out = MAGIC.to_vec();
         let text: Vec<u32> = self.text.chunks(4).map(|c| c.iter().rev().fold(0, |w, &b| w << 8 | u32::from(b))).collect();
         let head = [self.flags, self.unk, self.text.len() as u32];
-        for section in [&head[..], &self.offsets, &text, &self.special, &self.bytes, &self.chars, &self.rare, &self.joins, &self.merges] {
+        for section in [&head[..], &self.offsets, &text, &self.special, &self.bytes, &self.chars, &self.rare, &self.joins, &self.added, &self.merges] {
             out.extend((section.len() as u32).to_le_bytes());
             for w in section {
                 out.extend(w.to_le_bytes());
@@ -288,11 +337,11 @@ impl Tokenizer {
     /// A tokenizer stored by [`Tokenizer::to_bytes`].
     pub fn from_bytes(data: &[u8]) -> Result<Tokenizer> {
         let mut words = data.strip_prefix(MAGIC).ok_or_else(damaged)?.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-        let mut s: Vec<Vec<u32>> = (0..9).map(|_| section(&mut words)).collect::<Result<_>>()?;
-        let [head, offsets, text, special, bytes, chars, rare, joins, merges] = std::array::from_fn(|i| std::mem::take(&mut s[i]));
+        let mut s: Vec<Vec<u32>> = (0..10).map(|_| section(&mut words)).collect::<Result<_>>()?;
+        let [head, offsets, text, special, bytes, chars, rare, joins, added, merges] = std::array::from_fn(|i| std::mem::take(&mut s[i]));
         let mut text: Vec<u8> = text.iter().flat_map(|w| w.to_le_bytes()).collect();
         text.truncate(*head.get(2).ok_or_else(damaged)? as usize);
-        let t = Tokenizer { flags: head[0], unk: head[1], offsets, text, special, bytes, chars, rare, joins, merges };
+        let t = Tokenizer { flags: head[0], unk: head[1], offsets, text, special, bytes, chars, rare, joins, added, merges };
         let sound = t.offsets.last() == Some(&(t.text.len() as u32)) && t.bytes.len() == 256 && t.chars.len() == DIRECT;
         if sound && t.merges.len().is_power_of_two() { Ok(t) } else { Err(damaged()) }
     }
@@ -318,17 +367,38 @@ fn spaces_to_meta(normalizer: Option<&Json>) -> Result<bool> {
     }
 }
 
-/// Adds the added tokens to `vocab`; returns the special ones' IDs.
-fn added<'j>(tokens: Option<&'j Json>, vocab: &mut Vec<(&'j str, u32)>) -> Vec<u32> {
-    let mut special = Vec::new();
+/// The added tokens of `added` that can match a text, by first byte then longest first. One with a `▁` never does:
+/// added tokens are found in the raw text, where spaces are still spaces.
+fn matched(names: &[&str], mut added: Vec<u32>) -> Vec<u32> {
+    added.retain(|&id| names.get(id as usize).is_some_and(|n| !n.is_empty() && !n.contains('▁')));
+    added.sort_unstable_by_key(|&id| (names[id as usize].as_bytes()[0], std::cmp::Reverse(names[id as usize].len()), id));
+    added
+}
+
+/// The flags of the pre-tokenizer: none; Gemma's split on spaces, which never splits once the normalizer `meta`
+/// has turned them into `▁`; or a Metaspace with `▁`, which may split and prepend.
+fn pre_tokenizer(pre: Option<&Json>, meta: bool) -> Result<u32> {
+    let Some(pre) = pre.filter(|p| **p != Json::Null) else { return Ok(0) };
+    let field = |k| pre.get(k).and_then(Json::str);
+    match field("type") {
+        Some("Split") if meta && pre.get("pattern").and_then(|p| p.get("String")).and_then(Json::str) == Some(" ") => Ok(0),
+        Some("Metaspace") if field("replacement") == Some("▁") => {
+            let split = u32::from(pre.get("split").and_then(Json::bool) != Some(false)) * SPLIT;
+            Ok(META | split | (u32::from(matches!(field("prepend_scheme"), Some("always" | "first"))) * PREPEND))
+        }
+        _ => Err(unsupported("this pre-tokenizer")),
+    }
+}
+
+/// Adds the added tokens to `vocab`; returns the special ones' IDs and the others'.
+fn added<'j>(tokens: Option<&'j Json>, vocab: &mut Vec<(&'j str, u32)>) -> (Vec<u32>, Vec<u32>) {
+    let (mut special, mut plain) = (Vec::new(), Vec::new());
     for t in tokens.and_then(Json::arr).unwrap_or_default() {
         let (content, id) = (t.get("content").and_then(Json::str).unwrap_or_default(), t.get("id").and_then(Json::num).unwrap_or(-1.0) as u32);
         vocab.push((content, id));
-        if t.get("special").and_then(Json::bool) == Some(true) {
-            special.push(id);
-        }
+        if t.get("special").and_then(Json::bool) == Some(true) { special.push(id) } else { plain.push(id) }
     }
-    special
+    (special, plain)
 }
 
 /// The buffers [`Tokenizer::encode`] reuses from piece to piece.

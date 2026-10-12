@@ -16,6 +16,8 @@
 500      crates/tachyon/src/token
 900      crates/tachyon/src/model
 450      crates/tachyon/src/engine.rs
+# encoder: step 10, ModernBERT for Laya multilingual and Granite Embedding 311M (spec step 10 decisions).
+700      crates/tachyon/src/encoder
 500      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs
 # net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
 950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs

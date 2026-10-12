@@ -1,6 +1,8 @@
 //! The tokenizer against Hugging Face `tokenizers`, on the fixture strings of `scripts/fixture.py`: a small
 //! tokenizer shaped like Gemma's, trained for the test and stored in the repository, and with the `models` feature,
-//! Gemma 4's own, from `$TACHYON_MODELS/gemma-4-E4B-it/tokenizer.json`.
+//! the models' own from `$TACHYON_MODELS`: Gemma 4's (`gemma-4-E4B-it/tokenizer.json`), mmBERT's, which Laya
+//! multilingual uses (`laya-multilingual/tokenizer/tokenizer.json`), and Granite Embedding 311M's
+//! (`granite-embedding-311m-multilingual-r2/tokenizer.json`), as their Hugging Face repositories lay them out.
 
 use tachyon::json::Json;
 #[cfg(feature = "models")]
@@ -20,7 +22,9 @@ fn fnv(ids: &[u32]) -> u64 {
 }
 
 /// Every fixture string encodes to the reference's IDs, and decodes back.
-fn check(tok: &Tokenizer, reference: &str) {
+/// Checks `tok` against `reference`, and that what it encodes decodes back, unless `prepends`: a tokenizer that
+/// prepends `▁` to every piece of text decodes it as a space, in Hugging Face too.
+fn check(tok: &Tokenizer, reference: &str, prepends: bool) {
     let want: Vec<(usize, u64)> = reference
         .lines()
         .map(|l| {
@@ -42,7 +46,7 @@ fn check(tok: &Tokenizer, reference: &str) {
             d.push(tok, id, &mut text);
         }
         d.finish(&mut text);
-        assert_eq!(text, s.replace('▁', " "), "string {i} decodes back");
+        assert!(prepends || text == s.replace('▁', " "), "string {i} decodes back: {text:?}");
     }
     assert!(wrong.is_empty(), "{} of {} strings differ from the reference; first: {}", wrong.len(), strings.len(), wrong[..wrong.len().min(3)].join("\n"));
 }
@@ -50,7 +54,7 @@ fn check(tok: &Tokenizer, reference: &str) {
 #[test]
 fn a_gemma_shaped_tokenizer_matches_the_reference() {
     let tok = Tokenizer::from_json(&std::fs::read(format!("{FIXTURES}/toy.json")).unwrap()).unwrap();
-    check(&tok, &std::fs::read_to_string(format!("{FIXTURES}/toy.ids")).unwrap());
+    check(&tok, &std::fs::read_to_string(format!("{FIXTURES}/toy.ids")).unwrap(), false);
 }
 
 #[test]
@@ -89,7 +93,43 @@ fn gemma() -> Tokenizer {
 #[cfg(feature = "models")]
 #[test]
 fn gemma_4_matches_the_reference() {
-    check(&gemma(), &std::fs::read_to_string(format!("{FIXTURES}/gemma-4.ids")).unwrap());
+    check(&gemma(), &std::fs::read_to_string(format!("{FIXTURES}/gemma-4.ids")).unwrap(), false);
+}
+
+/// The tokenizer in `$TACHYON_MODELS/path`.
+#[cfg(feature = "models")]
+fn model(path: &str) -> Tokenizer {
+    let dir = std::env::var("TACHYON_MODELS").expect("TACHYON_MODELS: the directory holding the models' repositories");
+    Tokenizer::from_json(&std::fs::read(format!("{dir}/{path}")).unwrap()).unwrap()
+}
+
+/// mmBERT's Metaspace pre-tokenizer: every space starts a piece of its own, and a text gets a leading `▁`.
+#[cfg(feature = "models")]
+#[test]
+fn mmbert_matches_the_reference() {
+    check(&model("laya-multilingual/tokenizer/tokenizer.json"), &std::fs::read_to_string(format!("{FIXTURES}/mmbert.ids")).unwrap(), true);
+}
+
+#[cfg(feature = "models")]
+#[test]
+fn granite_embedding_matches_the_reference() {
+    let tok = model("granite-embedding-311m-multilingual-r2/tokenizer.json");
+    check(&tok, &std::fs::read_to_string(format!("{FIXTURES}/granite-311m.ids")).unwrap(), false);
+}
+
+/// Granite Embedding reads `<bos>` and the text, nothing after: the inputs of `scripts/encoders.py`'s references.
+#[cfg(feature = "models")]
+#[test]
+fn granite_embedding_inputs_match_sentence_transformers() {
+    let tok = model("granite-embedding-311m-multilingual-r2/tokenizer.json");
+    let bos = tok.special("<bos>").unwrap();
+    for (i, line) in std::fs::read_to_string(format!("{FIXTURES}/granite-311m.ref")).unwrap().lines().enumerate() {
+        let case = Json::parse(line.as_bytes()).unwrap();
+        let mut ids = vec![bos];
+        tok.encode(case.get("text").and_then(Json::str).unwrap(), &mut ids);
+        let want: Vec<u32> = case.get("ids").and_then(Json::arr).unwrap().iter().map(|v| v.num().unwrap() as u32).collect();
+        assert_eq!(ids, want, "text {i}");
+    }
 }
 
 /// Conversations through the hand-coded template give the tokens of Gemma 4's own `chat_template.jinja`.

@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ### Changed
 
+- The tokenizer reads mmBERT's Metaspace pre-tokenizer (a cut before every space, `▁` prepended to each piece), and finds non-special added tokens such as Granite's `<body>` in the text before merging, as Hugging Face does: mmBERT's and Granite Embedding 311M's tokenizers match `tokenizers` on all 10,000 fixture strings.
+
 - `tachyon run` takes a catalog name (`gemma-4-e4b`) as well as a model directory.
 - Model weights take VRAM from the GPU's memory pool (`Context::alloc_pooled`), which keeps freed VRAM for the process until `Context::trim` gives it back: a model returning from the host tier reuses the VRAM the last one left instead of fresh VRAM, which the driver clears first (the L40S copies into fresh VRAM at 70% of the rate). `Engine::unload`, and `Engine::expire` when a keep-alive runs out, give VRAM back to the system; a model moved out to make room does not. GPUs without memory pools allocate as before. The `switch` bench reports the cost of giving VRAM back.
 
@@ -17,6 +19,9 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - Attention gives each block at least 24 positions and loads a chunk of positions' keys and values at once, instead of relying on prefetch hints, which the RTX 3060 ignores: 11 µs → 8 µs per sliding layer at short contexts.
 
 ### Added
+
+- `tachyon::encoder`, step 10a: `Config` reads a ModernBERT's `config.json` in transformers 5's layout or 4's; `encoder::laya` builds Laya's question sequences exactly as the `laya` package (0.4.5) does, token for token on 500 cases in 17 languages (`Builder`, `Question`, `Kind`, `Budget`), reads a checkpoint's head settings and temperatures (`Head`) and turns option logits into probabilities. `tests/encoder.rs` holds a float32 ModernBERT and Laya head on the CPU, the GPU encoder's future reference, matching PyTorch to 1e-4 on a tiny random Laya (`scripts/encoders.py tiny`) and, with the `models` feature, the real checkpoints' references.
+- `scripts/encoders.py`: float32 references for Laya multilingual (500 decisions) and Granite Embedding 311M (54 embeddings), and the precision study that chose f16 for the encoders: Q8 changes 2.4% of Laya's answers, f16 none.
 
 - `tachyon pull [model] [--keep]`, `catalog`, `list`, `rm` and `doctor`. `pull` downloads a Hugging Face checkpoint over 8 connections (`TACHYON_CONNECTIONS`) in 32 MiB ranges, hashes it in order with SHA-256 and flushes it to disk as it arrives, each on its own thread, resumes an interrupted download from its `.part` file, follows the Hub's redirects and asks again when a signed CDN link expires, then converts it into `$TACHYON_HOME` and removes the checkpoint unless `--keep`. Without a name it pulls the largest model that fits in 70% of GPU 0. `TACHYON_HUB` names a mirror.
 - `tachyon_cli::net`, networking with `std` only: SHA-256 (SHA-NI when the CPU has it), HMAC and HKDF, AES-128-GCM (AES-NI and PCLMULQDQ), X25519, P-256 ECDSA and RSA (PKCS#1 v1.5 and PSS) verification, X.509 chains checked against the system's trust anchors, a TLS 1.3 client (`TLS_AES_128_GCM_SHA256`, X25519), and HTTP/1.1 with keep-alive, chunked bodies, redirects and ranges. Ported in part from caudal.

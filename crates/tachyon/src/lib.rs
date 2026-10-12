@@ -24,6 +24,7 @@
 compile_error!("tachyon targets x86_64 Linux only");
 
 pub mod cuda;
+pub mod encoder;
 pub mod engine;
 mod error;
 pub mod json;
