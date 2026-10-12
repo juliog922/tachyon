@@ -11,13 +11,14 @@
 375      crates/tachyon/src/wpk
 # sys: raised from 150 in step 2 (the io_uring ABI structs, and the page-cache residency probe).
 175      crates/tachyon/src/sys.rs
-1800     crates/tachyon/src/ptx
+1800     crates/tachyon/src/ptx/mod.rs crates/tachyon/src/ptx/attend.rs crates/tachyon/src/ptx/gemm.rs crates/tachyon/src/ptx/gemv.rs crates/tachyon/src/ptx/sample.rs
 300      crates/tachyon/src/quant.rs
 500      crates/tachyon/src/token
 900      crates/tachyon/src/model
 450      crates/tachyon/src/engine.rs
-# encoder: step 10, ModernBERT for Laya multilingual and Granite Embedding 311M (spec step 10 decisions).
-700      crates/tachyon/src/encoder
+# encoder: step 10, ModernBERT for Laya multilingual and Granite Embedding 311M, with its own kernels (an f16
+# tensor-core product, layer norm, attention over packed sequences): spec step 10 decisions.
+1400     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
 500      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs
 # net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
 950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs

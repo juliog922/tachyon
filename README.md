@@ -68,6 +68,9 @@ crates/tachyon/          the library
   benches/               machine ceilings and the bench harness
   src/encoder/mod.rs     ModernBERT encoders (Laya multilingual, Granite Embedding 311M): configuration
   src/encoder/laya.rs    Laya's question sequences, head settings and probabilities
+  src/encoder/convert.rs encoder checkpoints to model directories, f16
+  src/encoder/run.rs     the encoder on the GPU: packed sequences, embeddings, Laya's logits
+  src/ptx/encoder.rs     the encoder's kernels: f16 tensor-core product, layer norm, attention
 crates/tachyon-cli/      the `tachyon` command
   src/models.rs          the catalog and pull, list, rm, doctor
   src/net/               downloads with std only: SHA-256 (SHA-NI), HMAC/HKDF, AES-128-GCM (AES-NI), X25519,

@@ -30,17 +30,20 @@
 //!   several, block row `y` takes `token[y]` and writes row `y` of `out`. Arguments:
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
+//! - The encoder's kernels, [`GEMM_F16`] to [`ATTEND_F16`]: see [`encoder`].
 //! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`]: see [`gemm`].
 //! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
 //! Lengths are multiples of 32.
 
 pub mod attend;
+pub mod encoder;
 pub mod gemm;
 pub mod gemv;
 pub mod sample;
 
 pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
+pub use encoder::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_TILE, NORM_F16, ROPE_F32};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -88,6 +91,15 @@ pub fn module() -> String {
         attend::store(256),
         attend::store(512),
         SPIN_PTX.into(),
+        encoder::gemm_f16(),
+        encoder::norm_f16(),
+        encoder::rows(EMBED_F16, true, false),
+        encoder::rows(ADD_ROWS, false, true),
+        encoder::rows(GATHER_ROWS, false, false),
+        encoder::gelu_f16(),
+        encoder::ROPE.into(),
+        encoder::attend_f16(ATTEND_F16, 64),
+        encoder::attend_f16(ATTEND_F16_32, 32),
     ];
     kernels.iter().fold(String::from(".version 7.1\n.target sm_80\n.address_size 64\n"), |m, k| m + "\n" + k) + &sample::sample()
 }

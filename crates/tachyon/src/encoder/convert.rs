@@ -1,0 +1,141 @@
+//! Conversion of a Hugging Face encoder checkpoint into a model directory: `config.json` (the ModernBERT's),
+//! `head.json` (a Laya checkpoint's `rl_agent_config.json`), `tokenizer.tok`, `weights.wpk` for VRAM and
+//! `host.wpk` for pinned host memory.
+//!
+//! `weights.wpk`: `embed_norm`, per layer `{i}.attn_norm` (not layer 0), `{i}.qkv`, `{i}.o`, `{i}.mlp_norm`,
+//! `{i}.up` (`Wi`), `{i}.down` (`Wo`), and `final_norm`; matrices `f16 [rows, cols]` as PyTorch's `Linear` holds
+//! them, norms `f32`. A Laya checkpoint adds its head: `type_emb` (`f32 [3, h]`); per head layer `h{l}.norm1.w`,
+//! `.b`, `h{l}.qkv.w`, `.b`, `h{l}.o.w`, `.b`, `h{l}.norm2.w`, `.b`, `h{l}.up.w`, `.b`, `h{l}.down.w`, `.b`; and
+//! `score.norm.w`, `.b`, `score.1.w`, `.b`, `score.2.w`, `.b`, the last padded with zeros to 64 rows for the
+//! matrix product. `host.wpk`: `embed`, the token embeddings, `f16 [vocab, h]`.
+//!
+//! A Laya repository holds `rl_agent_config.json`, `encoder/config.json`, `tokenizer/tokenizer.json` and one
+//! `model.safetensors` whose encoder tensors start with `encoder.` (the encoder's `config.json` may also sit at the
+//! top, as in the tests' tiny Laya); a Granite Embedding repository holds
+//! `config.json`, `tokenizer.json` and the encoder's tensors.
+
+use super::Config;
+use super::laya::Head;
+use crate::quant::{Safetensors, f16_bits};
+use crate::token::Tokenizer;
+use crate::wpk::{Dtype, Writer};
+use crate::{Error, Result};
+use std::path::Path;
+
+/// Rows the last scorer layer is padded to.
+const PAD: usize = 64;
+
+/// Converts the encoder checkpoint in `src` (Laya or Granite Embedding, see the module documentation) to a model
+/// directory `dst`.
+pub fn convert(src: &Path, dst: &Path) -> Result<()> {
+    let laya = src.join("rl_agent_config.json").exists();
+    let dir = if laya && src.join("encoder").is_dir() { src.join("encoder") } else { src.to_path_buf() };
+    let st = Safetensors::open(src)?;
+    let p = if laya { "encoder." } else { st.prefix("embeddings.norm.weight") };
+    std::fs::create_dir_all(dst)?;
+    write(dst, &st, (&dir.join("config.json"), p), laya.then(|| src.join("rl_agent_config.json")).as_deref())?;
+    tokenizer(&src.join(if laya { "tokenizer/tokenizer.json" } else { "tokenizer.json" }), dst)
+}
+
+/// Writes into `dst` the encoder's `config.json` (from `config`), `weights.wpk`, with Laya's head when `head` names
+/// its configuration (copied as `head.json`), and `host.wpk`; the encoder's names start with `p`.
+fn write(dst: &Path, st: &Safetensors, (config, p): (&Path, &str), head: Option<&Path>) -> Result<()> {
+    let text = std::fs::read(config)?;
+    std::fs::write(dst.join("config.json"), &text)?;
+    let mut w = Writer::create(dst.join("weights.wpk"))?;
+    encoder(&mut w, st, &Config::from_json(&text)?, p)?;
+    if let Some(path) = head {
+        laya(&mut w, st, path, dst)?;
+    }
+    w.finish()?;
+    host(dst, st, p)
+}
+
+/// Writes `host.wpk`, the token embeddings, into `dst`.
+fn host(dst: &Path, st: &Safetensors, p: &str) -> Result<()> {
+    let mut host = Writer::create(dst.join("host.wpk"))?;
+    matrix(&mut host, st, "embed", &format!("{p}embeddings.tok_embeddings.weight"), 0)?;
+    host.finish()
+}
+
+/// Stores the tokenizer at `path`, if there is one, in `dst`.
+fn tokenizer(path: &Path, dst: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    Ok(std::fs::write(dst.join("tokenizer.tok"), Tokenizer::from_json(&std::fs::read(path)?)?.to_bytes())?)
+}
+
+/// The encoder's tensors, whose checkpoint names start with `p`.
+fn encoder(w: &mut Writer, st: &Safetensors, cfg: &Config, p: &str) -> Result<()> {
+    vector(w, st, "embed_norm", &format!("{p}embeddings.norm.weight"))?;
+    for i in 0..cfg.layers() {
+        let l = format!("{p}layers.{i}.");
+        if i > 0 {
+            vector(w, st, &format!("{i}.attn_norm"), &format!("{l}attn_norm.weight"))?;
+        }
+        vector(w, st, &format!("{i}.mlp_norm"), &format!("{l}mlp_norm.weight"))?;
+        for (name, source) in [("qkv", "attn.Wqkv"), ("o", "attn.Wo"), ("up", "mlp.Wi"), ("down", "mlp.Wo")] {
+            matrix(w, st, &format!("{i}.{name}"), &format!("{l}{source}.weight"), 0)?;
+        }
+    }
+    vector(w, st, "final_norm", &format!("{p}final_norm.weight"))
+}
+
+/// Laya's head and scorer, configured by `path`, which is copied into `dst` as `head.json`.
+fn laya(w: &mut Writer, st: &Safetensors, path: &Path, dst: &Path) -> Result<()> {
+    let json = std::fs::read(path)?;
+    head_layers(w, st, Head::from_json(&json)?.layers)?;
+    scorer(w, st)?;
+    Ok(std::fs::write(dst.join("head.json"), json)?)
+}
+
+/// Laya's type embedding and head of `layers` layers.
+fn head_layers(w: &mut Writer, st: &Safetensors, layers: usize) -> Result<()> {
+    vector(w, st, "type_emb", "type_emb.weight")?;
+    for l in 0..layers {
+        let s = format!("head.layers.{l}.");
+        let parts =
+            [("norm1", "norm1."), ("qkv", "self_attn.in_proj_"), ("o", "self_attn.out_proj."), ("norm2", "norm2."), ("up", "linear1."), ("down", "linear2.")];
+        for (name, source) in parts {
+            let (weight, out) = (format!("{s}{source}weight"), format!("h{l}.{name}.w"));
+            if name.starts_with("norm") { vector(w, st, &out, &weight) } else { matrix(w, st, &out, &weight, 0) }?;
+            vector(w, st, &format!("h{l}.{name}.b"), &format!("{s}{source}bias"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Laya's scorer: a layer norm, a layer to `h`, and one to a logit, padded to [`PAD`] rows.
+fn scorer(w: &mut Writer, st: &Safetensors) -> Result<()> {
+    vector(w, st, "score.norm.w", "scorer.0.weight")?;
+    vector(w, st, "score.norm.b", "scorer.0.bias")?;
+    for (name, source, pad) in [("score.1", "scorer.1", 0), ("score.2", "scorer.3", PAD)] {
+        matrix(w, st, &format!("{name}.w"), &format!("{source}.weight"), pad)?;
+        let mut bias = st.rows(&format!("{source}.bias"), 0..st.dims(&format!("{source}.bias"))?.0)?;
+        bias.resize(bias.len().max(pad), 0.0);
+        w.add(&format!("{name}.b"), Dtype::F32, &[bias.len() as u64], &bias.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+    }
+    Ok(())
+}
+
+/// Writes `source` as `f16 [rows, cols]`, with zero rows up to `pad` rows; read a slice of rows at a time.
+fn matrix(w: &mut Writer, st: &Safetensors, name: &str, source: &str, pad: usize) -> Result<()> {
+    let (rows, cols) = st.dims(source)?;
+    if cols == 0 {
+        return Err(Error::Format(format!("{source}: no columns")));
+    }
+    let mut out = Vec::with_capacity(rows.max(pad) * cols * 2);
+    let step = (1 << 22) / cols + 1;
+    for start in (0..rows).step_by(step) {
+        out.extend(st.rows(source, start..rows.min(start + step))?.iter().flat_map(|&x| f16_bits(x).to_le_bytes()));
+    }
+    out.resize(rows.max(pad) * cols * 2, 0);
+    w.add(name, Dtype::F16, &[rows.max(pad) as u64, cols as u64], &out)
+}
+
+/// Writes a vector as `f32`.
+fn vector(w: &mut Writer, st: &Safetensors, name: &str, source: &str) -> Result<()> {
+    let v = st.rows(source, 0..st.dims(source)?.0)?;
+    w.add(name, Dtype::F32, &[v.len() as u64], &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
+}

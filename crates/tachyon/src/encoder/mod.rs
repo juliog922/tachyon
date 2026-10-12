@@ -5,10 +5,28 @@
 //! and within [`Config::window`] positions elsewhere, each with its own RoPE base; and a gated MLP,
 //! `Wo · (gelu(a) ⊙ b)` with `[a, b] = Wi · x`. A final layer norm closes it. No layer has a bias.
 
+mod convert;
 pub mod laya;
+mod run;
+
+pub use convert::convert;
+pub use run::Encoder;
 
 use crate::json::Json;
 use crate::{Error, Result};
+
+/// How an [`Encoder`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    /// The most tokens encoded at once, up to 65535: a batch's sequences in all, and the longest sequence.
+    pub tokens: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings { tokens: 4096 }
+    }
+}
 
 /// A ModernBERT encoder's shape, from its `config.json`.
 #[derive(Debug, Clone, PartialEq)]
