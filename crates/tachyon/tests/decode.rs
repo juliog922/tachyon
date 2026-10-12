@@ -189,6 +189,8 @@ struct Attend {
     pos: u32,
     splits: u32,
     fresh: bool,
+    /// Blocks per key-value head: `4·group` query heads share each.
+    group: usize,
 }
 
 /// What an attention launch reads.
@@ -203,7 +205,7 @@ struct Inputs {
 
 impl Attend {
     fn inputs(&self, seed: u64) -> Inputs {
-        let rows = 4 * KV + if self.fresh { 2 * KV } else { 0 };
+        let rows = 4 * self.group * KV + if self.fresh { 2 * KV } else { 0 };
         let weights = |s| values(self.d, s).iter().map(|x| 0.2 + 0.1 * x).collect();
         let freq = if self.d == 256 { rope(10_000.0, 256, 1.0) } else { rope(1e6, 512, 0.25) };
         let cache = |s| values(KV * self.cap as usize * self.d, s).iter().map(|&x| f16_bits(0.3 * x)).collect();
@@ -212,12 +214,13 @@ impl Attend {
 
     /// Q8 output, and the key and value caches after the launch, from the GPU; launched `times` times.
     fn gpu(&self, gpu: &Gpu, x: &Inputs, times: usize) -> (Q8, Vec<u16>, Vec<u16>) {
-        let (d, splits) = (self.d, self.splits);
+        let (d, splits, blocks) = (self.d, self.splits, self.group * KV);
         let bufs = [gpu.upload(&x.qkv), gpu.upload(&x.qn), gpu.upload(&x.kn), gpu.upload(&x.freq), gpu.upload(&x.k), gpu.upload(&x.v)];
         let [pqkv, pqn, pkn, pfreq, pk, pv] = bufs.each_ref().map(DevBuf::ptr);
-        let (pos, part, count, out) = (gpu.upload(&[self.pos]), gpu.zeros(KV * splits as usize * (8 + 4 * d) * 4), gpu.zeros(4 * KV), q8_out(gpu, 4 * KV * d));
+        let (pos, part, count, out) =
+            (gpu.upload(&[self.pos]), gpu.zeros(blocks * splits as usize * (8 + 4 * d) * 4), gpu.zeros(4 * blocks), q8_out(gpu, 4 * blocks * d));
         let (ppos, ppart, pcount, pq, ps) = (pos.ptr(), part.ptr(), count.ptr(), out.0.ptr(), out.1.ptr());
-        let (cap, win, fresh) = (self.cap, self.win, u32::from(self.fresh));
+        let (cap, win, fresh, group) = (self.cap, self.win, u32::from(self.fresh), self.group as u32);
         let args = [
             arg(&pqkv),
             arg(&pqn),
@@ -229,6 +232,7 @@ impl Attend {
             arg(&cap),
             arg(&win),
             arg(&fresh),
+            arg(&group),
             arg(&ppart),
             arg(&pcount),
             arg(&pq),
@@ -236,10 +240,10 @@ impl Attend {
         ];
         let f = gpu.module.function(if d == 256 { ATTEND_256 } else { ATTEND_512 }).unwrap();
         for _ in 0..times {
-            // SAFETY: fourteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
-            unsafe { gpu.stream.launch(&f, [KV as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }.unwrap();
+            // SAFETY: fifteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
+            unsafe { gpu.stream.launch(&f, [blocks as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }.unwrap();
         }
-        assert_eq!(gpu.words(&count), [0; KV], "the counters are left at zero");
+        assert_eq!(gpu.words(&count), vec![0; blocks], "the counters are left at zero");
         (q8_read(gpu, &out), gpu.halves(&bufs[4]), gpu.halves(&bufs[5]))
     }
 
@@ -249,7 +253,8 @@ impl Attend {
         let head = |i: usize| x.qkv[i * d..][..d].iter().map(|&v| f64::from(v)).collect::<Vec<f64>>();
         let (mut out, mut keys, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         for g in 0..KV {
-            let (mut k, mut v) = if self.fresh { (head(4 * KV + g), head(5 * KV + g)) } else { (vec![], vec![]) };
+            let heads = 4 * self.group * KV;
+            let (mut k, mut v) = if self.fresh { (head(heads + g), head(heads + KV + g)) } else { (vec![], vec![]) };
             if self.fresh {
                 normalize(&mut k, Some(&x.kn));
                 rotate(&mut k, &x.freq, self.pos);
@@ -260,7 +265,7 @@ impl Attend {
                 .map(|age| (cur + cap - age) % cap)
                 .map(|t| if self.fresh && t == cur { (k.clone(), v.clone()) } else { (cached(&x.k, t), cached(&x.v, t)) })
                 .collect();
-            for h in 4 * g..4 * g + 4 {
+            for h in 4 * self.group * g..4 * self.group * (g + 1) {
                 let mut q = head(h);
                 normalize(&mut q, Some(&x.qn));
                 rotate(&mut q, &x.freq, self.pos);
@@ -296,21 +301,24 @@ fn check_attend(gpu: &Gpu, case: Attend) {
 #[test]
 fn attention_over_a_short_context() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 0, splits: 16, fresh: true });
-    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 100, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 0, splits: 16, fresh: true, group: 1 });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 100, splits: 16, fresh: true, group: 1 });
+    // Eight query heads per key-value head, as E2B has: two blocks share each, and the first stores the new key.
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 100, splits: 16, fresh: true, group: 2 });
 }
 
 #[test]
 fn attention_over_a_full_sliding_window() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 700, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 512, win: 512, pos: 700, splits: 16, fresh: true, group: 1 });
     // A ring longer than the window, as prefill keeps: the 512 newest positions only.
-    check_attend(&gpu, Attend { d: 256, cap: 1024, win: 512, pos: 1700, splits: 16, fresh: true });
+    check_attend(&gpu, Attend { d: 256, cap: 1024, win: 512, pos: 1700, splits: 16, fresh: true, group: 1 });
 }
 
 #[test]
 fn global_attention_with_its_own_or_a_shared_cache() {
     let gpu = Gpu::new();
-    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 32, fresh: true });
-    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 256, fresh: false });
+    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 32, fresh: true, group: 1 });
+    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 256, fresh: false, group: 1 });
+    check_attend(&gpu, Attend { d: 512, cap: 2048, win: 2048, pos: 1500, splits: 32, fresh: true, group: 2 });
 }

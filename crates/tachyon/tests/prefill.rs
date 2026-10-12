@@ -149,10 +149,11 @@ impl Chunk {
         ];
         let [pqkv, pqn, pkn, pfreq, pk, pv, ppos] = bufs.each_ref().map(DevBuf::ptr);
         let (work, counters, (q, s)) = (gpu.zeros(TOKENS * KV * (8 + 4 * D) * 4), gpu.zeros(TOKENS * KV * 4), out(gpu, TOKENS * 4 * KV * D));
-        let (ptrs, fresh, (cap, win)) = ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], 0u32, (CAP, WIN));
-        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap)];
+        let (ptrs, (fresh, group), (cap, win)) =
+            ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], (0u32, 1u32), (CAP, WIN));
+        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&group)];
         let mut attend: Vec<_> = ptrs[..7].iter().map(arg).collect();
-        attend.extend([arg(&cap), arg(&win), arg(&fresh)]);
+        attend.extend([arg(&cap), arg(&win), arg(&fresh), arg(&group)]);
         attend.extend(ptrs[7..].iter().map(arg));
         // SAFETY: each launch passes its kernel's arguments in order and with their types; every buffer is sized as
         // the kernels' documentation gives for `TOKENS` tokens.

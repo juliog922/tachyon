@@ -40,7 +40,7 @@ pub mod gemm;
 pub mod gemv;
 pub mod sample;
 
-pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_KV, KV_256, KV_512, rope};
+pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};

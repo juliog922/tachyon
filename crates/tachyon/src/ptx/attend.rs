@@ -1,35 +1,35 @@
 //! Decode attention: one new query token against the key-value cache, for one layer.
 //!
-//! [`ATTEND_256`] and [`ATTEND_512`] differ only in the head size `D`. Each key-value head serves
-//! [`HEADS_PER_KV`] query heads. The kernel takes the projected query, key and value of the new token as `f32`
-//! (`q[H][D]`, then `k[Hkv][D]`, then `v[Hkv][D]`, with `H = 4·Hkv`) and:
+//! [`ATTEND_256`] and [`ATTEND_512`] differ only in the head size `D`. A block takes [`HEADS_PER_BLOCK`] query
+//! heads, which share one key-value head: `group` blocks serve each key-value head, so `H = 4·group·Hkv` (Gemma 4
+//! E4B: 8 heads over 2, group 1; E2B: 8 over 1, group 2). The kernel takes the projected query, key and value of the
+//! new token as `f32` (`q[H][D]`, then `k[Hkv][D]`, then `v[Hkv][D]`) and:
 //!
 //! 1. RMS-normalizes each query head and scales it by `qn`; with `fresh`, does the same to the key with `kn`
 //!    and normalizes the value without a scale (Gemma 4's `q_norm`, `k_norm`, `v_norm`, ε = 1e-6);
 //! 2. rotates query and key by RoPE at position `*pos`: pairs `(i, i + D/2)` turn by `pos · freq[i]`, so a
 //!    zero frequency leaves a pair alone, which is how [`rope`] expresses Gemma 4's proportional RoPE;
-//! 3. with `fresh`, stores the key and value as `f16` in the cache at slot `pos % cap`. Without it (a layer that
-//!    shares another layer's cache) the cache already holds them;
+//! 3. with `fresh`, stores the key and value as `f16` in the cache at slot `pos % cap` (the first block of the
+//!    group does). Without it (a layer that shares another layer's cache) the cache already holds them;
 //! 4. attends over the last `min(pos + 1, window)` positions with scale 1 and writes the result as Q8: a ring of
 //!    `cap ≥ window` slots with `window` 512 is a sliding window, a cache as long as the context global attention.
 //!    Prefill keeps sliding rings a chunk longer than the window, so a chunk's newest keys never overwrite positions
 //!    its oldest tokens still attend to.
 //!
 //! The cache is `f16 [Hkv][cap][D]`, keys and values in separate buffers. Arguments: `qkv, qn, kn, freq:
-//! *const f32, k_cache, v_cache: *mut f16, pos: *const u32, cap, window, fresh: u32, partial: *mut f32, count:
-//! *mut u32`, Q8 out (`H × D` values).
+//! *const f32, k_cache, v_cache: *mut f16, pos: *const u32, cap, window, fresh, group: u32, partial: *mut f32,
+//! count: *mut u32`, Q8 out (`H × D` values).
 //!
 //! For prefill, [`ATTEND_256P`] and [`ATTEND_512P`] write Q8P instead, and a grid `z` of `tokens` takes token `z` at
 //! position `*pos + z` (its row of `qkv`, its own `partial` and `count`, its row of the output), with one block per
-//! key-value head (`S = 1`) and `fresh` 0: [`KV_256`] and [`KV_512`] first put every token's key and value
-//! in the cache, so each block reads its whole window from there. Launch a grid of `(Hkv, S)` blocks of `32 · ATTEND_WARPS` threads, `S ≤
-//! 256`: the positions in the cache are split evenly over the `S` blocks of each key-value head, at least 24 per
-//! block (so a short context uses few blocks, and they have little to merge), and the block that finishes last for
-//! its head merges the others' partial results. Blocks of
-//! [`ATTEND_256`] fit two per multiprocessor and those of [`ATTEND_512`] one, so one wave is `S = 2·SMs / Hkv`
-//! or `SMs / Hkv`. `partial` holds
-//! `Hkv · S · (8 + 4·D)` floats of scratch; `count` holds `Hkv` counters, zero before the first launch and left
-//! at zero by every launch.
+//! four query heads (`S = 1`) and `fresh` 0: [`KV_256`] and [`KV_512`] first put every token's key and value
+//! in the cache, so each block reads its whole window from there. Launch a grid of `(H/4, S)` blocks of
+//! `32 · ATTEND_WARPS` threads, `S ≤ 256`: the positions in the cache are split evenly over the `S` blocks of each
+//! four heads, at least 24 per block (so a short context uses few blocks, and they have little to merge), and the
+//! block that finishes last merges the others' partial results. Blocks of [`ATTEND_256`] fit two per multiprocessor
+//! and those of [`ATTEND_512`] one, so one wave is `S = 8·SMs / H` or `4·SMs / H`. `partial` holds
+//! `H/4 · S · (8 + 4·D)` floats of scratch; `count` holds `H/4` counters, zero before the first launch and left at
+//! zero by every launch.
 
 use super::{Q8, q8, q8p, warp};
 use std::fmt::Write;
@@ -43,14 +43,14 @@ pub const ATTEND_256P: &str = "attend_256p";
 /// See [`ATTEND_256P`].
 pub const ATTEND_512P: &str = "attend_512p";
 /// Names of the prefill key-value stores: a grid of `(Hkv, tokens)` blocks of 32, arguments `qkv, kn, freq,
-/// k_cache, v_cache, pos, cap`.
+/// k_cache, v_cache, pos, cap, group`.
 pub const KV_256: &str = "kv_256";
 /// See [`KV_256`].
 pub const KV_512: &str = "kv_512";
 /// Warps per attention block.
 pub const ATTEND_WARPS: u32 = 8;
-/// Query heads per key-value head.
-pub const HEADS_PER_KV: u32 = 4;
+/// Query heads per attention block, all of one key-value head.
+pub const HEADS_PER_BLOCK: u32 = 4;
 
 /// RoPE frequencies for heads of `dim`: `theta^(−2i/dim)` for the first `fraction · dim / 2` pairs, zero for the
 /// rest. `fraction` 1 is standard RoPE; Gemma 4's global layers use 0.25 ("proportional").
@@ -70,14 +70,14 @@ fn ld32(s: &mut String, reg: &str, first: usize, addr: &str, off: usize, n: usiz
     }
 }
 
-/// `e` registers `%{reg}0..` stored as `f16` at `[{addr}]`.
-fn st16(s: &mut String, reg: &str, addr: &str, e: usize) {
+/// `e` registers `%{reg}0..` stored as `f16` at `[{addr}]`, under `guard` (a predicate, or nothing).
+fn st16(s: &mut String, reg: &str, addr: &str, e: usize, guard: &str) {
     for m in (0..e).step_by(8) {
         for p in 0..4 {
             let (a, b) = (m + 2 * p, m + 2 * p + 1);
             let _ = writeln!(s, "    cvt.rn.f16.f32 %hk0, %{reg}{a};\n    cvt.rn.f16.f32 %hk1, %{reg}{b};\n    mov.b32 %pk{p}, {{%hk0, %hk1}};");
         }
-        let _ = writeln!(s, "    st.global.v4.b32 [{addr}+{}], {{%pk0, %pk1, %pk2, %pk3}};", 2 * m);
+        let _ = writeln!(s, "    {guard}st.global.v4.b32 [{addr}+{}], {{%pk0, %pk1, %pk2, %pk3}};", 2 * m);
     }
 }
 
@@ -131,12 +131,13 @@ fn queries(s: &mut String, d: usize, e: usize) {
     (0..4 * e).for_each(|j| _ = writeln!(s, "    mov.f32 %acc{j}, 0f00000000;"));
 }
 
-/// The new token's key and value, normalized, the key rotated, stored to the cache and left in `%k`, `%v`.
-fn fresh(s: &mut String, d: usize, e: usize) {
-    let _ = writeln!(s, "    shl.b32 %x, %nkv, 2;\n    add.u32 %x, %x, %g;\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;");
+/// The new token's key and value of key-value head `%kvh` (of `%nkr`, after `4·%nkv` query heads), normalized, the
+/// key rotated, stored to the cache under `guard` and left in `%k`, `%v`.
+fn fresh(s: &mut String, d: usize, e: usize, guard: &str) {
+    let _ = writeln!(s, "    shl.b32 %x, %nkv, 2;\n    add.u32 %x, %x, %kvh;\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;");
     *s += "    mul.wide.u32 %o, %x, 4;\n    add.u64 %a, %qkv, %o;\n";
     ld32(s, "k", 0, "%a", 0, e);
-    let _ = writeln!(s, "    mul.lo.u32 %x, %nkv, {};\n    cvt.u64.u32 %o, %x;\n    add.u64 %a, %a, %o;", 4 * d);
+    let _ = writeln!(s, "    mul.lo.u32 %x, %nkr, {};\n    cvt.u64.u32 %o, %x;\n    add.u64 %a, %a, %o;", 4 * d);
     ld32(s, "v", 0, "%a", 0, e);
     let _ = writeln!(s, "    ld.param.u64 %b, [pkn];\n    cvta.to.global.u64 %b, %b;\n    mul.wide.u32 %o, %lane, {};\n    add.u64 %b, %b, %o;", 4 * e);
     ld32(s, "w", 0, "%b", 0, e);
@@ -144,14 +145,14 @@ fn fresh(s: &mut String, d: usize, e: usize) {
     rotate(s, "k", 0, e);
     norm(s, "v", 0, e, false);
     slot(s, "%cur", d, e);
-    st16(s, "k", "%a", e);
+    st16(s, "k", "%a", e, guard);
     *s += "    add.u64 %a, %vc, %o;\n";
-    st16(s, "v", "%a", e);
+    st16(s, "v", "%a", e, guard);
 }
 
 /// `%o`: byte offset of this lane's values of position `t` in the cache; `%a`: their address in the key cache.
 fn slot(s: &mut String, t: &str, d: usize, e: usize) {
-    let _ = writeln!(s, "    mad.lo.u32 %x, %g, %cap, {t};\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;");
+    let _ = writeln!(s, "    mad.lo.u32 %x, %kvh, %cap, {t};\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;");
     *s += "    mul.wide.u32 %o, %x, 2;\n    add.u64 %a, %kc, %o;\n";
 }
 
@@ -166,7 +167,7 @@ fn positions(s: &mut String, d: usize, e: usize) {
     let (mut score, c) = (String::new(), chunk(d));
     step(&mut score, e);
     *s += "    @!%dofresh bra POSITIONS;\n";
-    fresh(s, d, e);
+    fresh(s, d, e, "@%own ");
     *s += &score;
     *s += "POSITIONS:\n    add.u32 %t, %start, %warp;\nCHUNK:\n    setp.ge.u32 %p, %t, %end;\n    @%p bra DONE;\n";
     for k in 0..c {
@@ -280,6 +281,11 @@ const SETUP: &str = "
     mov.u32 %spl, %ctaid.y;
     mov.u32 %nkv, %nctaid.x;
     mov.u32 %nsp, %nctaid.y;
+    ld.param.u32 %grp, [pgroup];
+    div.u32 %kvh, %g, %grp;
+    div.u32 %nkr, %nkv, %grp;
+    rem.u32 %x, %g, %grp;
+    setp.eq.u32 %own, %x, 0;
     ld.param.u64 %a, [ppos];
     cvta.to.global.u64 %a, %a;
     ld.global.u32 %pos, [%a];
@@ -307,7 +313,9 @@ const SETUP: &str = "
     div.u32 %active, %active, %span;
     ld.param.u64 %qkv, [pqkv];
     cvta.to.global.u64 %qkv, %qkv;
-    mul.lo.u32 %x, %nkv, ROW;
+    shl.b32 %x, %nkv, 2;
+    mad.lo.u32 %x, %nkr, 2, %x;
+    mul.lo.u32 %x, %x, ROW;
     mul.wide.u32 %o, %x, %z;
     add.u64 %qkv, %qkv, %o;
     ld.param.u64 %kc, [pkc];
@@ -427,14 +435,14 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
     let e = d / 32;
     let mut s = format!(
         ".visible .entry attend_{d}{}(.param .u64 pqkv, .param .u64 pqn, .param .u64 pkn, .param .u64 pfreq, .param .u64 pkc, .param .u64 pvc,
-    .param .u64 ppos, .param .u32 pcap, .param .u32 pwin, .param .u32 pfresh, .param .u64 ppart, .param .u64 pcount, .param .u64 pq, .param .u64 ps)
+    .param .u64 ppos, .param .u32 pcap, .param .u32 pwin, .param .u32 pfresh, .param .u32 pgroup, .param .u64 ppart, .param .u64 pcount, .param .u64 pq, .param .u64 ps)
 {}{{
     .shared .align 16 .f32 sm[32];
     .shared .align 16 .f32 sacc[{}];
     .shared .align 4 .u32 flag;
     .shared .align 8 .f32 red[32];
-    .reg .pred %p, %ps, %fresh, %dofresh, %last, %lane0, %pc<{}>;
-    .reg .b32 %th, %lane, %warp, %z, %y, %g, %spl, %nkv, %nsp, %pos, %cap, %span, %n, %cur, %skip, %start, %end, %active, %t, %x, %j, %s, %h, %old, %gi, %rw;
+    .reg .pred %p, %ps, %fresh, %dofresh, %last, %lane0, %own, %pc<{}>;
+    .reg .b32 %th, %lane, %warp, %z, %y, %g, %grp, %kvh, %nkr, %spl, %nkv, %nsp, %pos, %cap, %span, %n, %cur, %skip, %start, %end, %active, %t, %x, %j, %s, %h, %old, %gi, %rw;
     .reg .b32 %pk<4>, %rk<{}>, %rv<{}>;
     .reg .b16 %hk<2>;
     .reg .f32 %q<{}>, %acc<{}>, %k<{e}>, %v<{e}>, %c<{e}>, %sn<{e}>, %w<{e}>, %m<4>, %l<4>, %cr<4>, %M<4>;
@@ -449,7 +457,7 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
         chunk(d) * e / 2,
         4 * e,
         4 * e,
-        SETUP.replace("ROW", &(4 * 6 * d).to_string()).replace("PART", &(4 * (8 + 4 * d)).to_string())
+        SETUP.replace("ROW", &(4 * d).to_string()).replace("PART", &(4 * (8 + 4 * d)).to_string())
     );
     angles(&mut s, e);
     queries(&mut s, d, e);
@@ -469,22 +477,25 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
 }
 
 /// The key-value store of prefill for heads of `d`: [`fresh`] for token `ctaid.y` at position `*pos + ctaid.y`, one
-/// warp per key-value head. Arguments: `qkv, kn, freq, k_cache, v_cache, pos, cap`, as [`ATTEND_256`] reads them,
-/// `qkv` holding a row per token. Launch a grid of `(Hkv, tokens)` blocks of 32.
+/// warp per key-value head. Arguments: `qkv, kn, freq, k_cache, v_cache, pos, cap, group`, as [`ATTEND_256`] reads
+/// them, `qkv` holding a row per token. Launch a grid of `(Hkv, tokens)` blocks of 32.
 pub(super) fn store(d: usize) -> String {
     let e = d / 32;
     let mut s = format!(
-        ".visible .entry kv_{d}(.param .u64 pqkv, .param .u64 pkn, .param .u64 pfreq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap)
+        ".visible .entry kv_{d}(.param .u64 pqkv, .param .u64 pkn, .param .u64 pfreq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap,
+    .param .u32 pgroup)
 {{
     .reg .pred %p;
-    .reg .b32 %lane, %g, %z, %nkv, %pos, %cap, %cur, %x, %pk<4>;
+    .reg .b32 %lane, %z, %nkv, %nkr, %kvh, %pos, %cap, %cur, %x, %pk<4>;
     .reg .b16 %hk<2>;
     .reg .f32 %k<{e}>, %v<{e}>, %c<{e}>, %sn<{e}>, %w<{e}>, %pf, %sgn, %f, %ft, %r;
     .reg .b64 %qkv, %kc, %vc, %a, %b, %o;
     mov.u32 %lane, %tid.x;
-    mov.u32 %g, %ctaid.x;
+    mov.u32 %kvh, %ctaid.x;
     mov.u32 %z, %ctaid.y;
-    mov.u32 %nkv, %nctaid.x;
+    mov.u32 %nkr, %nctaid.x;
+    ld.param.u32 %x, [pgroup];
+    mul.lo.u32 %nkv, %nkr, %x;
     ld.param.u64 %a, [ppos];
     cvta.to.global.u64 %a, %a;
     ld.global.u32 %pos, [%a];
@@ -493,7 +504,9 @@ pub(super) fn store(d: usize) -> String {
     rem.u32 %cur, %pos, %cap;
     ld.param.u64 %qkv, [pqkv];
     cvta.to.global.u64 %qkv, %qkv;
-    mul.lo.u32 %x, %nkv, {};
+    shl.b32 %x, %nkv, 2;
+    mad.lo.u32 %x, %nkr, 2, %x;
+    mul.lo.u32 %x, %x, {};
     mul.wide.u32 %o, %x, %z;
     add.u64 %qkv, %qkv, %o;
     ld.param.u64 %kc, [pkc];
@@ -501,9 +514,9 @@ pub(super) fn store(d: usize) -> String {
     ld.param.u64 %vc, [pvc];
     cvta.to.global.u64 %vc, %vc;
 ",
-        4 * 6 * d
+        4 * d
     );
     angles(&mut s, e);
-    fresh(&mut s, d, e);
+    fresh(&mut s, d, e, "");
     s + "    ret;\n}\n"
 }

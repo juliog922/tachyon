@@ -1,12 +1,14 @@
-//! The chat API on the GPU: answers stream and repeat, cancel cleanly, and a step allocates nothing; with the `models`
-//! feature, Gemma 4 E4B's 4-bit answers against Hugging Face's in bfloat16.
+//! The chat API on the GPU: answers stream and repeat, cancel cleanly, and a step allocates nothing; models move
+//! between VRAM, the host tier and disk as the limits, pins and keep-alives say, and answer the same wherever they
+//! come back from; with the `models` feature, Gemma 4 E4B's 4-bit answers against Hugging Face's in bfloat16.
 #![cfg(feature = "gpu")]
 
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use tachyon::engine::{Engine, Request};
+use std::time::Duration;
+use tachyon::engine::{Engine, Limits, Load, Request, Tier};
 use tachyon::model::Settings;
 use tachyon::token::{Message, Role};
 
@@ -41,9 +43,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// The answer to `messages`, at most `max` tokens of it: its text and token count.
-fn answer(engine: &mut Engine, messages: &[Message], max: usize) -> (String, usize) {
-    let mut stream = engine.chat(&Request { max_tokens: max, ..Request::new(messages) }).unwrap();
+/// Model `name`'s answer to `messages`, at most `max` tokens of it, kept `keep` after: its text and token count.
+fn answer(engine: &mut Engine, (name, keep): (&str, Option<Duration>), messages: &[Message], max: usize) -> (String, usize) {
+    let mut stream = engine.chat(name, &Request { max_tokens: max, keep_alive: keep, ..Request::new(messages) }).unwrap();
     let mut text = String::new();
     while let Some(piece) = stream.next_text().unwrap() {
         text.push_str(piece);
@@ -53,22 +55,24 @@ fn answer(engine: &mut Engine, messages: &[Message], max: usize) -> (String, usi
 
 #[test]
 fn tiny_model_streams_cancels_and_does_not_allocate() {
-    let src = common::tiny::checkpoint("engine", 3);
+    let src = common::tiny::checkpoint("engine", 3, common::tiny::E4B);
     tachyon::model::convert(&src, &src.join("out")).unwrap();
-    let mut engine = Engine::open(&src.join("out"), &Settings { context: 64, chunk: 8 }).unwrap();
+    let mut engine = Engine::new(0, Limits::default()).unwrap();
+    engine.load("tiny", &src.join("out"), &Load { settings: Settings { context: 64, chunk: 8 }, ..Load::default() }).unwrap();
+    let tiny = ("tiny", None);
     let messages = [Message { role: Role::System, text: "Be brief." }, Message { role: Role::User, text: "hello there, how are you" }];
-    let (full, tokens) = answer(&mut engine, &messages, 30);
+    let (full, tokens) = answer(&mut engine, tiny, &messages, 30);
     assert!(tokens > 0 && tokens <= 30, "{tokens} tokens");
-    assert_eq!(answer(&mut engine, &messages, 30), (full.clone(), tokens), "a second chat repeats the first");
+    assert_eq!(answer(&mut engine, tiny, &messages, 30), (full.clone(), tokens), "a second chat repeats the first");
     // Cancelled after a few pieces, by dropping the stream, the engine answers the next chat as before.
-    let mut stream = engine.chat(&Request::new(&messages)).unwrap();
+    let mut stream = engine.chat("tiny", &Request::new(&messages)).unwrap();
     for _ in 0..3 {
         stream.next_text().unwrap();
     }
     drop(stream);
-    assert_eq!(answer(&mut engine, &messages, 30).0, full, "the chat after a cancelled one");
+    assert_eq!(answer(&mut engine, tiny, &messages, 30).0, full, "the chat after a cancelled one");
     // After two pieces, every step to the end of the context allocates nothing.
-    let mut stream = engine.chat(&Request::new(&messages)).unwrap();
+    let mut stream = engine.chat("tiny", &Request::new(&messages)).unwrap();
     let prompt = stream.prompt();
     stream.next_text().unwrap();
     stream.next_text().unwrap();
@@ -78,8 +82,57 @@ fn tiny_model_streams_cancels_and_does_not_allocate() {
     assert_eq!(stream.tokens(), 64 - prompt, "the answer fills the context");
     drop(stream);
     let long = "hello ".repeat(80);
-    let err = engine.chat(&Request::new(&[Message { role: Role::User, text: &long }])).err();
+    let err = engine.chat("tiny", &Request::new(&[Message { role: Role::User, text: &long }])).err();
     assert!(matches!(err, Some(tachyon::Error::TooLong { context: 64, .. })), "{err:?}");
+    std::fs::remove_dir_all(src).unwrap();
+}
+
+/// Where models `names` are.
+fn tiers<const N: usize>(engine: &Engine, names: [&str; N]) -> [Option<Tier>; N] {
+    names.map(|n| engine.tier(n))
+}
+
+#[test]
+fn models_move_between_tiers_and_answer_the_same() {
+    let src = common::tiny::checkpoint("tiers", 3, common::tiny::E4B);
+    let dir = src.join("out");
+    tachyon::model::convert(&src, &dir).unwrap();
+    let settings = Settings { context: 64, chunk: 8 };
+    let need = tachyon::model::footprint(&dir, &settings).unwrap();
+    let (keep, pin) =
+        (Load { settings, keep_alive: Duration::MAX, pin: false }, Load { settings: Settings { context: 64, chunk: 8 }, keep_alive: Duration::MAX, pin: true });
+    let messages = [Message { role: Role::User, text: "hello there" }];
+    let (vram, host, disk) = (Some(Tier::Vram), Some(Tier::Host), Some(Tier::Disk));
+    // Room for two: a third moves the least recently used to the host tier, from where it answers the same.
+    let mut engine = Engine::new(0, Limits { vram: Some(2 * need + need / 2), host: None }).unwrap();
+    engine.load("a", &dir, &keep).unwrap();
+    engine.load("b", &dir, &keep).unwrap();
+    let want = answer(&mut engine, ("a", None), &messages, 8);
+    engine.load("c", &dir, &keep).unwrap();
+    assert_eq!(tiers(&engine, ["a", "b", "c"]), [vram, host, vram], "b was the least recently used");
+    assert_eq!(answer(&mut engine, ("b", None), &messages, 8), want, "b back from the host tier");
+    assert_eq!(tiers(&engine, ["a", "b", "c"]), [host, vram, vram], "then a was");
+    // A pinned model stays, though the least recently used.
+    engine.load("a", &dir, &pin).unwrap();
+    answer(&mut engine, ("b", None), &messages, 1);
+    answer(&mut engine, ("c", None), &messages, 1);
+    assert_eq!(tiers(&engine, ["a", "b", "c"]), [vram, host, vram], "the pinned a stayed");
+    engine.load("c", &dir, &pin).unwrap();
+    let full = engine.load("d", &dir, &keep).err();
+    assert_eq!(full, Some(tachyon::Error::OutOfMemory { need, free: need / 2 }), "two pinned models leave no room");
+    assert_eq!(engine.tier("d"), None, "a model that does not fit is not loaded");
+    // With no host tier, models leave VRAM for disk: at once after an answer kept zero, or once a keep-alive runs
+    // out; and come back answering the same.
+    let mut engine = Engine::new(0, Limits { vram: None, host: Some(0) }).unwrap();
+    engine.load("a", &dir, &keep).unwrap();
+    assert_eq!(answer(&mut engine, ("a", Some(Duration::ZERO)), &messages, 8), want);
+    assert_eq!(engine.tier("a"), disk, "kept zero");
+    assert_eq!(answer(&mut engine, ("a", Some(Duration::from_millis(50))), &messages, 8), want, "a back from disk");
+    engine.load("m", &dir, &keep).unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    engine.expire().unwrap();
+    assert_eq!(tiers(&engine, ["a", "m"]), [disk, vram], "a's keep-alive ran out; m's never does");
+    assert!(engine.unload("m") && !engine.unload("m") && engine.tier("m").is_none());
     std::fs::remove_dir_all(src).unwrap();
 }
 

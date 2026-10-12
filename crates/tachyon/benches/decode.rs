@@ -92,9 +92,26 @@ fn attend(gpu: &Gpu, suite: &mut Suite, d: usize, cap: u32, ctx: u32) -> Duratio
     let f = gpu.module.function(if d == 256 { ATTEND_256 } else { ATTEND_512 }).unwrap();
     let name = format!("attend {d}, {} of {cap} positions", ctx.min(cap));
     per_launch(gpu, suite, &name, copies.max(LAUNCHES), |st, i| {
-        let (pk, pv, fresh) = (k.ptr() + (i % copies * half) as u64, v.ptr() + (i % copies * half) as u64, 1u32);
-        let args = [arg(&pqkv), arg(&pw), arg(&pw), arg(&pf), arg(&pk), arg(&pv), arg(&pp), arg(&cap), arg(&fresh), arg(&ppart), arg(&pc), arg(&pq), arg(&ps)];
-        // SAFETY: thirteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
+        let (pk, pv, (fresh, group)) = (k.ptr() + (i % copies * half) as u64, v.ptr() + (i % copies * half) as u64, (1u32, 1u32));
+        let win = cap;
+        let args = [
+            arg(&pqkv),
+            arg(&pw),
+            arg(&pw),
+            arg(&pf),
+            arg(&pk),
+            arg(&pv),
+            arg(&pp),
+            arg(&cap),
+            arg(&win),
+            arg(&fresh),
+            arg(&group),
+            arg(&ppart),
+            arg(&pc),
+            arg(&pq),
+            arg(&ps),
+        ];
+        // SAFETY: fifteen arguments of the kernel's types, every buffer sized as the kernel's documentation gives.
         unsafe { st.launch(&f, [KV as u32, splits, 1], [32 * ATTEND_WARPS, 1, 1], 0, &args) }
     })
 }

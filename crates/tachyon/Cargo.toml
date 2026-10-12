@@ -52,5 +52,10 @@ name = "generate"
 harness = false
 required-features = ["gpu"]
 
+[[bench]]
+name = "switch"
+harness = false
+required-features = ["gpu"]
+
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

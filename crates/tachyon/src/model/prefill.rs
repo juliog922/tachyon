@@ -32,12 +32,12 @@ pub(super) struct Chunk {
 /// Lays out prefill's buffers for `chunk` tokens with `take`, which returns the address of `len` new bytes.
 pub(super) fn layout(cfg: &Config, chunk: usize, take: &mut impl FnMut(usize) -> u64) -> Chunk {
     let (d, kv, pl, f) = (cfg.head_dim[1], cfg.kv_heads, cfg.layers() * cfg.per_layer, 4 * chunk.next_multiple_of(GEMM_TOKENS as usize));
-    let widest = cfg.hidden.max(cfg.ffn).max(cfg.heads * d).max(cfg.per_layer);
+    let widest = cfg.hidden.max(cfg.mlp(cfg.layers() - 1)).max(cfg.heads * d).max(cfg.per_layer);
     let x = [take(f * cfg.hidden), take(f * cfg.hidden)];
     let q = [take(f / 4 * widest), take(f / 4 * widest / 8)];
-    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.ffn).max(cfg.hidden).max(pl)));
+    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.mlp(cfg.layers() - 1)).max(cfg.hidden).max(pl)));
     let per_layer = [take(f * pl), take(f * pl), take(f * pl)];
-    Chunk { x, q, qkv, y, per_layer, attend: [take(f * kv * (8 + 4 * d)), take(f * kv)], ids: 0 }
+    Chunk { x, q, qkv, y, per_layer, attend: [take(f * cfg.heads / 4 * (8 + 4 * d)), take(f * cfg.heads / 4)], ids: 0 }
 }
 
 /// `y = X·Mᵀ` over `n` tokens of Q8P input `q`.
@@ -86,14 +86,14 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, c: &Chunk, i: usize, n: u32) -
     let (d, kv) = (cfg.head_dim[g], cfg.kv_heads as u32);
     let (cap, win) = if g == 1 { (b.context, b.context) } else { (b.ring, cfg.window as u32) };
     let (freq, kc, vc, pos) = (b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]);
-    let store = [c.qkv, at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter().chain([A::U(cap)]).collect();
+    let store = [c.qkv, at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter().chain([A::U(cap), A::U(cfg.group())]).collect();
     let ptrs = [c.qkv, at("q_norm"), at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter();
-    let args = ptrs.chain([cap, win, 0].map(A::U)).chain([c.attend[0], c.attend[1], c.q[0], c.q[1]].map(A::P)).collect();
+    let args = ptrs.chain([cap, win, 0, cfg.group()].map(A::U)).chain([c.attend[0], c.attend[1], c.q[0], c.q[1]].map(A::P)).collect();
     let (x0, x1) = (c.x[i % 2], c.x[(i + 1) % 2]);
     vec![
         gemm(w.mat(&format!("{i}.qkv")), c.q, c.qkv, n),
         (if d == 256 { KV_256 } else { KV_512 }, [kv, n, 1], 32, store),
-        (if d == 256 { ATTEND_256P } else { ATTEND_512P }, [kv, 1, n], 32 * ATTEND_WARPS, args),
+        (if d == 256 { ATTEND_256P } else { ATTEND_512P }, [cfg.heads as u32 / 4, 1, n], 32 * ATTEND_WARPS, args),
         gemm(w.mat(&format!("{i}.o")), c.q, c.y, n),
         norm([x0, x1, c.y, at("post_attention_layernorm"), at("pre_feedforward_layernorm")], c.q, cfg.hidden, n, [cfg.eps, 1.0]),
     ]
@@ -103,7 +103,7 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, c: &Chunk, i: usize, n: u32) -
 fn mlp(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2], scalar: f32) -> Vec<Op> {
     let n = n as u32;
     let (h, eps, at) = (cfg.hidden, cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
-    let (x0, x1, (ffn, pl)) = (c.x[i % 2], c.x[(i + 1) % 2], (cfg.ffn, cfg.per_layer));
+    let (x0, x1, (ffn, pl)) = (c.x[i % 2], c.x[(i + 1) % 2], (cfg.mlp(i), cfg.per_layer));
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
     vec![
         gemm(w.mat(&format!("{i}.gate_up")), c.q, c.y, n),

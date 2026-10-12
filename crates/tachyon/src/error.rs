@@ -34,6 +34,17 @@ pub enum Error {
         /// Positions the context holds.
         context: usize,
     },
+    /// A model does not fit the engine's VRAM limit beside the models it may not evict (pinned, or in use).
+    OutOfMemory {
+        /// Bytes the model needs.
+        need: usize,
+        /// Bytes free under the limit once every model that may go has gone.
+        free: usize,
+    },
+    /// No model of this name is loaded.
+    NoModel(String),
+    /// A model needs a feature Tachyon does not run yet; carries the feature.
+    Unsupported(String),
 }
 
 /// `Result` with [`Error`].
@@ -51,6 +62,19 @@ impl fmt::Display for Error {
             Error::Io(errno) => write!(f, "{}", std::io::Error::from_raw_os_error(*errno)),
             Error::Format(why) => write!(f, "invalid weight file: {why}"),
             Error::TooLong { tokens, context } => write!(f, "the prompt has {tokens} tokens; the context holds {context} positions"),
+            Error::OutOfMemory { .. } | Error::NoModel(_) | Error::Unsupported(_) => self.engine(f),
+        }
+    }
+}
+
+impl Error {
+    /// The message of an engine error.
+    fn engine(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::OutOfMemory { need, free } => write!(f, "the model needs {} MiB of VRAM; {} MiB can be freed under the limit", need >> 20, free >> 20),
+            Error::NoModel(name) => write!(f, "no model named {name:?} is loaded"),
+            Error::Unsupported(what) => write!(f, "the model has {what}, which tachyon does not run yet"),
+            _ => Ok(()),
         }
     }
 }

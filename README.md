@@ -30,9 +30,10 @@ cargo run --release -p tachyon-cli -- run ~/.local/share/tachyon/gemma-4-e4b "Wh
 In your program, `tachyon::engine` is the API (see its documentation):
 
 ```rust
-let mut engine = Engine::open("gemma-4-e4b".as_ref(), &Default::default())?;
+let mut engine = Engine::new(0, Limits::default())?;
+engine.load("e4b", "gemma-4-e4b".as_ref(), &Load::default())?;
 let messages = [Message { role: Role::User, text: "Why is the sky blue?" }];
-let mut answer = engine.chat(&Request::new(&messages))?;
+let mut answer = engine.chat("e4b", &Request::new(&messages))?;
 while let Some(text) = answer.next_text()? {
     print!("{text}");
 }

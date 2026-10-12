@@ -42,8 +42,8 @@ pub(super) enum A {
     F(f32),
 }
 
-/// What [`load`] returns: configuration, `weights.wpk` and `host.wpk`, their memory, the layer scalars.
-type Loaded = (Config, [Wpk; 2], DevBuf, HostBuf, Vec<f32>);
+/// A loaded model: configuration, `weights.wpk` and `host.wpk`, their memory, the layer scalars.
+type Loaded<W> = (Config, [Wpk; 2], W, HostBuf, Vec<f32>);
 
 /// What [`scratch`] returns: the token words and prefill's IDs, the control buffer, the arena, and the buffers laid
 /// out in them.
@@ -93,7 +93,17 @@ pub struct Decoder {
     ops: Vec<Op>,
     module: crate::cuda::Module,
     pre: Pre,
-    _keep: (DevBuf, HostBuf),
+    mem: (DevBuf, HostBuf),
+    /// The weights' copy in pinned memory a resumed model keeps, so parking it again copies nothing.
+    shadow: Option<HostBuf>,
+}
+
+/// A model in the host-RAM tier ([`Decoder::park`]): its weights in pinned memory, ready to return to VRAM at full
+/// PCIe speed with [`Parked::resume`], its kernels still compiled.
+pub struct Parked {
+    model: Loaded<HostBuf>,
+    module: crate::cuda::Module,
+    loader: Loader,
 }
 
 /// What prefill builds its launches from: the weight files and where they were loaded, each layer's scalar, the
@@ -141,11 +151,11 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
         base + at as u64
     };
     let (d, kv, l, pl, f) = (cfg.head_dim[1], cfg.kv_heads, cfg.layers(), cfg.layers() * cfg.per_layer, 4);
-    let widest = cfg.hidden.max(cfg.ffn).max(cfg.heads * d).max(cfg.per_layer);
+    let widest = cfg.hidden.max(cfg.mlp(l - 1)).max(cfg.heads * d).max(cfg.per_layer);
     let (x, q) = ([take(f * cfg.hidden), take(f * cfg.hidden)], [take(widest), take(widest / 4)]);
-    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.ffn).max(cfg.hidden).max(pl)));
+    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.mlp(l - 1)).max(cfg.hidden).max(pl)));
     let (ple, pli, proj, logits, work) = (take(f * pl), take(f * pl), take(f * pl), take(f * cfg.vocab), take(f * cfg.vocab));
-    let (partial, count) = ([take(f * kv * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * kv), take(f)]);
+    let (partial, count) = ([take(f * cfg.heads / 4 * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * cfg.heads / 4), take(f)]);
     let caches: Vec<[u64; 2]> = (0..l)
         .map(|i| {
             let len = 2 * kv * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
@@ -199,14 +209,37 @@ impl Weights<'_> {
 impl Decoder {
     /// Loads the model directory `dir` (see [`super::convert`]) onto `ctx`'s GPU, with room for `context` positions.
     pub fn open(ctx: &Context, dir: &Path, settings: &Settings) -> Result<Decoder> {
-        let (stream, module, mut loader) = (ctx.stream()?, ctx.load(&crate::ptx::module())?, Loader::new(ctx)?);
-        let (cfg, [wpk, hpk], weights, host, scalars) = load(ctx, dir, &mut loader)?;
-        let ([tokens, ids], ctl, arena, mut b, chunk) = scratch(ctx, &stream, &cfg, settings)?;
+        let mut loader = Loader::new(ctx)?;
+        let model = load(ctx, dir, &mut loader)?;
+        Decoder::build(ctx.load(&crate::ptx::module())?, loader, model, settings)
+    }
+
+    /// Moves the model to the host-RAM tier: its weights into pinned memory (unless it kept them there, see
+    /// [`Decoder::shadow_bytes`]), its VRAM freed. A generation still running stops first.
+    pub fn park(mut self) -> Result<Parked> {
+        self.stop()?;
+        let weights = if let Some(kept) = self.shadow.take() {
+            kept
+        } else {
+            let mut weights = self.stream.context().alloc_host(self.mem.0.len())?;
+            // SAFETY: `weights` outlives the copy, which `sync` completes.
+            unsafe { self.stream.download(&mut weights, &self.mem.0, 0) }?;
+            self.stream.sync()?;
+            weights
+        };
+        Ok(Parked { model: (self.cfg, self.pre.files, weights, self.mem.1, self.pre.scalars), module: self.module, loader: self.loader })
+    }
+
+    /// The decoder of `model` on `module`'s GPU: its buffers laid out and its step recorded.
+    fn build(module: crate::cuda::Module, loader: Loader, model: Loaded<DevBuf>, settings: &Settings) -> Result<Decoder> {
+        let (cfg, [wpk, hpk], weights, host, scalars) = model;
+        let (ctx, mut steps) = (module.context().clone(), Vec::new());
+        let stream = ctx.stream()?;
+        let ([tokens, ids], ctl, arena, mut b, chunk) = scratch(&ctx, &stream, &cfg, settings)?;
         let bases = [weights.ptr(), host.device_ptr()?];
         let (w, hw) = (Weights { wpk: &wpk, base: bases[0] }, Weights { wpk: &hpk, base: bases[1] });
         // Two recordings with the token words traded: steps alternate between them, so one can be queued while the
         // other runs and the CPU reads each token from its own word.
-        let mut steps = Vec::new();
         for _ in 0..2 {
             steps.push(step(&cfg, [&w, &hw], &b, &scalars, ctx.info().sms));
             b.token.reverse();
@@ -214,10 +247,26 @@ impl Decoder {
         let (graphs, done) = record(&stream, &module, &steps)?;
         let (ops, logits) = (steps.swap_remove(0), b.logits);
         let pre = Pre { files: [wpk, hpk], bases, scalars, bufs: b, chunk, ids, size: settings.chunk };
-        let mut dec =
-            Decoder { graphs, cfg, stream, done, at: 0, tokens, pos: 0, control: ctl, arena, logits, loader, ops, module, pre, _keep: (weights, host) };
+        let mem = (weights, host);
+        let mut dec = Decoder { graphs, cfg, stream, done, at: 0, tokens, pos: 0, control: ctl, arena, logits, loader, ops, module, pre, mem, shadow: None };
         dec.reset(&Sampling::default())?;
         Ok(dec)
+    }
+
+    /// Pinned host memory [`Decoder::park`] leaves it in: its weights and its host table.
+    pub fn parked_bytes(&self) -> usize {
+        self.mem.0.len() + self.mem.1.len()
+    }
+
+    /// Pinned memory held by the copy of its weights a model resumed from the host tier keeps: parking it again
+    /// copies nothing. [`Decoder::drop_shadow`] frees it.
+    pub fn shadow_bytes(&self) -> usize {
+        self.shadow.as_ref().map_or(0, |s| s.len())
+    }
+
+    /// Frees the copy [`Decoder::shadow_bytes`] counts.
+    pub fn drop_shadow(&mut self) {
+        self.shadow = None;
     }
 
     /// The model's configuration.
@@ -350,9 +399,38 @@ impl Decoder {
     }
 }
 
+impl Parked {
+    /// Brings the model back to VRAM with `settings`: one copy of its weights at full PCIe speed, while its buffers
+    /// are laid out and its step recorded, as [`Decoder::open`] does. The pinned copy stays with the decoder (see
+    /// [`Decoder::shadow_bytes`]): freeing pinned memory costs about as much as the copy.
+    pub fn resume(self, settings: &Settings) -> Result<Decoder> {
+        let (cfg, files, parked, host, scalars) = self.model;
+        let ctx = self.module.context().clone();
+        let (weights, copy) = (ctx.alloc(parked.len())?, ctx.stream()?);
+        // SAFETY: `parked` stays alive and unwritten until `sync` below completes the copy, whatever `build` returns.
+        unsafe { copy.upload(&weights, 0, &parked) }?;
+        let built = Decoder::build(self.module, self.loader, (cfg, files, weights, host, scalars), settings);
+        copy.sync()?;
+        let mut dec = built?;
+        dec.shadow = Some(parked);
+        Ok(dec)
+    }
+
+    /// Pinned host memory it holds: its weights and its host table.
+    pub fn bytes(&self) -> usize {
+        self.model.2.len() + self.model.3.len()
+    }
+}
+
+/// VRAM the model in `dir` takes on a GPU with `settings`: its weights and the buffers of its step, prefill and caches.
+pub fn footprint(dir: &Path, settings: &Settings) -> Result<usize> {
+    let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
+    Ok(Wpk::open(dir.join("weights.wpk"))?.data_len() + layout(&cfg, settings, 0).2 + control(&cfg, &Sampling::default()).0.len())
+}
+
 /// The model's configuration and files, its weights in VRAM and its host table in pinned memory, and each layer's
 /// `layer_scalar`.
-fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded> {
+fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded<DevBuf>> {
     let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
     let (wpk, hpk) = (Wpk::open(dir.join("weights.wpk"))?, Wpk::open(dir.join("host.wpk"))?);
     let (weights, mut host) = (ctx.alloc(wpk.data_len())?, ctx.alloc_host(hpk.data_len())?);
@@ -468,14 +546,15 @@ fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u3
 /// MLP's normalized input in `q`.
 fn attention(cfg: &Config, w: &Weights, b: &Bufs, i: usize, sms: u32) -> Vec<Op> {
     let (g, n) = (usize::from(cfg.global[i]), |name: &str| w.at(&format!("{i}.{name}")));
-    let (d, kv, fresh) = (cfg.head_dim[g], cfg.kv_heads as u32, cfg.source(i) == i);
-    let (cap, win, splits) = if g == 1 { (b.context, b.context, sms / kv) } else { (b.ring, cfg.window as u32, 2 * sms / kv) };
+    let (d, blocks, fresh) = (cfg.head_dim[g], (cfg.heads / 4) as u32, cfg.source(i) == i);
+    let (cap, win, splits) = if g == 1 { (b.context, b.context, sms / blocks) } else { (b.ring, cfg.window as u32, 2 * sms / blocks) };
     let ptrs = [b.qkv, n("q_norm"), if fresh { n("k_norm") } else { 0 }, b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]];
-    let args = ptrs.map(A::P).into_iter().chain([A::U(cap), A::U(win), A::U(u32::from(fresh))]).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
+    let args =
+        ptrs.map(A::P).into_iter().chain([cap, win, u32::from(fresh), cfg.group()].map(A::U)).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
     let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
     vec![
         gemv(w.mat(&format!("{i}.qkv")), b.q, b.qkv),
-        (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [kv, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
+        (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [blocks, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
         gemv(w.mat(&format!("{i}.o")), b.q, b.y),
         norm([x0, x1, b.y, n("post_attention_layernorm"), n("pre_feedforward_layernorm")], b.q, [cfg.hidden, 1], [cfg.eps, 1.0]),
     ]
@@ -489,7 +568,7 @@ fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
     vec![
         gemv(w.mat(&format!("{i}.gate_up")), b.q, b.y),
-        geglu(b.y, b.y + 4 * cfg.ffn as u64, b.q, cfg.ffn),
+        geglu(b.y, b.y + 4 * cfg.mlp(i) as u64, b.q, cfg.mlp(i)),
         gemv(w.mat(&format!("{i}.down")), b.q, b.y),
         norm([x1, x0, b.y, n("post_feedforward_layernorm"), 0], b.q, [h, 1], [eps, 1.0]),
         gemv(w.mat(&format!("{i}.per_layer_gate")), b.q, b.y),

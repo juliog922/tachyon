@@ -11,7 +11,7 @@
 mod decode;
 mod prefill;
 
-pub use decode::{Decoder, Settings};
+pub use decode::{Decoder, Parked, Settings, footprint};
 
 use crate::json::Json;
 use crate::quant::{Safetensors, q4};
@@ -25,7 +25,7 @@ use std::path::Path;
 pub struct Config {
     /// Width of the residual stream.
     pub hidden: usize,
-    /// Width of the MLP.
+    /// Width of the MLP; see [`Config::mlp`].
     pub ffn: usize,
     /// Query heads.
     pub heads: usize,
@@ -43,6 +43,8 @@ pub struct Config {
     pub window: usize,
     /// The last this many layers reuse an earlier layer's keys and values.
     pub shared: usize,
+    /// The shared layers' MLPs are twice as wide (E2B's `use_double_wide_mlp`).
+    pub wide: bool,
     /// RoPE base of sliding layers, and of global ones.
     pub theta: [f32; 2],
     /// Share of a global head's dimensions RoPE turns.
@@ -72,6 +74,7 @@ impl Config {
         let c = doc.get("text_config").unwrap_or(&doc);
         let n: Vec<f64> =
             INTS.iter().map(|k| c.get(k).and_then(Json::num).ok_or_else(|| Error::Format(format!("config.json: no {k}")))).collect::<Result<_>>()?;
+        unsupported(c, &n)?;
         let rope = |kind: &str, k: &str, or: f64| c.get("rope_parameters").and_then(|r| r.get(kind)?.get(k)?.num()).unwrap_or(or) as f32;
         let types = c.get("layer_types").and_then(Json::arr).unwrap_or_default();
         Ok(Config {
@@ -85,6 +88,7 @@ impl Config {
             global: types.iter().map(|t| t.str() == Some("full_attention")).collect(),
             window: n[8] as usize,
             shared: c.get("num_kv_shared_layers").and_then(Json::num).unwrap_or(0.0) as usize,
+            wide: c.get("use_double_wide_mlp").and_then(Json::bool).unwrap_or(false),
             theta: [rope("sliding_attention", "rope_theta", 1e4), rope("full_attention", "rope_theta", 1e6)],
             fraction: rope("full_attention", "partial_rotary_factor", 1.0),
             eps: n[9] as f32,
@@ -97,12 +101,37 @@ impl Config {
         self.global.len()
     }
 
+    /// Width of layer `i`'s MLP: twice [`Config::ffn`] in a shared layer of a [`Config::wide`] model.
+    pub fn mlp(&self, i: usize) -> usize {
+        self.ffn << usize::from(self.wide && self.shared < self.layers() && i >= self.layers() - self.shared)
+    }
+
+    /// Attention blocks per key-value head: each takes four query heads.
+    pub fn group(&self) -> u32 {
+        (self.heads / 4 / self.kv_heads) as u32
+    }
+
     /// The layer whose keys and values layer `i` attends over: itself, or for a shared layer the last unshared
     /// layer of its kind.
     pub fn source(&self, i: usize) -> usize {
         let first = self.layers() - self.shared;
         if i < first { i } else { (0..first).rev().find(|&j| self.global[j] == self.global[i]).unwrap_or(i) }
     }
+}
+
+/// Refuses, as [`Error::Unsupported`], what Gemma 4's larger models add (step 12 brings it): `c` is the decoder's
+/// configuration, `n` the numbers [`Config::from_json`] read from it.
+fn unsupported(c: &Json, n: &[f64]) -> Result<()> {
+    let on = |k: &str| c.get(k).and_then(Json::bool) == Some(true);
+    let (global_kv, [heads, kv]) = (c.get("num_global_key_value_heads").and_then(Json::num), [n[2] as usize, n[3] as usize]);
+    let features = [
+        (on("enable_moe_block"), "a mixture-of-experts block (26B A4B)"),
+        (on("attention_k_eq_v"), "values equal to keys in global layers (26B A4B, 31B)"),
+        (n[6] == 0.0, "layers without per-layer inputs (26B A4B, 31B)"),
+        (global_kv.is_some_and(|g| g as usize != kv), "a different number of key-value heads in global layers (26B A4B, 31B)"),
+        (kv == 0 || heads % (4 * kv) != 0, "fewer than four query heads per key-value head (26B A4B, 31B)"),
+    ];
+    features.iter().find(|f| f.0).map_or(Ok(()), |f| Err(Error::Unsupported(f.1.into())))
 }
 
 /// Converts the checkpoint in `src` to a model directory `dst` (see the module documentation).

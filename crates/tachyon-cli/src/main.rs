@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::process::ExitCode;
 use tachyon::cuda::{self, DeviceInfo};
-use tachyon::engine::{Engine, Request};
+use tachyon::engine::{Engine, Limits, Load, Request};
 use tachyon::token::{Message, Role};
 
 const HELP: &str = "tachyon: embedded inference on NVIDIA GPUs
@@ -57,10 +57,11 @@ fn done(r: tachyon::Result<()>) -> ExitCode {
 /// Answers `prompt` with the model in `dir`, greedily, printing the text as it comes, then the speed.
 fn run(dir: &std::path::Path, prompt: &str) -> tachyon::Result<()> {
     use std::io::Write as _;
-    let mut engine = Engine::open(dir, &tachyon::model::Settings::default())?;
+    let mut engine = Engine::new(0, Limits::default())?;
+    engine.load("model", dir, &Load::default())?;
     let messages = [Message { role: Role::User, text: prompt }];
     let start = std::time::Instant::now();
-    let mut answer = engine.chat(&Request::new(&messages))?;
+    let mut answer = engine.chat("model", &Request::new(&messages))?;
     let (prefill, mid) = (start.elapsed(), std::time::Instant::now());
     while let Some(text) = answer.next_text()? {
         print!("{text}");
