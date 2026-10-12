@@ -1,0 +1,8 @@
+//! The parts of the `tachyon` command line that benchmarks and tests reach: [`net`], downloads over HTTPS with
+//! nothing but the standard library, and [`models`], the catalog and the commands that manage models.
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+compile_error!("tachyon targets x86_64 Linux only");
+
+pub mod models;
+pub mod net;

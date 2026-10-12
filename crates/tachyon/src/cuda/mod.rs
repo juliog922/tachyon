@@ -197,22 +197,28 @@ impl Context {
         cu!(cuMemGetInfo(&raw mut free, &raw mut total)).map(|()| (free, total))
     }
 
-    /// `len` bytes of device memory, uninitialized. It comes from the device's memory pool, which keeps the VRAM
-    /// of freed buffers for the next ones: written before, it takes copies at full speed, where fresh VRAM is
-    /// cleared by the driver first (and committed on first write under WSL2). [`Context::trim`] gives it back.
+    /// `len` bytes of device memory, uninitialized.
     pub fn alloc(&self, len: usize) -> Result<DevBuf> {
         let mut ptr = 0;
-        if self.0.pool.is_null() {
-            cu!(cuMemAlloc(&raw mut ptr, len))?;
-        } else {
-            // Allocated in the order of the legacy stream, and ready for every stream once it is synchronized.
-            cu!(cuMemAllocAsync(&raw mut ptr, len, null_mut()))?;
-            cu!(cuStreamSynchronize(null_mut()))?;
-        }
-        Ok(DevBuf { ptr, len, ctx: self.clone() })
+        cu!(cuMemAlloc(&raw mut ptr, len)).map(|()| DevBuf { ptr, len, pooled: false, _ctx: self.clone() })
     }
 
-    /// Gives the VRAM the memory pool keeps from freed buffers back to the system.
+    /// `len` bytes of device memory from the device's memory pool, which keeps the VRAM of freed pooled buffers for
+    /// the next ones: written before, it takes copies at full speed, where fresh VRAM is cleared by the driver first
+    /// (and committed on first write under WSL2). [`Context::trim`] gives it back. Unlike [`Context::alloc`]'s, the
+    /// buffer is freed without waiting for the GPU: it must not be dropped while work that writes it is queued.
+    pub fn alloc_pooled(&self, len: usize) -> Result<DevBuf> {
+        if self.0.pool.is_null() {
+            return self.alloc(len);
+        }
+        let mut ptr = 0;
+        // In the order of the legacy stream, and ready for every stream once that is synchronized.
+        cu!(cuMemAllocAsync(&raw mut ptr, len, null_mut()))?;
+        cu!(cuStreamSynchronize(null_mut()))?;
+        Ok(DevBuf { ptr, len, pooled: true, _ctx: self.clone() })
+    }
+
+    /// Gives the VRAM the memory pool keeps from freed pooled buffers back to the system.
     pub fn trim(&self) -> Result<()> {
         if self.0.pool.is_null() { Ok(()) } else { cu!(cuMemPoolTrimTo(self.0.pool, 0)) }
     }
@@ -262,7 +268,8 @@ impl Context {
 pub struct DevBuf {
     ptr: DevPtr,
     len: usize,
-    ctx: Context,
+    pooled: bool,
+    _ctx: Context,
 }
 
 impl DevBuf {
@@ -284,12 +291,9 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        if self.ctx.0.pool.is_null() {
-            let _ = cu!(cuMemFree(self.ptr));
-        } else {
-            // Like `cuMemFree`, waits for the work that may use it; then it returns to the pool.
-            let _ = cu!(cuCtxSynchronize()).and_then(|()| cu!(cuMemFreeAsync(self.ptr, null_mut())));
-        }
+        // A pooled buffer returns to the pool at once: a wait for the whole context here would break a graph
+        // capture running on another thread.
+        let _ = if self.pooled { cu!(cuMemFreeAsync(self.ptr, null_mut())) } else { cu!(cuMemFree(self.ptr)) };
     }
 }
 

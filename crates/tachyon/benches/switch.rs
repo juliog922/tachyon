@@ -89,21 +89,25 @@ fn memory(ctx: &Context, suite: &mut Suite) {
     });
 }
 
-/// What VRAM costs to take from the memory pool, give back to it, and give back to the system, 1 GiB at a time.
+/// What VRAM costs to take and give back, 1 GiB at a time: allocated plainly, as buffers are, and from the memory
+/// pool, as weights are; and the pool given back to the system.
 fn vram(ctx: &Context, suite: &mut Suite) {
     let len = 1 << 30;
-    suite.run("VRAM alloc, 1 GiB", RUNS, || {
-        let mut buf = None;
-        let t = cpu(|| buf = Some(ctx.alloc(len).unwrap()));
-        drop(buf);
-        t
-    });
-    suite.run("VRAM free, 1 GiB", RUNS, || {
-        let buf = ctx.alloc(len).unwrap();
-        cpu(|| drop(buf))
-    });
+    for (name, pooled) in [("VRAM", false), ("VRAM from the pool", true)] {
+        let alloc = || if pooled { ctx.alloc_pooled(len) } else { ctx.alloc(len) }.unwrap();
+        suite.run(&format!("{name}, alloc 1 GiB"), RUNS, || {
+            let mut buf = None;
+            let t = cpu(|| buf = Some(alloc()));
+            drop(buf);
+            t
+        });
+        suite.run(&format!("{name}, free 1 GiB"), RUNS, || {
+            let buf = alloc();
+            cpu(|| drop(buf))
+        });
+    }
     suite.run("VRAM given back from the pool, 1 GiB", RUNS, || {
-        drop(ctx.alloc(len).unwrap());
+        drop(ctx.alloc_pooled(len).unwrap());
         cpu(|| ctx.trim().unwrap())
     });
 }
@@ -119,7 +123,7 @@ fn copies(ctx: &Context, suite: &mut Suite) -> [f64; 2] {
             if !reuse || dev.is_none() {
                 dev = None;
                 ctx.trim().unwrap();
-                dev = Some(ctx.alloc(LEN).unwrap());
+                dev = Some(ctx.alloc_pooled(LEN).unwrap());
             }
             let to = dev.as_ref().unwrap();
             // SAFETY: `host` outlives the copy, which `sync` completes.

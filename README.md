@@ -4,7 +4,7 @@ An embedded inference engine for NVIDIA GPUs, written in Rust with zero dependen
 
 Tachyon runs a fixed catalog of open-weight models (Gemma 4, Laya, Granite embeddings) inside your process, at the speed the GPU's memory bandwidth allows, and switches between them in tenths of a second. It needs only `libc` and the NVIDIA driver's `libcuda.so.1`, loaded at run time: no CUDA Toolkit, no crates, no Python.
 
-> **Status: step 5 of 14.** The CUDA driver layer, the weight file loader, the decode kernels and the tokenizer are done or under validation: one Gemma 4 E4B token's matrix-vector products stream at 96% (RTX 3060 Laptop) and 98% (L40S) of the measured VRAM bandwidth. The rest of the decode kernels (normalization, gated activation, embeddings, attention, sampling) are done and tested on the GPU; step 6 fuses them into a decode step. Model inference arrives in later steps; see the roadmap below.
+> **Status: step 9 of 14.** Gemma 4 E4B and E2B generate text, prefill on tensor cores and share a GPU, switching in tenths of a second: 108 tok/s on the RTX 3060 Laptop (1.45× llama.cpp), with time to first token 1.1–1.7× faster than llama.cpp's on that laptop and on an L40S. Step 9, under validation, downloads models itself: `tachyon pull` speaks TLS 1.3 and HTTP/1.1 with nothing but `std`. See the roadmap below.
 
 ## Requirements
 
@@ -22,10 +22,15 @@ On WSL2 the driver lives on Windows and is found at `/usr/lib/wsl/lib/libcuda.so
 ```sh
 cargo run --release -p tachyon-cli -- gpu          # the GPUs the driver sees
 cargo run --release -p tachyon-cli -- gpu --json
-hf download google/gemma-4-E4B-it --local-dir ~/models/gemma-4-E4B-it
-cargo run --release -p tachyon-cli -- convert ~/models/gemma-4-E4B-it ~/.local/share/tachyon/gemma-4-e4b
-cargo run --release -p tachyon-cli -- run ~/.local/share/tachyon/gemma-4-e4b "Why is the sky blue?"
+cargo run --release -p tachyon-cli -- doctor       # driver, GPUs, CPU, memory, trust anchors, the Hub
+cargo run --release -p tachyon-cli -- catalog      # the models Tachyon knows
+cargo run --release -p tachyon-cli -- pull         # downloads and converts the model recommended for GPU 0
+cargo run --release -p tachyon-cli -- pull gemma-4-e4b
+cargo run --release -p tachyon-cli -- list
+cargo run --release -p tachyon-cli -- run gemma-4-e4b "Why is the sky blue?"
 ```
+
+`pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 32 MiB ranges, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
 
 In your program, `tachyon::engine` is the API (see its documentation):
 
@@ -62,6 +67,10 @@ crates/tachyon/          the library
   tests/fixtures/        tokenizer fixtures: 10,000 strings and the reference token IDs
   benches/               machine ceilings and the bench harness
 crates/tachyon-cli/      the `tachyon` command
+  src/models.rs          the catalog and pull, list, rm, doctor
+  src/net/               downloads with std only: SHA-256 (SHA-NI), HMAC/HKDF, AES-128-GCM (AES-NI), X25519,
+                         P-256 and RSA verification, X.509 chains, a TLS 1.3 client, HTTP/1.1, the Hub
+  benches/download.rs    SHA-256, AES-GCM, downloads against curl, conversion
 bench/results/<machine>/ benchmark baselines, one directory per machine
 budget.txt               code-line budget of each module
 ci.sh                    every quality gate
@@ -106,9 +115,10 @@ cargo bench -p tachyon --features gpu --bench machine
 cargo bench -p tachyon --features gpu --bench load
 cargo bench -p tachyon --features gpu --bench gemv
 cargo bench -p tachyon --features gpu --bench decode
+cargo bench -p tachyon-cli --bench download
 ```
 
-The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate. The `load` bench writes a test `.wpk` sized to the machine (to `$TACHYON_BENCH_DIR`, default `target/bench`; put it on the disk models load from) and checks the step-2 gate: a staged disk → VRAM load reaches 90% of the slower of the disk and PCIe. The `gemv` bench runs the decode kernel on every Gemma 4 E4B projection and checks the step-3 gate: one token's projections, weighted by the bytes each reads, stream at 90% of the measured VRAM read bandwidth. The `decode` bench times every other decode kernel per launch and reports one token's worth of them against a decode step whose GEMVs run at that bandwidth.
+The `machine` bench measures the ceilings every later target is a fraction of: VRAM read bandwidth (the decode roofline), PCIe in both directions, and the CPU cost of a kernel launch and of a graph replay. It prints a table, writes `target/bench/machine.json`, and checks the step-1 exit gate. The `load` bench writes a test `.wpk` sized to the machine (to `$TACHYON_BENCH_DIR`, default `target/bench`; put it on the disk models load from) and checks the step-2 gate: a staged disk → VRAM load reaches 90% of the slower of the disk and PCIe. The `gemv` bench runs the decode kernel on every Gemma 4 E4B projection and checks the step-3 gate: one token's projections, weighted by the bytes each reads, stream at 90% of the measured VRAM read bandwidth. The `decode` bench times every other decode kernel per launch and reports one token's worth of them against a decode step whose GEMVs run at that bandwidth. The `download` bench fetches the first 256 MiB of Gemma 4 E2B's checkpoint with `curl` and with Tachyon over one connection and over eight, and checks the step-9 gate: over one connection Tachyon is within 5% of `curl`, and SHA-256 outruns every download.
 
 Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=1`; later runs fail when a median is more than 3% slower. The machine name is `$TACHYON_BENCH_MACHINE`, else the host name. For stable numbers, lock the GPU clocks (`nvidia-smi -lgc`) and keep laptops on AC power.
 
@@ -123,9 +133,9 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 4 | Remaining decode kernels | done |
 | 5 | Tokenizer and chat template | done |
 | 6 | Gemma 4 E4B text generation | done: 108 tok/s on the RTX 3060 Laptop, 1.45× llama.cpp |
-| 7 | Prefill on tensor cores | |
-| 8 | Residency, keep-alive, model switching | |
-| 9 | `pull`, catalog, conversion | |
+| 7 | Prefill on tensor cores | done: time to first token 1.1–1.7× faster than llama.cpp |
+| 8 | Residency, keep-alive, model switching | done: Gemma 4 E2B added; back from the host tier at 96% of a copy (L40S) |
+| 9 | `pull`, catalog, conversion | under validation |
 | 10 | ModernBERT encoder: Laya decisions, Granite embeddings | |
 | 11 | Vision and audio inputs | |
 | 12 | Larger tiers: 12B, 31B, FP8, MoE | |

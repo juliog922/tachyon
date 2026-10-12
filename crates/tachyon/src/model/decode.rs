@@ -406,7 +406,7 @@ impl Parked {
     pub fn resume(self, settings: &Settings) -> Result<Decoder> {
         let (cfg, files, parked, host, scalars) = self.model;
         let ctx = self.module.context().clone();
-        let (weights, copy) = (ctx.alloc(parked.len())?, ctx.stream()?);
+        let (weights, copy) = (ctx.alloc_pooled(parked.len())?, ctx.stream()?);
         // SAFETY: `parked` stays alive and unwritten until `sync` below completes the copy, whatever `build` returns.
         unsafe { copy.upload(&weights, 0, &parked) }?;
         let built = Decoder::build(self.module, self.loader, (cfg, files, weights, host, scalars), settings);
@@ -433,7 +433,7 @@ pub fn footprint(dir: &Path, settings: &Settings) -> Result<usize> {
 fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded<DevBuf>> {
     let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
     let (wpk, hpk) = (Wpk::open(dir.join("weights.wpk"))?, Wpk::open(dir.join("host.wpk"))?);
-    let (weights, mut host) = (ctx.alloc(wpk.data_len())?, ctx.alloc_host(hpk.data_len())?);
+    let (weights, mut host) = (ctx.alloc_pooled(wpk.data_len())?, ctx.alloc_host(hpk.data_len())?);
     loader.to_device(&wpk, &weights)?;
     loader.to_host(&hpk, &mut host)?;
     let scalars = scalars(&dir.join("weights.wpk"), &wpk, cfg.layers())?;

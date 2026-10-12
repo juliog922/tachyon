@@ -59,7 +59,6 @@ api! {
     cuDevicePrimaryCtxRetain(*mut Handle, c_int);
     cuDevicePrimaryCtxRelease(c_int);
     cuCtxSetCurrent(Handle);
-    cuCtxSynchronize();
     cuDeviceGetDefaultMemPool(*mut Handle, c_int);
     cuMemPoolSetAttribute(Handle, c_int, *mut c_void);
     cuMemPoolTrimTo(Handle, usize);

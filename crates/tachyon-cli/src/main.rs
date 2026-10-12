@@ -7,40 +7,103 @@ use std::process::ExitCode;
 use tachyon::cuda::{self, DeviceInfo};
 use tachyon::engine::{Engine, Limits, Load, Request};
 use tachyon::token::{Message, Role};
+use tachyon_cli::models;
 
 const HELP: &str = "tachyon: embedded inference on NVIDIA GPUs
 
 Usage: tachyon <command> [--json]
 
 Commands:
+  catalog                      List the models Tachyon knows, and which are pulled
+  recommend                    Name the model to pull for GPU 0
+  pull <name> [--keep]         Download a model from Hugging Face and convert it (--keep: keep the checkpoint)
+  list                         List the pulled models
+  rm <name>                    Remove a pulled model
+  run <model> <prompt>         Answer one prompt, greedily, and report the speed (a name or a directory)
   gpu                          List the GPUs the driver sees
+  doctor                       Check the driver, GPUs, CPU, memory, certificates and the connection to Hugging Face
   convert <checkpoint> <model> Convert a Hugging Face Gemma 4 checkpoint directory to a model directory
-  run <model> <prompt>         Answer one prompt, greedily, and report the speed
   version                      Print the version
   help                         Print this help
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let json = args.iter().any(|a| a == "--json");
-    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-    match words.first().copied() {
-        Some("gpu") => gpu(json),
-        Some("convert") if words.len() == 3 => done(tachyon::model::convert(words[1].as_ref(), words[2].as_ref())),
-        Some("run") if words.len() == 3 => done(run(words[1].as_ref(), words[2])),
-        Some("version" | "--version" | "-V") => {
+    let (json, keep) = (args.iter().any(|a| a == "--json"), args.iter().any(|a| a == "--keep"));
+    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| !["--json", "--keep"].contains(a)).collect();
+    models_command(&words, keep).unwrap_or_else(|| command(&words, json))
+}
+
+/// Runs the model-management command of `words`, if it is one.
+fn models_command(words: &[&str], keep: bool) -> Option<ExitCode> {
+    Some(match words {
+        ["catalog"] => {
+            models::catalog();
+            ExitCode::SUCCESS
+        }
+        ["recommend"] => recommend(),
+        ["pull", name] => finished(models::pull(name, keep)),
+        ["list"] => {
+            models::list();
+            ExitCode::SUCCESS
+        }
+        ["rm", name] => finished(models::rm(name)),
+        ["doctor"] => ExitCode::from(u8::from(!models::doctor())),
+        _ => return None,
+    })
+}
+
+/// Runs any other command of `words`.
+fn command(words: &[&str], json: bool) -> ExitCode {
+    match words {
+        ["gpu"] => gpu(json),
+        ["convert", from, to] => done(tachyon::model::convert(from.as_ref(), to.as_ref())),
+        ["run", model, prompt] => done(run(&model_dir(model), prompt)),
+        ["version" | "--version" | "-V"] => {
             println!("tachyon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        None | Some("help" | "--help" | "-h") => {
+        [] | ["help" | "--help" | "-h"] => {
             print!("{HELP}");
             ExitCode::SUCCESS
         }
-        Some(other) => {
+        [other, ..] => {
             eprint!("error: unknown command or arguments '{other}'\n\n{HELP}");
             ExitCode::from(2)
         }
     }
+}
+
+/// A pulled model's directory when `name` is one, else `name` as a path.
+fn model_dir(name: &str) -> std::path::PathBuf {
+    let pulled = models::home().join(name);
+    if !name.contains('/') && pulled.join("weights.wpk").exists() { pulled } else { name.into() }
+}
+
+/// The model to pull for GPU 0.
+fn recommend() -> ExitCode {
+    match cuda::device(0) {
+        Ok(d) => {
+            let pick = models::recommend(d.vram).map_or("none of the catalog fits", |m| m.name);
+            println!("{pick}: for the {} with {:.1} GiB", d.name, d.vram as f64 / f64::from(1 << 30));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(3)
+        }
+    }
+}
+
+/// Success, or the I/O error printed and failure.
+fn finished(r: std::io::Result<()>) -> ExitCode {
+    r.map_or_else(
+        |e| {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        },
+        |()| ExitCode::SUCCESS,
+    )
 }
 
 /// Success, or the error printed and failure.

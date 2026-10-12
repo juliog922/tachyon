@@ -9,9 +9,17 @@ license.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+name = "tachyon_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tachyon"
 path = "src/main.rs"
+
+[[bench]]
+name = "download"
+harness = false
 
 [dependencies]
 tachyon = { path = "../tachyon", version = "0.1.0" }

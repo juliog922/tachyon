@@ -7,7 +7,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Changed
 
 - `tachyon run` takes a catalog name (`gemma-4-e4b`) as well as a model directory.
-- Device memory comes from the GPU's memory pool, which keeps freed VRAM for the process until `Context::trim` gives it back: a model returning from the host tier reuses the VRAM the last one left instead of fresh VRAM, which the driver clears first (the L40S copies into fresh VRAM at 70% of the rate). `Engine::unload`, and `Engine::expire` when a keep-alive runs out, give VRAM back to the system; a model moved out to make room does not. GPUs without memory pools allocate as before. The `switch` bench reports the cost of giving VRAM back.
+- Model weights take VRAM from the GPU's memory pool (`Context::alloc_pooled`), which keeps freed VRAM for the process until `Context::trim` gives it back: a model returning from the host tier reuses the VRAM the last one left instead of fresh VRAM, which the driver clears first (the L40S copies into fresh VRAM at 70% of the rate). `Engine::unload`, and `Engine::expire` when a keep-alive runs out, give VRAM back to the system; a model moved out to make room does not. GPUs without memory pools allocate as before. The `switch` bench reports the cost of giving VRAM back.
 
 - Attention kernels take a `group` argument and launch a block per four query heads (`ptx::HEADS_PER_BLOCK`, was `HEADS_PER_KV`); `KV_256`/`KV_512` take `group` too. The `decode` bench passes the window it had been missing since step 7.
 - `Engine::open` is gone: an engine is made with `Engine::new` and loads models by name.
