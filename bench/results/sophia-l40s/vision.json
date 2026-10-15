@@ -1,0 +1,74 @@
+[
+    {
+        "name": "tower, 63 soft tokens",
+        "median_ns": 18712869,
+        "p99_ns": 19052263,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "tower, 130 soft tokens",
+        "median_ns": 29209281,
+        "p99_ns": 29620838,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "tower, 266 soft tokens",
+        "median_ns": 46867574,
+        "p99_ns": 47445900,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "tower, 540 soft tokens",
+        "median_ns": 83412280,
+        "p99_ns": 84264935,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "tower, 1064 soft tokens",
+        "median_ns": 126987392,
+        "p99_ns": 148869005,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "first token, image at 70",
+        "median_ns": 26188897,
+        "p99_ns": 26724235,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "first token, image at 280",
+        "median_ns": 51277181,
+        "p99_ns": 52114384,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "first token, no image",
+        "median_ns": 12113270,
+        "p99_ns": 12118577,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]
