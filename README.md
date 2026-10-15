@@ -45,7 +45,7 @@ cargo run --release -p tachyon-cli -- pull granite-embedding-311m
 cargo run --release -p tachyon-cli -- embed granite-embedding-311m --dims=256 "how do I get a refund"
 ```
 
-Laya comes in three checkpoints, each pulled by name: `laya-multilingual` (100+ languages, the default choice), `laya-english` (ModernBERT-large, the most accurate in English) and `laya-typed-decisions` (fine-tuned on four triage workflows). Tachyon does not route between them as the `laya` package's `Router` does: name the one to use. Granite comes in two sizes, `granite-embedding-311m` and `granite-embedding-97m` (384 dims, the fastest); their layers run in 8-bit (Q8).
+Laya comes in three checkpoints, each pulled by name: `laya-multilingual` (100+ languages, the default choice), `laya-english` (ModernBERT-large, the most accurate in English) and `laya-typed-decisions` (fine-tuned on four triage workflows). Tachyon does not route between them as the `laya` package's `Router` does: name the one to use. Granite comes in two sizes, `granite-embedding-311m` and `granite-embedding-97m` (384 dims, the fastest); the 311M's layers run in 8-bit (Q8), the 97M's in f16, as Q8 costs it too much precision.
 
 `pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 8 MiB chunks, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
 
@@ -87,7 +87,7 @@ crates/tachyon/          the library
   benches/               machine ceilings and the bench harness
   src/encoder/mod.rs     ModernBERT encoders (Laya multilingual, Granite Embedding 311M): configuration
   src/encoder/laya.rs    Laya's question sequences, head settings and probabilities
-  src/encoder/convert.rs encoder checkpoints to model directories: f16, Granite's layers in Q8
+  src/encoder/convert.rs encoder checkpoints to model directories: f16, Granite 311M's layers in Q8
   src/encoder/run.rs     the encoder on the GPU: packed sequences, embeddings, Laya's logits
   src/encoder/race.rs    which product kernel each shape takes, raced on the GPU
   src/ptx/encoder.rs     the encoder's kernels: f16 and Q8 tensor-core products, layer norm, attention

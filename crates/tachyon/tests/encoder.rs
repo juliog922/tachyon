@@ -60,6 +60,7 @@ fn gelu(x: f32) -> f32 {
 
 /// Attention of each head over the rows of `q`, `k`, `v` (`n` rows of `heads × d`), each row seeing the rows within
 /// `window` of it, or all of them; RoPE at base `theta` first, if any.
+#[allow(dead_code)]
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -401,12 +402,13 @@ fn the_gpu_encoder_matches_the_reference_on_the_tiny_laya() {
     }
 }
 
-/// The tiny Laya's encoder alone, so converted as an embedding model, with its layers' matrices in Q8: every
+/// The tiny Laya's encoder alone, converted as an embedding model with its layers' matrices in Q8 (too narrow to have
+/// them by default): every
 /// token's hidden state within a cosine of 0.99999 of the float32 reference's (a random model's layers add little).
 #[cfg(feature = "gpu")]
 #[test]
 fn the_q8_encoder_follows_the_reference_on_the_tiny_model() {
-    use tachyon::encoder::{Encoder, Settings, convert};
+    use tachyon::encoder::{Encoder, Settings, convert_with};
     let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let (src, dir) = (tmp.join("tiny-embedder"), tmp.join("tiny-embedder-q8"));
     std::fs::create_dir_all(&src).unwrap();
@@ -417,7 +419,7 @@ fn the_q8_encoder_follows_the_reference_on_the_tiny_model() {
     let n = u64::from_le_bytes(file[..8].try_into().unwrap()) as usize;
     let header = String::from_utf8(file[8..8 + n].to_vec()).unwrap().replace("\"encoder.", "\"");
     std::fs::write(src.join("model.safetensors"), [&(header.len() as u64).to_le_bytes()[..], header.as_bytes(), &file[8 + n..]].concat()).unwrap();
-    convert(&src, &dir).unwrap();
+    convert_with(&src, &dir, Some(true)).unwrap();
     let wpk = tachyon::wpk::Wpk::open(dir.join("weights.wpk")).unwrap();
     assert!(wpk.tensor("1.up").is_some_and(|t| t.dtype == tachyon::wpk::Dtype::I8) && wpk.tensor("1.up.scale").is_some());
     let ctx = tachyon::cuda::Context::new(0).unwrap();
@@ -447,9 +449,9 @@ fn converted(name: &str) -> std::path::PathBuf {
 }
 
 /// A Laya checkpoint (`$TACHYON_MODELS/name`) on the GPU against the float32 references of all 500 cases (fixture
-/// `reference`): probabilities within 2e-4 on average and 1e-2 at most, the same answer in at least 499.
+/// `reference`): probabilities within `bounds` (on average, at most), the same answer in at least 499.
 #[cfg(all(feature = "gpu", feature = "models"))]
-fn laya_matches(name: &str, reference: &str) {
+fn laya_matches(name: &str, reference: &str, bounds: [f64; 2]) {
     use tachyon::encoder::laya::{Kind, probabilities};
     use tachyon::encoder::{Encoder, Settings};
     let ctx = tachyon::cuda::Context::new(0).unwrap();
@@ -475,29 +477,32 @@ fn laya_matches(name: &str, reference: &str) {
     }
     let mean = sum / f64::from(count);
     println!("{name} on the GPU: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/{}", cases.len());
-    assert!(mean <= 2e-4 && worst <= 1e-2 && same >= 499, "{name}: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/500");
+    let [most_mean, most] = bounds;
+    assert!(mean <= most_mean && worst <= most && same >= 499, "{name}: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/500");
 }
 
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn laya_on_the_gpu_matches_the_reference() {
-    laya_matches("laya-multilingual", "laya-multilingual.ref");
+    laya_matches("laya-multilingual", "laya-multilingual.ref", [2e-4, 1e-2]);
 }
 
-/// Laya English: ModernBERT-large, its byte-level tokenizer, sequences of up to 512 tokens.
+/// Laya English: ModernBERT-large, its byte-level tokenizer, sequences of up to 512 tokens. `f16` rounding of its
+/// matrices alone moves a probability by up to 2.4e-2 (1.4e-4 on average), so the bounds are those of the study
+/// with room, still tighter than the `laya` package's own bf16 (6.5e-2, 1.1e-3).
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn laya_english_on_the_gpu_matches_the_reference() {
-    laya_matches("laya", "laya-english.ref");
+    laya_matches("laya", "laya-english.ref", [3e-4, 3e-2]);
 }
 
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn laya_typed_decisions_on_the_gpu_matches_the_reference() {
-    laya_matches("laya-typed-decisions", "laya-typed-decisions.ref");
+    laya_matches("laya-typed-decisions", "laya-typed-decisions.ref", [2e-4, 1e-2]);
 }
 
-/// A Granite Embedding checkpoint (`$TACHYON_MODELS/name`, its layers in Q8) on the GPU against the 54 float32
+/// A Granite Embedding checkpoint (`$TACHYON_MODELS/name`) on the GPU against the 54 float32
 /// references of fixture `reference`, its inputs as they are: cosine ≥ 0.9999 each.
 #[cfg(all(feature = "gpu", feature = "models"))]
 fn granite_matches(name: &str, reference: &str) {
@@ -521,7 +526,8 @@ fn granite_on_the_gpu_matches_the_reference() {
     granite_matches("granite-embedding-311m-multilingual-r2", "granite-311m.ref");
 }
 
-/// Granite 97M: heads of 32, a gated `SiLU`, `<|startoftext|>` and `<|return|>` around each text.
+/// Granite 97M: heads of 32, a gated `SiLU`, `<|startoftext|>` and `<|return|>` around each text; its layers in
+/// `f16`, as it is too narrow for Q8.
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn granite_97m_on_the_gpu_matches_the_reference() {

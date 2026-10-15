@@ -12,7 +12,7 @@ pub(crate) mod race;
 mod run;
 mod text;
 
-pub use convert::convert;
+pub use convert::{convert, convert_with};
 pub use run::{Encoder, footprint};
 
 use crate::json::Json;

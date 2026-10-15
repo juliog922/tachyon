@@ -4,8 +4,8 @@
 //!
 //! `weights.wpk`: `embed_norm`, per layer `{i}.attn_norm` (not layer 0), `{i}.qkv`, `{i}.o`, `{i}.mlp_norm`,
 //! `{i}.up` (`Wi`), `{i}.down` (`Wo`), and `final_norm`; matrices `f16 [rows, cols]` as PyTorch's `Linear` holds
-//! them, norms `f32`. An embedding model's layers take 8-bit weights instead (spec, step 10e): each matrix `i8`
-//! with its scales `{name}.scale`, `f32 [rows, cols / 64]` ([`crate::quant::q8e`]). A Laya checkpoint adds its head: `type_emb` (`f32 [3, h]`); per head layer `h{l}.norm1.w`,
+//! them, norms `f32`. An embedding model at least [`Q8_WIDTH`] wide takes 8-bit weights in its layers instead (spec,
+//! step 10e): each matrix `i8` with its scales `{name}.scale`, `f32 [rows, cols / 64]` ([`crate::quant::q8e`]). A Laya checkpoint adds its head: `type_emb` (`f32 [3, h]`); per head layer `h{l}.norm1.w`,
 //! `.b`, `h{l}.qkv.w`, `.b`, `h{l}.o.w`, `.b`, `h{l}.norm2.w`, `.b`, `h{l}.up.w`, `.b`, `h{l}.down.w`, `.b`; and
 //! `score.norm.w`, `.b`, `score.1.w`, `.b`, `score.2.w`, `.b`, the last padded with zeros to 64 rows for the
 //! matrix product. `host.wpk`: `embed`, the token embeddings, `f16 [vocab, h]`.
@@ -23,33 +23,54 @@ use crate::wpk::{Dtype, Writer};
 use crate::{Error, Result};
 use std::path::Path;
 
+/// The narrowest embedding model whose layers take 8-bit weights. The precision study (`scripts/encoders.py`) puts
+/// Granite 311M (768 wide) at a lowest cosine of 0.999926 in Q8, within the tests' 0.9999, and Granite 97M (384) at
+/// 0.998635, which stays in `f16` (1.000000).
+const Q8_WIDTH: usize = 768;
 /// Rows the last scorer layer is padded to.
 const PAD: usize = 64;
 
 /// Converts the encoder checkpoint in `src` (Laya or Granite Embedding, see the module documentation) to a model
 /// directory `dst`.
 pub fn convert(src: &Path, dst: &Path) -> Result<()> {
+    convert_with(src, dst, None)
+}
+
+/// [`convert`], with 8-bit layers if `q8` says so; by default an embedding model at least 768 wide has them.
+pub fn convert_with(src: &Path, dst: &Path, q8: Option<bool>) -> Result<()> {
     let laya = src.join("rl_agent_config.json").exists();
     let dir = if laya && src.join("encoder").is_dir() { src.join("encoder") } else { src.to_path_buf() };
     let st = Safetensors::open(src)?;
     let p = if laya { "encoder." } else { st.prefix("embeddings.norm.weight") };
     std::fs::create_dir_all(dst)?;
-    write(dst, &st, (&dir.join("config.json"), p), laya.then(|| src.join("rl_agent_config.json")).as_deref())?;
+    let source = Source { config: dir.join("config.json"), prefix: p, head: laya.then(|| src.join("rl_agent_config.json")), q8 };
+    write(dst, &st, &source)?;
     tokenizer(&src.join(if laya { "tokenizer/tokenizer.json" } else { "tokenizer.json" }), dst)
 }
 
-/// Writes into `dst` the encoder's `config.json` (from `config`), `weights.wpk`, with Laya's head when `head` names
-/// its configuration (copied as `head.json`), and `host.wpk`; the encoder's names start with `p`.
-fn write(dst: &Path, st: &Safetensors, (config, p): (&Path, &str), head: Option<&Path>) -> Result<()> {
-    let text = std::fs::read(config)?;
+/// Writes into `dst` the encoder's `config.json`, `weights.wpk`, with Laya's head when the source has one (its
+/// configuration copied as `head.json`), and `host.wpk`.
+fn write(dst: &Path, st: &Safetensors, source: &Source) -> Result<()> {
+    let text = std::fs::read(&source.config)?;
     std::fs::write(dst.join("config.json"), &text)?;
     let mut w = Writer::create(dst.join("weights.wpk"))?;
-    encoder(&mut w, st, &Config::from_json(&text)?, (p, head.is_none()))?;
-    if let Some(path) = head {
+    let cfg = Config::from_json(&text)?;
+    let p = source.prefix;
+    encoder(&mut w, st, &cfg, (p, source.q8.unwrap_or(source.head.is_none() && cfg.hidden >= Q8_WIDTH)))?;
+    if let Some(path) = &source.head {
         laya(&mut w, st, path, dst)?;
     }
     w.finish()?;
     host(dst, st, p)
+}
+
+/// Where a checkpoint holds an encoder's parts: its `config.json`, its tensors' names' prefix, Laya's head
+/// configuration if it has one; and whether its layers take 8-bit weights (`None`: as [`Q8_WIDTH`] says).
+struct Source<'a> {
+    config: std::path::PathBuf,
+    prefix: &'a str,
+    head: Option<std::path::PathBuf>,
+    q8: Option<bool>,
 }
 
 /// Writes `host.wpk`, the token embeddings, into `dst`.
