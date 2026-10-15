@@ -1,0 +1,1 @@
+clip-0.wav and clip-1.wav: LibriSpeech (V. Panayotov, G. Chen, D. Povey, S. Khudanpur, ICASSP 2015), CC BY 4.0, https://www.openslr.org/12 , taken from hf-internal-testing/librispeech_asr_dummy (validation, clean). soft-clip-*.f16 and speech.ref are derived from them.

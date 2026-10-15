@@ -232,9 +232,10 @@ fn numbers(case: &Json, key: &str) -> Vec<f64> {
 
 /// E4B with the tower's soft tokens against Hugging Face's bfloat16 decoder with the float32 tower's, on the 3
 /// images at 70 and 280 soft tokens: the chat template gives the reference's tokens; fed the prompt and each
-/// reference answer token by token, its pick after every token agrees with the reference's on ≥ 80% of the
-/// positions (text alone reaches 86% with 4-bit weights; the answers here are ~170 tokens, so a few picks move the
-/// figure). Prefill takes chunks of 128 tokens, so the 280-token images cross two chunk boundaries. Disagreements
+/// reference answer token by token, its pick after every token agrees with the reference's on ≥ 78% of the
+/// positions. That bound is what 4-bit weights allow, measured by `scripts/agreement.py` on `vision.ref`: Hugging
+/// Face's model with its weights rounded as Tachyon rounds them, and its activations to 8 bits, agrees on 80.2%
+/// (Tachyon measured 80.8%); the answers are 172 tokens, so the bound sits four picks below. Prefill takes chunks of 128 tokens, so the 280-token images cross two chunk boundaries. Disagreements
 /// where the reference was sure (a gap of 2 or more) are printed.
 #[cfg(feature = "models")]
 #[test]
@@ -271,7 +272,7 @@ fn the_decoder_answers_about_images_as_hugging_face_does() {
         (agree, total) = (agree + mine, total + answer.len());
     }
     println!("top-1 agreement {agree}/{total} ({:.2}%)", 100.0 * agree as f64 / total as f64);
-    assert!(agree as f64 >= 0.80 * total as f64);
+    assert!(agree as f64 >= 0.78 * total as f64);
 }
 
 /// The engine answers about an image: E4B, loaded with images at 70 soft tokens, describes the photo; its prompt
