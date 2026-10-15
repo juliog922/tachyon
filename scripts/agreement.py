@@ -5,14 +5,21 @@ rounds them, and with alternatives. Each variant reads every prompt and referenc
 best token after each answer position, as the engine test does. If Tachyon's own figure matches "q4 g64 /7 + q8",
 the engine computes what its weights allow.
 
+With `vision.ref` (`scripts/media.py vision`), each answer is about an image: the float32 tower's soft tokens fill
+its slots, as they did for the reference, and only the decoder's weights are rounded.
+
     python3 scripts/agreement.py ~/models/gemma-4-E4B-it crates/tachyon/tests/fixtures/gemma-4-e4b.ref
+    python3 scripts/agreement.py ~/models/gemma-4-E4B-it crates/tachyon/tests/fixtures/media/vision.ref
 """
 
 import json
+import os
 import sys
 
 import torch
 from transformers import Gemma4ForConditionalGeneration
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def q4(w, group, divisors):
@@ -39,13 +46,39 @@ def q8(x):
     return ((b / torch.where(s == 0, 1, s)).round() * s).reshape(x.shape).to(x.dtype)
 
 
-def agreement(model, lines):
-    agree = total = 0
+def soft_tokens(src, lines):
+    """Each `vision.ref` line's float32 soft tokens, as `scripts/media.py vision` made them."""
+    from PIL import Image, ImageOps
+    from transformers import AutoProcessor
+    from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+    import media
+    proc = AutoProcessor.from_pretrained(src)
+    model = Gemma4ForConditionalGeneration.from_pretrained(src, dtype=torch.float32).cuda().eval()
+    out = []
     for j in lines:
-        ids = torch.tensor([j["prompt"] + j["answer"]], device="cuda")
+        img = ImageOps.exif_transpose(Image.open(os.path.join(media.ROOT, j["image"]))).convert("RGB")
+        proc.image_processor = Gemma4ImageProcessorPil(max_soft_tokens=j["budget"])
+        enc = proc(text=[j["prompt"]], images=[[img]], return_tensors="pt").to("cuda")
+        assert enc["input_ids"][0].tolist() == j["ids"], j["image"]
         with torch.no_grad():
-            logits = model(input_ids=ids).logits[0]
-        n = len(j["prompt"])
+            out.append(model.model.get_image_features(enc["pixel_values"], enc["image_position_ids"]).pooler_output[0].float().cpu())
+    del model
+    torch.cuda.empty_cache()
+    return out
+
+
+def agreement(model, lines, soft):
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+    agree = total = 0
+    for k, j in enumerate(lines):
+        prompt = j.get("ids", j["prompt"])
+        ids = torch.tensor([prompt + j["answer"]], device="cuda")
+        extra = {}
+        if soft:
+            extra["mm_encoder_outputs"] = {"image": BaseModelOutputWithPooling(pooler_output=(soft[k].to("cuda", torch.bfloat16),))}
+        with torch.no_grad():
+            logits = model(input_ids=ids, **extra).logits[0]
+        n = len(prompt)
         picks = logits[n - 1 : n - 1 + len(j["answer"])].argmax(-1).tolist()
         agree += sum(p == a for p, a in zip(picks, j["answer"]))
         total += len(j["answer"])
@@ -54,11 +87,13 @@ def agreement(model, lines):
 
 def main(src, ref):
     lines = [json.loads(l) for l in open(ref)]
+    soft = soft_tokens(src, lines) if "image" in lines[0] else None
     variants = [
         ("bf16", None, False),
         ("q4 g64 /7 (Tachyon)", (64, [7]), False),
-        ("q4 g64 /7 + q8 (Tachyon)", (64, [7]), True),
+        ("q4 g64 /7 + q8", (64, [7]), True),
         ("q4 g64 best scale", (64, [6 + i / 4 for i in range(13)]), False),
+        ("q4 g64 best scale + q8 (Tachyon)", (64, [6 + i / 4 for i in range(13)]), True),
         ("q4 g32 /7", (32, [7]), False),
         ("q4 g32 best scale", (32, [6 + i / 4 for i in range(13)]), False),
     ]
@@ -71,7 +106,7 @@ def main(src, ref):
         if acts:
             for mod in [m for m in lm.modules() if isinstance(m, torch.nn.Linear)] + [model.lm_head]:
                 mod.register_forward_pre_hook(lambda _, a: (q8(a[0]),) + a[1:])
-        agree, total = agreement(model, lines)
+        agree, total = agreement(model, lines, soft)
         print(f"{name:<28} {agree}/{total} ({100 * agree / total:.2f}%)", flush=True)
         del model
         torch.cuda.empty_cache()

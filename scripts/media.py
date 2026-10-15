@@ -17,6 +17,22 @@ bf16 and to f16, and prints how far the soft tokens move and the largest value a
 tokens through the chat template, the float32 soft tokens' file (`soft-<image>-<budget>.f16`, `f16 [n, 2560]`, for
 the 70-token runs) and the decoder's greedy answer in bfloat16 to those soft tokens, with the margin of each token.
 
+`python3 scripts/media.py audio [~/models/gemma-4-E4B-it]` writes the audio fixtures: WAV files of every sample
+format Tachyon reads (8-bit unsigned to 64-bit float, plain and `WAVE_FORMAT_EXTENSIBLE`, mono and stereo, an extra
+chunk before the data) and `audio.ref`, one JSON line per file: its rate, its samples and the FNV-1a 64 of them as
+`f32` (`soundfile`'s scaling, `v / 2^(bits-1)`, 8 bits `(v - 128) / 128`; channels averaged as `librosa.to_mono`
+does), and for the 16 kHz files the log-mel features of Gemma 4's feature extractor (`mel-<name>.f32`, `f32 [frames,
+128]`). With a checkpoint, its feature extractor's settings are checked against the defaults Tachyon implements.
+Needs numpy and transformers.
+
+`python3 scripts/media.py speech ~/models/gemma-4-E4B-it clip.wav...` is the audio tower's precision study and
+references (as `vision`'s), on speech clips of 16 kHz mono 16-bit WAV (up to 30 s; `ffmpeg -i in -ac 1 -ar 16000
+-c:a pcm_s16le out.wav` makes one), copied into the fixtures. It runs the audio tower and its projection in float32
+and with every linear and convolution layer's weight and input rounded to bf16 and to f16, printing how far the soft
+tokens move and the largest values layers read, write and leave in the residual stream. Then `speech.ref`: per clip
+the prompt's tokens (the question, then the audio), the float32 soft tokens' file (`soft-<clip>.f16`), and the
+decoder's greedy answer in bfloat16 with the float32 tower, with each token's margin.
+
 `python3 scripts/media.py inspect ~/models/gemma-4-E4B-it` prints what converting the vision tower needs to know: its
 tensors (layer 0's, as every layer has the same), whether the clip bounds of linear layers reading the same input
 agree (so they can share one product), and the pad token's embedding row.
@@ -219,11 +235,13 @@ ANSWER = 32
 
 
 class Rounded:
-    """Within the block, every linear layer under `modules` sees its weight and its input rounded to `dtype`."""
+    """Within the block, every linear and convolution layer under `modules` sees its weight and its input rounded to
+    `dtype`."""
 
     def __init__(self, modules, dtype):
         import torch
-        self.linears = [m for mod in modules for m in mod.modules() if isinstance(m, torch.nn.Linear)]
+        kinds = (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d)
+        self.linears = [m for mod in modules for m in mod.modules() if isinstance(m, kinds)]
         self.dtype, self.saved, self.hooks = dtype, [], []
 
     def round(self, x):
@@ -244,14 +262,19 @@ class Rounded:
 
 
 def extremes(modules):
-    """Hooks recording the largest |value| any linear layer under `modules` reads and writes."""
+    """Hooks recording the largest |value| any linear or convolution layer under `modules` reads and writes, and any
+    audio layer leaves in the residual stream."""
     import torch
     seen = {"in": 0.0, "out": 0.0}
 
     def hook(_, args, out):
         seen["in"] = max(seen["in"], float(args[0].abs().max()))
         seen["out"] = max(seen["out"], float(out.abs().max()))
-    hooks = [m.register_forward_hook(hook) for mod in modules for m in mod.modules() if isinstance(m, torch.nn.Linear)]
+    def layer(_, args, out):
+        seen["stream"] = max(seen.get("stream", 0.0), float(out.abs().max()))
+    kinds = (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d)
+    hooks = [m.register_forward_hook(hook) for mod in modules for m in mod.modules() if isinstance(m, kinds)]
+    hooks += [m.register_forward_hook(layer) for mod in modules for m in mod.modules() if type(m).__name__.endswith("AudioLayer")]
     return seen, hooks
 
 
@@ -358,11 +381,172 @@ def inspect(checkpoint):
         print("pad (token 0) embedding row: max |v| %.6g, norm %.6g" % (float(emb[0][0].abs().max()), float(emb[0][0].float().norm())))
 
 
+def sound(n, rate, seed):
+    """`n` samples at `rate` of tones, a chirp and noise, peaking at 0.9: something for every mel bin."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / rate
+    x = 0.3 * np.sin(2 * np.pi * 440 * t) + 0.2 * np.sin(2 * np.pi * 2500 * t + 1) + 0.2 * np.sin(2 * np.pi * (100 + 3000 * t) * t)
+    x += rng.normal(0, 0.05, n) * (1 + np.sin(2 * np.pi * 3 * t))
+    return 0.9 * x / np.abs(x).max()
+
+
+def wav(path, x, rate, tag, bits, extensible=False, extra=False):
+    """Writes `x` (`[n, channels]` in [-1, 1]) as a WAV file of format `tag` (1 integers, 3 floats) and `bits`; returns
+    the samples as Tachyon reads them, `f32`, channels averaged."""
+    full = 2 ** (bits - 1)
+    if tag == 3:
+        data = x.astype("<f4" if bits == 32 else "<f8")
+        read = data.astype(np.float32)
+    elif bits == 8:
+        data = np.clip(np.round(x * 128) + 128, 0, 255).astype(np.uint8)
+        read = (data.astype(np.float32) - 128) / 128
+    else:
+        q = np.clip(np.round(x * full), -full, full - 1).astype(np.int64)
+        read = q.astype(np.float32) / np.float32(full)
+        data = q.astype("<i4") if bits == 32 else q.astype("<i2") if bits == 16 else q
+    raw = data.tobytes() if bits != 24 else b"".join(int(v).to_bytes(3, "little", signed=True) for v in data.reshape(-1))
+    channels = x.shape[1]
+    fmt = struct.pack("<HHIIHH", 0xFFFE if extensible else tag, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits)
+    if extensible:
+        fmt += struct.pack("<HHI", 22, bits, 3) + struct.pack("<H", tag) + b"\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71"
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+    if extra:
+        chunks += b"LIST" + struct.pack("<I", 5) + b"INFOx\x00"
+    chunks += b"data" + struct.pack("<I", len(raw)) + raw + b"\x00" * (len(raw) % 2)
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks)
+    return read.sum(axis=1, dtype=np.float32) / np.float32(channels) if channels > 1 else read[:, 0]
+
+
+def audio(checkpoint=None):
+    from transformers.models.gemma4.feature_extraction_gemma4 import Gemma4AudioFeatureExtractor
+    ours = Gemma4AudioFeatureExtractor()
+    if checkpoint:
+        from transformers import AutoFeatureExtractor
+        theirs = AutoFeatureExtractor.from_pretrained(checkpoint)
+        for k, v in vars(ours).items():
+            if not isinstance(v, np.ndarray) and getattr(theirs, k, None) != v:
+                print("checkpoint's feature extractor differs: %s = %r, Tachyon's %r" % (k, getattr(theirs, k, None), v))
+        same = all(np.array_equal(getattr(ours, k), getattr(theirs, k)) for k in ("window", "mel_filters"))
+        print("window and mel filters " + ("the same" if same else "DIFFER"))
+    mono = sound(4000, 16000, 1)[:, None]
+    stereo = np.stack([mono[:, 0], sound(4000, 16000, 2)], 1)
+    files = [
+        ("audio-u8.wav", mono, 16000, 1, 8, {}),
+        ("audio-s16.wav", mono, 16000, 1, 16, {}),
+        ("audio-s24.wav", mono, 16000, 1, 24, {}),
+        ("audio-s32.wav", mono, 16000, 1, 32, {}),
+        ("audio-f32.wav", mono, 16000, 3, 32, {}),
+        ("audio-f64.wav", mono, 16000, 3, 64, {}),
+        ("audio-stereo.wav", stereo, 16000, 1, 16, {}),
+        ("audio-extensible.wav", stereo, 16000, 1, 24, {"extensible": True, "extra": True}),
+        ("audio-44100.wav", sound(11025, 44100, 3)[:, None], 44100, 1, 16, {}),
+        ("speech-like.wav", sound(19745, 16000, 4)[:, None], 16000, 1, 16, {}),
+    ]
+    with open(os.path.join(ROOT, "audio.ref"), "w") as out:
+        for name, x, rate, tag, bits, kw in files:
+            read = wav(os.path.join(ROOT, name), x, rate, tag, bits, **kw)
+            line = {"file": name, "rate": rate, "samples": len(read), "fnv": fnv(read.astype("<f4").tobytes())}
+            if rate == 16000 and name in ("audio-s16.wav", "speech-like.wav", "audio-stereo.wav"):
+                feats = ours([read], return_tensors="np")["input_features"][0]
+                line["mel"] = "mel-%s.f32" % name.split(".")[0]
+                line["frames"] = feats.shape[0]
+                feats.astype("<f4").tofile(os.path.join(ROOT, line["mel"]))
+            out.write(json.dumps(line) + "\n")
+            print(line)
+
+
+# ------------------------------------------------------------------------------------------------ audio study
+TRANSCRIBE = "Transcribe this audio."
+
+
+def clip(path):
+    """A 16 kHz mono 16-bit WAV file's samples, as Tachyon reads them."""
+    import wave
+    with wave.open(path) as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2), path + ": not 16 kHz mono 16-bit"
+        return np.frombuffer(w.readframes(w.getnframes()), "<i2").astype(np.float32) / np.float32(32768)
+
+
+def speech(checkpoint, paths):
+    import shutil
+    import torch
+    from transformers import AutoProcessor, Gemma4ForConditionalGeneration
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    proc = AutoProcessor.from_pretrained(checkpoint)
+    model = Gemma4ForConditionalGeneration.from_pretrained(checkpoint, dtype=torch.float32).cuda().eval()
+    tower = [model.model.audio_tower, model.model.embed_audio]
+    bounds = [b for m in model.model.audio_tower.modules() for n, b in m.named_buffers(recurse=False) if n.startswith(("input_", "output_"))]
+    print("clip bounds: %d, finite: %d" % (len(bounds), sum(bool(torch.isfinite(b)) for b in bounds)))
+    runs = []
+    for path in paths:
+        name = os.path.basename(path)
+        shutil.copyfile(path, os.path.join(ROOT, name))
+        msgs = [{"role": "user", "content": [{"type": "text", "text": TRANSCRIBE}, {"type": "audio"}]}]
+        text = proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        enc = proc(text=[text], audio=[clip(path)], sampling_rate=16000, return_tensors="pt").to("cuda")
+        runs.append((name, text, enc))
+
+    def soft(enc):
+        out = model.model.get_audio_features(enc["input_features"], enc["input_features_mask"])
+        return out.pooler_output[out.attention_mask].float()
+    print("\n%-24s %-6s %12s %12s %12s %10s %10s %10s" % ("clip", "format", "max |d|", "max rel", "min cosine", "max in", "max out", "stream"))
+    refs = []
+    for name, _, enc in runs:
+        with torch.no_grad():
+            seen, hooks = extremes(tower)
+            ref = soft(enc)
+            for h in hooks:
+                h.remove()
+            refs.append(ref)
+            print("%-24s %-6s %12s %12s %12s %10.3g %10.3g %10.3g" % (name, "f32", "", "", "", seen["in"], seen["out"], seen.get("stream", 0)))
+            for label, dtype in (("bf16", torch.bfloat16), ("f16", torch.float16)):
+                with Rounded(tower, dtype):
+                    got = soft(enc)
+                d = (got - ref).abs()
+                cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1)
+                print("%-24s %-6s %12.3e %12.3e %12.6f" % (name, label, float(d.max()), float(d.max() / ref.abs().max()), float(cos.min())) +
+                      ("  NON-FINITE" if not torch.isfinite(got).all() else ""))
+    model.to(torch.bfloat16)
+    for m in tower:
+        m.float()
+    with open(os.path.join(ROOT, "speech.ref"), "w") as out:
+        for (name, text, enc), ref in zip(runs, refs):
+            line = {"clip": name, "prompt": text, "ids": enc["input_ids"][0].tolist(), "soft_tokens": ref.shape[0], "frames": enc["input_features"].shape[1]}
+            line["soft"] = "soft-%s.f16" % name.split(".")[0]
+            ref.half().cpu().numpy().tofile(os.path.join(ROOT, line["soft"]))
+            line["answer"], line["margins"] = transcribe(model, enc)
+            out.write(json.dumps(line, ensure_ascii=False) + "\n")
+            print("%s: %s" % (name, proc.decode(line["answer"])))
+
+
+def transcribe(model, enc):
+    """The decoder's greedy answer in bfloat16 (the audio tower in float32), with each token's margin."""
+    import torch
+    answer, margins = [], []
+    with torch.no_grad():
+        out = model(**enc, use_cache=True)
+        for _ in range(4 * ANSWER):
+            top = out.logits[0, -1].float().topk(2)
+            token = int(top.indices[0])
+            answer.append(token)
+            margins.append(round(float(top.values[0] - top.values[1]), 4))
+            if token in (1, 106):
+                break
+            out = model(input_ids=torch.tensor([[token]], device="cuda"), past_key_values=out.past_key_values, use_cache=True)
+    return answer, margins
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "images"
     if mode == "vision":
         vision(os.path.expanduser(sys.argv[2]))
     elif mode == "inspect":
         inspect(os.path.expanduser(sys.argv[2]))
+    elif mode == "speech":
+        speech(os.path.expanduser(sys.argv[2]), [os.path.expanduser(p) for p in sys.argv[3:]])
+    elif mode == "audio":
+        audio(os.path.expanduser(sys.argv[2]) if len(sys.argv) > 2 else None)
     else:
         images()

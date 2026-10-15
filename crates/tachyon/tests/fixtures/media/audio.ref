@@ -1,0 +1,10 @@
+{"file": "audio-u8.wav", "rate": 16000, "samples": 4000, "fnv": "ad3f62f7149ef94f"}
+{"file": "audio-s16.wav", "rate": 16000, "samples": 4000, "fnv": "260f79f9dd5251ab", "mel": "mel-audio-s16.f32", "frames": 25}
+{"file": "audio-s24.wav", "rate": 16000, "samples": 4000, "fnv": "105c27015aeeb27d"}
+{"file": "audio-s32.wav", "rate": 16000, "samples": 4000, "fnv": "527a0bd4099a73f5"}
+{"file": "audio-f32.wav", "rate": 16000, "samples": 4000, "fnv": "fa3cf66694869b5b"}
+{"file": "audio-f64.wav", "rate": 16000, "samples": 4000, "fnv": "fa3cf66694869b5b"}
+{"file": "audio-stereo.wav", "rate": 16000, "samples": 4000, "fnv": "343e76cac3ed8e66", "mel": "mel-audio-stereo.f32", "frames": 25}
+{"file": "audio-extensible.wav", "rate": 16000, "samples": 4000, "fnv": "aa03c3ec8d6df2b1"}
+{"file": "audio-44100.wav", "rate": 44100, "samples": 11025, "fnv": "cdf85a5f77dd9d0f"}
+{"file": "speech-like.wav", "rate": 16000, "samples": 19745, "fnv": "4a1e229ff16703d0", "mel": "mel-speech-like.f32", "frames": 123}

@@ -1,11 +1,14 @@
 //! Media inputs for Gemma 4's encoders. Images: PNG and JPEG decoded to RGB as PIL decodes them (JPEGs turned by
 //! their EXIF orientation, as `transformers` loads them), then resized as PIL resizes them to the vision encoder's
-//! patch grid.
+//! patch grid. Audio: WAV files, resampled to 16 kHz, and their log-mel features ([`decode_wav`], [`mel`]).
 
+mod audio;
 mod inflate;
 mod jpeg;
 mod png;
 mod resize;
+
+pub use audio::{Audio, MAX_SAMPLES, MEL_BINS, SAMPLE_RATE, decode_wav, mel};
 
 use crate::{Error, Result};
 
