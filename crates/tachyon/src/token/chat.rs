@@ -9,10 +9,11 @@
 //! Messages are trimmed, consecutive model messages share one turn, and the conversation ends by opening the
 //! model's turn. A user or system message's images come before its text, each as `<|image>`, then `<|image|>` once
 //! per soft token its budget gives it ([`Chat::with_budget`]), then `<image|>`: the slots the vision tower's soft
-//! tokens fill. Tools are not covered.
+//! tokens fill. Its audio comes after its text, each clip as `<|audio>`, a `<|audio|>` per soft token (one per 40 ms,
+//! [`crate::audio::count`]), then `<audio|>`. Tools are not covered.
 
 use super::Tokenizer;
-use crate::media::{DEFAULT_BUDGET, Image};
+use crate::media::{Audio, DEFAULT_BUDGET, Image};
 use crate::{Error, Result};
 
 /// Who wrote a message.
@@ -27,7 +28,7 @@ pub enum Role {
 }
 
 /// One message of a conversation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Message<'a> {
     /// Who wrote it.
     pub role: Role,
@@ -36,12 +37,14 @@ pub struct Message<'a> {
     /// The images it shows, before its text: a user message's, or a system message's after the first (the first is
     /// the system turn, which shows none, as Gemma 4's template has it).
     pub images: &'a [Image],
+    /// The audio it plays, after its text, as its images.
+    pub audio: &'a [Audio],
 }
 
 impl<'a> Message<'a> {
     /// A message of text only.
     pub const fn new(role: Role, text: &'a str) -> Message<'a> {
-        Message { role, text, images: &[] }
+        Message { role, text, images: &[], audio: &[] }
     }
 }
 
@@ -52,8 +55,10 @@ pub struct Chat {
     turn: u32,
     end: u32,
     think: u32,
-    /// `<|image>`, `<|image|>`, `<image|>`, if the tokenizer has them.
+    /// `<|image>`, `<|image|>`, `<image|>`, and the audio's `<|audio>`, `<|audio|>`, `<audio|>`, if the tokenizer has
+    /// them.
     image: Option<[u32; 3]>,
+    audio: Option<[u32; 3]>,
     budget: usize,
 }
 
@@ -61,9 +66,12 @@ impl Chat {
     /// The chat format of a Gemma 4 tokenizer.
     pub fn gemma4(tok: &Tokenizer) -> Result<Chat> {
         let get = |s: &str| tok.special(s).ok_or_else(|| Error::Format(format!("tokenizer: no {s} token, not Gemma 4's")));
-        let image = ["<|image>", "<|image|>", "<image|>"].map(|s| tok.special(s));
-        let image = image.iter().all(Option::is_some).then(|| image.map(Option::unwrap_or_default));
-        Ok(Chat { bos: get("<bos>")?, turn: get("<|turn>")?, end: get("<turn|>")?, think: get("<|think|>")?, image, budget: DEFAULT_BUDGET })
+        let marks = |names: [&str; 3]| {
+            let ids = names.map(|s| tok.special(s));
+            ids.iter().all(Option::is_some).then(|| ids.map(Option::unwrap_or_default))
+        };
+        let (image, audio) = (marks(["<|image>", "<|image|>", "<image|>"]), marks(["<|audio>", "<|audio|>", "<audio|>"]));
+        Ok(Chat { bos: get("<bos>")?, turn: get("<|turn>")?, end: get("<turn|>")?, think: get("<|think|>")?, image, audio, budget: DEFAULT_BUDGET })
     }
 
     /// This format with images at `budget` soft tokens (one of [`crate::media::BUDGETS`]; 280 by default).
@@ -75,6 +83,11 @@ impl Chat {
     /// The token of an image's soft-token slots, if the tokenizer has one.
     pub fn image_token(&self) -> Option<u32> {
         self.image.map(|i| i[1])
+    }
+
+    /// The token of an audio clip's soft-token slots, if the tokenizer has one.
+    pub fn audio_token(&self) -> Option<u32> {
+        self.audio.map(|i| i[1])
     }
 
     /// The token that ends the model's turn, where generation stops.
@@ -115,20 +128,20 @@ impl Chat {
         tok.encode("model\n", out);
     }
 
-    /// A user or system message's turn: its images' slots, then its text.
+    /// A user or system message's turn: its images' slots, its text, its audio's slots.
     fn turn(&self, tok: &Tokenizer, m: &Message<'_>, out: &mut Vec<u32>) {
         out.push(self.turn);
-        let role = if m.role == Role::System { "system" } else { "user" };
-        let Some([boi, slot, eoi]) = self.image.filter(|_| !m.images.is_empty()) else {
-            return self.close(tok, &format!("{role}\n{}", m.text.trim()), out);
-        };
-        tok.encode(&format!("{role}\n"), out);
-        for image in m.images {
-            out.push(boi);
-            out.extend(std::iter::repeat_n(slot, image.soft_tokens(self.budget).unwrap_or(0)));
-            out.push(eoi);
+        let mut text = String::from(if m.role == Role::System { "system\n" } else { "user\n" });
+        if let Some(marks) = self.image.filter(|_| !m.images.is_empty()) {
+            tok.encode(&std::mem::take(&mut text), out);
+            m.images.iter().for_each(|image| slots(marks, image.soft_tokens(self.budget).unwrap_or(0), out));
         }
-        self.close(tok, m.text.trim(), out);
+        text.push_str(m.text.trim());
+        if let Some(marks) = self.audio.filter(|_| !m.audio.is_empty()) {
+            tok.encode(&std::mem::take(&mut text), out);
+            m.audio.iter().for_each(|clip| slots(marks, crate::audio::count(clip), out));
+        }
+        self.close(tok, &text, out);
     }
 
     /// The model's messages since the last other one, if any, as one turn.
@@ -145,4 +158,11 @@ impl Chat {
         out.push(self.end);
         tok.encode("\n", out);
     }
+}
+
+/// `n` slots between the opening and closing marks `[open, slot, close]`.
+fn slots([open, slot, close]: [u32; 3], n: usize, out: &mut Vec<u32>) {
+    out.push(open);
+    out.extend(std::iter::repeat_n(slot, n));
+    out.push(close);
 }

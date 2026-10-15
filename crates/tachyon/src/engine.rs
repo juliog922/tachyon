@@ -15,8 +15,9 @@
 //! never leaves VRAM, and neither does the one answering: its stream borrows the engine. With no thread, keep-alives
 //! are checked at every call; an application that leaves the engine idle calls [`Engine::expire`] when it likes.
 //!
-//! Messages may show images ([`Message::images`]) to a model converted with its vision tower: the tower comes into
-//! VRAM with the first image the model sees, and leaves with the model.
+//! Messages may show images ([`Message::images`]) and play audio ([`Message::audio`]) to a model converted with its
+//! vision and audio towers: a tower comes into VRAM with the first image or clip the model sees, and leaves with the
+//! model.
 //!
 //! ```no_run
 //! use tachyon::engine::{Engine, Limits, Load, Request};
@@ -32,6 +33,7 @@
 //! # Ok::<(), tachyon::Error>(())
 //! ```
 
+use crate::audio::Tower;
 use crate::cuda::Context;
 use crate::encoder::laya::Question;
 use crate::encoder::{self, Encoder};
@@ -110,8 +112,9 @@ struct Model {
     used: Instant,
     until: Option<Instant>,
     at: Place,
-    /// Its vision tower, once it has seen an image while in VRAM.
+    /// Its vision tower, once it has seen an image while in VRAM; its audio tower, once it has heard a clip.
     vision: Option<Vision>,
+    audio: Option<Tower>,
 }
 
 // One per model, moved only between tiers: its size does not matter.
@@ -184,7 +187,8 @@ impl Engine {
         let ends = [chat.end_of_turn(), tok.special("<eos>").unwrap_or(chat.end_of_turn())];
         let need = footprint(dir, &load.settings)?;
         let (used, at) = (Instant::now(), Place::Disk);
-        let mut model = Model { name: name.into(), dir: dir.into(), load: load.clone(), tok, chat, ends, need, used, until: None, at, vision: None };
+        let mut model =
+            Model { name: name.into(), dir: dir.into(), load: load.clone(), tok, chat, ends, need, used, until: None, at, vision: None, audio: None };
         model.touch(load.keep_alive);
         self.models.push(model);
         let loaded = self.resident(self.models.len() - 1);
@@ -270,7 +274,7 @@ impl Engine {
         self.expire()?;
         let i = self.models.iter().position(|m| m.name == name).ok_or_else(|| Error::NoModel(name.into()))?;
         self.resident(i)?;
-        let soft = self.images(i, req)?;
+        let soft = self.media(i, req)?;
         let (m, prompt) = (&mut self.models[i], &mut self.prompt);
         let slots = encode(m, req, prompt, &soft)?;
         let (tokens, context) = (prompt.len(), m.load.settings.context);
@@ -279,15 +283,26 @@ impl Engine {
         Ok(TokenStream { engine: self, model: i, keep, detok: Detokenizer::default(), text: String::with_capacity(256), next: Some(first), left, tokens: 0 })
     }
 
-    /// The soft tokens of the images of `req`'s messages, in order, by model `i`'s vision tower (in VRAM by now:
-    /// brought there with the first image).
-    fn images(&mut self, i: usize, req: &Request<'_>) -> Result<Vec<Vec<f32>>> {
-        // The chat template shows a user's images, and a system message's after the first.
+    /// The soft tokens of the images and audio of `req`'s messages, in the prompt's order, by model `i`'s towers (in
+    /// VRAM by now: each brought there with its first image or clip).
+    fn media(&mut self, i: usize, req: &Request<'_>) -> Result<Vec<Vec<f32>>> {
+        // The chat template shows a user's images and audio, and a system message's after the first.
         let shown = |(k, m): &(usize, &Message<'_>)| m.role == Role::User || m.role == Role::System && *k > 0;
-        let images: Vec<_> = req.messages.iter().enumerate().filter(shown).flat_map(|(_, m)| m.images).collect();
-        if images.is_empty() {
-            return Ok(Vec::new());
+        let budget = self.models[i].load.budget;
+        let mut soft = Vec::new();
+        for (_, m) in req.messages.iter().enumerate().filter(shown) {
+            for image in m.images {
+                soft.push(self.vision(i)?.soft_tokens(image, budget)?);
+            }
+            for clip in m.audio {
+                soft.push(self.hearing(i)?.soft_tokens(clip)?);
+            }
         }
+        Ok(soft)
+    }
+
+    /// Model `i`'s vision tower, brought into VRAM if it is not there.
+    fn vision(&mut self, i: usize) -> Result<&mut Vision> {
         let m = &mut self.models[i];
         if m.vision.is_none() {
             if !m.dir.join("vision.wpk").exists() || m.chat.image_token().is_none() {
@@ -295,8 +310,19 @@ impl Engine {
             }
             m.vision = Some(Vision::open(&self.ctx, &m.dir, m.load.budget)?);
         }
-        let vision = m.vision.as_mut().unwrap_or_else(|| unreachable!("opened above"));
-        images.into_iter().map(|image| vision.soft_tokens(image, m.load.budget)).collect()
+        Ok(m.vision.as_mut().unwrap_or_else(|| unreachable!("opened above")))
+    }
+
+    /// Model `i`'s audio tower, brought into VRAM if it is not there.
+    fn hearing(&mut self, i: usize) -> Result<&mut Tower> {
+        let m = &mut self.models[i];
+        if m.audio.is_none() {
+            if !m.dir.join("audio.wpk").exists() || m.chat.audio_token().is_none() {
+                return Err(Error::Unsupported(format!("no audio tower in {}: audio", m.dir.display())));
+            }
+            m.audio = Some(Tower::open(&self.ctx, &m.dir)?);
+        }
+        Ok(m.audio.as_mut().unwrap_or_else(|| unreachable!("opened above")))
     }
 
     /// Brings model `i` into VRAM, moving out the least recently used models that may go until it fits.
@@ -333,7 +359,7 @@ impl Engine {
     /// Moves model `i` out of VRAM: to the host tier if it fits there, making room by freeing the least recently
     /// used pinned memory (a resident model's kept copy, or a parked model, which goes to disk), or else to disk.
     fn evict(&mut self, i: usize) -> Result<()> {
-        self.models[i].vision = None;
+        (self.models[i].vision, self.models[i].audio) = (None, None);
         let Place::Vram(dec) = std::mem::replace(&mut self.models[i].at, Place::Disk) else { return Ok(()) };
         let bytes = dec.parked_bytes();
         if bytes > self.limits[1] {
@@ -355,7 +381,7 @@ impl Engine {
     /// VRAM the resident models take, encoders included.
     fn used(&self) -> usize {
         let encoders: usize = self.encoders.iter().map(|e| e.1.bytes()).sum();
-        let towers: usize = self.models.iter().filter_map(|m| m.vision.as_ref()).map(Vision::bytes).sum();
+        let towers: usize = self.models.iter().map(|m| m.vision.as_ref().map_or(0, Vision::bytes) + m.audio.as_ref().map_or(0, Tower::bytes)).sum();
         encoders + towers + self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum::<usize>()
     }
 
@@ -390,20 +416,21 @@ fn encode<'s>(m: &Model, req: &Request<'_>, prompt: &mut Vec<u32>, soft: &'s [Ve
     if tokens >= context {
         return Err(Error::TooLong { tokens, context });
     }
-    slots(prompt, m.chat.image_token(), soft, m.vision.as_ref().map_or(0, Vision::width))
+    let width = m.vision.as_ref().map(Vision::width).or(m.audio.as_ref().map(Tower::width)).unwrap_or(0);
+    slots(prompt, [m.chat.image_token(), m.chat.audio_token()], soft, width)
 }
 
-/// Where in `prompt` each image's soft tokens go: its first slot (a run of `slot` tokens), with its rows of `width`.
-/// An error unless the runs and the images match one for one.
-fn slots<'s>(prompt: &[u32], slot: Option<u32>, soft: &'s [Vec<f32>], width: usize) -> Result<Vec<(usize, &'s [f32])>> {
+/// Where in `prompt` each image's or clip's soft tokens go: its first slot (a run of one of the `marks`), with its
+/// rows of `width`. An error unless the runs and the soft tokens match one for one.
+fn slots<'s>(prompt: &[u32], marks: [Option<u32>; 2], soft: &'s [Vec<f32>], width: usize) -> Result<Vec<(usize, &'s [f32])>> {
     let mut runs = Vec::new();
     for (p, &t) in prompt.iter().enumerate() {
-        if Some(t) == slot && (p == 0 || prompt[p - 1] != t) {
+        if marks.contains(&Some(t)) && (p == 0 || prompt[p - 1] != t) {
             runs.push((p, prompt[p..].iter().take_while(|&&u| u == t).count()));
         }
     }
     if runs.len() != soft.len() || runs.iter().zip(soft).any(|(r, s)| r.1 * width != s.len()) {
-        return Err(Error::Media(format!("{} images in the prompt, but {} sets of soft tokens", runs.len(), soft.len())));
+        return Err(Error::Media(format!("{} images and clips in the prompt, but {} sets of soft tokens", runs.len(), soft.len())));
     }
     Ok(runs.iter().zip(soft).map(|(r, s)| (r.0, s.as_slice())).collect())
 }

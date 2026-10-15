@@ -6,10 +6,13 @@ best token after each answer position, as the engine test does. If Tachyon's own
 the engine computes what its weights allow.
 
 With `vision.ref` (`scripts/media.py vision`), each answer is about an image: the float32 tower's soft tokens fill
-its slots, as they did for the reference, and only the decoder's weights are rounded.
+its slots, as they did for the reference, and only the decoder's weights are rounded. With `speech.ref`
+(`scripts/media.py speech`), each answer is a transcription: the audio tower runs in float32, as it did for the
+reference.
 
     python3 scripts/agreement.py ~/models/gemma-4-E4B-it crates/tachyon/tests/fixtures/gemma-4-e4b.ref
     python3 scripts/agreement.py ~/models/gemma-4-E4B-it crates/tachyon/tests/fixtures/media/vision.ref
+    python3 scripts/agreement.py ~/models/gemma-4-E4B-it crates/tachyon/tests/fixtures/media/speech.ref
 """
 
 import json
@@ -67,14 +70,27 @@ def soft_tokens(src, lines):
     return out
 
 
+def features(src, lines):
+    """Each `speech.ref` line's clip as the processor gives it to the model: features and their mask."""
+    from transformers import AutoProcessor
+    import media
+    proc = AutoProcessor.from_pretrained(src)
+    out = []
+    for j in lines:
+        enc = proc(text=[j["prompt"]], audio=[media.clip(os.path.join(media.ROOT, j["clip"]))], sampling_rate=16000, return_tensors="pt")
+        assert enc["input_ids"][0].tolist() == j["ids"], j["clip"]
+        out.append({k: enc[k].to("cuda") for k in ("input_features", "input_features_mask")})
+    return out
+
+
 def agreement(model, lines, soft):
     from transformers.modeling_outputs import BaseModelOutputWithPooling
     agree = total = 0
     for k, j in enumerate(lines):
         prompt = j.get("ids", j["prompt"])
         ids = torch.tensor([prompt + j["answer"]], device="cuda")
-        extra = {}
-        if soft:
+        extra = soft[k] if soft and "clip" in j else {}
+        if soft and "image" in j:
             extra["mm_encoder_outputs"] = {"image": BaseModelOutputWithPooling(pooler_output=(soft[k].to("cuda", torch.bfloat16),))}
         with torch.no_grad():
             logits = model(input_ids=ids, **extra).logits[0]
@@ -87,10 +103,10 @@ def agreement(model, lines, soft):
 
 def main(src, ref):
     lines = [json.loads(l) for l in open(ref)]
-    soft = soft_tokens(src, lines) if "image" in lines[0] else None
+    soft = soft_tokens(src, lines) if "image" in lines[0] else features(src, lines) if "clip" in lines[0] else None
     variants = [
         ("bf16", None, False),
-        ("q4 g64 /7 (Tachyon)", (64, [7]), False),
+        ("q4 g64 /7", (64, [7]), False),
         ("q4 g64 /7 + q8", (64, [7]), True),
         ("q4 g64 best scale", (64, [6 + i / 4 for i in range(13)]), False),
         ("q4 g64 best scale + q8 (Tachyon)", (64, [6 + i / 4 for i in range(13)]), True),
@@ -99,6 +115,8 @@ def main(src, ref):
     ]
     for name, quant, acts in variants:
         model = Gemma4ForConditionalGeneration.from_pretrained(src, dtype=torch.bfloat16).to("cuda").eval()
+        model.model.audio_tower.float()
+        model.model.embed_audio.float()
         lm = model.model.language_model
         with torch.no_grad():
             for mod in [m for m in lm.modules() if isinstance(m, (torch.nn.Linear, torch.nn.Embedding))] if quant else []:

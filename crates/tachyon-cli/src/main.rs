@@ -20,7 +20,9 @@ Commands:
   list                         List the pulled models
   rm <name>                    Remove a pulled model
   run <model> <prompt>         Answer one prompt, greedily, and report the speed (a name or a directory;
-                               --image=FILE, repeatable: PNG or JPEG files the prompt shows first)
+                               --image=FILE, --audio=FILE, repeatable: PNG or JPEG files the prompt shows
+                               first, WAV files it plays after)
+  transcribe <model> <file>    Transcribe a WAV file's speech, up to 30 s
   decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions)
   embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
   gpu                          List the GPUs the driver sees
@@ -64,6 +66,7 @@ fn command(words: &[&str], json: bool) -> ExitCode {
         ["decide", model, request] => printed(encoders::decide(&model_dir(model), request.as_ref())),
         ["embed", model, rest @ ..] if !rest.is_empty() => embed(model, rest),
         ["run", model, rest @ ..] => run_args(model, rest),
+        ["transcribe", model, file] => done(run(&model_dir(model), TRANSCRIBE, &[&format!("--audio={file}")])),
         ["version" | "--version" | "-V"] => {
             println!("tachyon {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -147,24 +150,29 @@ fn done(r: tachyon::Result<()>) -> ExitCode {
     )
 }
 
-/// `run` with `rest`: one prompt, and the images among `--image=FILE` words.
+/// What `transcribe` asks.
+const TRANSCRIBE: &str = "Transcribe the following speech segment in its language. Only output the transcription, with no newlines.";
+
+/// `run` with `rest`: one prompt, and the media among `--image=FILE` and `--audio=FILE` words.
 fn run_args(model: &str, rest: &[&str]) -> ExitCode {
-    let files: Vec<&str> = rest.iter().filter_map(|w| w.strip_prefix("--image=")).collect();
-    let [prompt] = rest.iter().filter(|w| !w.starts_with("--image=")).collect::<Vec<_>>()[..] else {
+    let (files, words): (Vec<&str>, Vec<&str>) = rest.iter().partition(|w| w.starts_with("--image=") || w.starts_with("--audio="));
+    let [prompt] = words[..] else {
         eprint!("error: run takes one prompt\n\n{HELP}");
         return ExitCode::from(2);
     };
     done(run(&model_dir(model), prompt, &files))
 }
 
-/// Answers `prompt`, showing the images in `files`, with the model in `dir`, greedily, printing the text as it
-/// comes, then the speed.
+/// Answers `prompt`, showing the images and playing the audio in `files` (`--image=FILE`, `--audio=FILE`), with the
+/// model in `dir`, greedily, printing the text as it comes, then the speed.
 fn run(dir: &std::path::Path, prompt: &str, files: &[&str]) -> tachyon::Result<()> {
     use std::io::Write as _;
-    let images = files.iter().map(|f| tachyon::media::decode(&std::fs::read(f)?)).collect::<tachyon::Result<Vec<_>>>()?;
+    let read = |kind: &'static str| files.iter().filter_map(move |f| f.strip_prefix(kind)).map(std::fs::read);
+    let images = read("--image=").map(|b| tachyon::media::decode(&b?)).collect::<tachyon::Result<Vec<_>>>()?;
+    let audio = read("--audio=").map(|b| tachyon::media::decode_wav(&b?)).collect::<tachyon::Result<Vec<_>>>()?;
     let mut engine = Engine::new(0, Limits::default())?;
     engine.load("model", dir, &Load::default())?;
-    let messages = [Message { images: &images, ..Message::new(Role::User, prompt) }];
+    let messages = [Message { images: &images, audio: &audio, ..Message::new(Role::User, prompt) }];
     let start = std::time::Instant::now();
     let mut answer = engine.chat("model", &Request::new(&messages))?;
     let (prefill, mid) = (start.elapsed(), std::time::Instant::now());

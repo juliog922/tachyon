@@ -63,6 +63,11 @@ harness = false
 required-features = ["gpu"]
 
 [[bench]]
+name = "audio"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
 name = "vision"
 harness = false
 required-features = ["gpu"]

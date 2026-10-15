@@ -196,6 +196,111 @@ fn the_tower_matches_hugging_faces_soft_tokens() {
     }
 }
 
+/// The question `scripts/media.py speech` asked about each clip.
+#[cfg(all(feature = "gpu", feature = "models"))]
+const TRANSCRIBE: &str = "Transcribe this audio.";
+
+/// E4B's model directory: `$TACHYON_MODEL`, by default `~/.local/share/tachyon/gemma-4-e4b`.
+#[cfg(all(feature = "gpu", feature = "models"))]
+fn model_dir() -> std::path::PathBuf {
+    std::env::var("TACHYON_MODEL")
+        .map_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/tachyon/gemma-4-e4b"), Into::into)
+}
+
+/// The cases of `speech.ref` with their clips: the prompt's tokens, Hugging Face's greedy answer and its margins.
+#[cfg(all(feature = "gpu", feature = "models"))]
+fn speech() -> Vec<(tachyon::json::Json, tachyon::media::Audio)> {
+    use tachyon::json::Json;
+    let media = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/media");
+    let lines = std::fs::read_to_string(format!("{media}/speech.ref")).unwrap();
+    lines
+        .lines()
+        .map(|l| {
+            let case = Json::parse(l.as_bytes()).unwrap();
+            let clip = std::fs::read(format!("{media}/{}", case.get("clip").and_then(Json::str).unwrap())).unwrap();
+            (case, tachyon::media::decode_wav(&clip).unwrap())
+        })
+        .collect()
+}
+
+/// The numbers of `case`'s field `key`, as token IDs.
+#[cfg(all(feature = "gpu", feature = "models"))]
+fn ids(case: &tachyon::json::Json, key: &str) -> Vec<u32> {
+    case.get(key).and_then(tachyon::json::Json::arr).unwrap().iter().map(|v| v.num().unwrap() as u32).collect()
+}
+
+/// E4B with the tower's soft tokens against Hugging Face's bfloat16 decoder with the float32 tower, on the two
+/// clips: the chat template gives the reference's tokens; fed the prompt and each reference answer token by token,
+/// its pick after every token agrees with the reference's on ≥ 80% of the positions (to be measured against what
+/// 4-bit weights allow, `scripts/agreement.py`). Prefill takes chunks of 128 tokens, so the clips' slots cross chunk
+/// boundaries. Disagreements where the reference was sure (a gap of 2 or more) are printed.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn the_decoder_transcribes_as_hugging_face_does() {
+    use tachyon::token::{Chat, Message, Role, Tokenizer};
+    let (dir, ctx) = (model_dir(), tachyon::cuda::Context::new(0).unwrap());
+    let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok")).unwrap()).unwrap();
+    let mut tower = tachyon::audio::Tower::open(&ctx, &dir).unwrap();
+    let mut dec = tachyon::model::Decoder::open(&ctx, &dir, &tachyon::model::Settings { context: 4096, chunk: 128 }).unwrap();
+    let (mut agree, mut total) = (0usize, 0usize);
+    for (case, clip) in speech() {
+        let name = case.get("clip").and_then(tachyon::json::Json::str).unwrap().to_string();
+        let clips = [clip];
+        let mut prompt = Vec::new();
+        Chat::gemma4(&tok).unwrap().encode(&tok, &[Message { audio: &clips, ..Message::new(Role::User, TRANSCRIBE) }], false, &mut prompt);
+        assert_eq!(prompt, ids(&case, "ids"), "{name}: the chat template's tokens");
+        let soft = tower.soft_tokens(&clips[0]).unwrap();
+        let at = prompt.iter().position(|&t| t == 258_881).unwrap();
+        dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
+        dec.prefill_with(&prompt[..prompt.len() - 1], &[(at, &soft)]).unwrap();
+        let mut pick = dec.step(prompt[prompt.len() - 1]).unwrap();
+        let (answer, gaps) =
+            (ids(&case, "answer"), case.get("margins").and_then(tachyon::json::Json::arr).unwrap().iter().map(|v| v.num().unwrap()).collect::<Vec<_>>());
+        let mut mine = 0;
+        for (k, (&want, gap)) in answer.iter().zip(&gaps).enumerate() {
+            if pick == want {
+                mine += 1;
+            } else if *gap >= 2.0 {
+                println!("{name}, answer token {k}: {pick} against {want} (reference gap {gap:.2})");
+            }
+            pick = dec.step(want).unwrap();
+        }
+        println!("{name}: {mine}/{} picks agree", answer.len());
+        (agree, total) = (agree + mine, total + answer.len());
+    }
+    println!("top-1 agreement {agree}/{total} ({:.2}%)", 100.0 * agree as f64 / total as f64);
+    assert!(agree as f64 >= 0.80 * total as f64);
+}
+
+/// The engine transcribes clip 0: its answer holds at least 80% of the words of Hugging Face's.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn the_engine_transcribes_a_clip() {
+    use tachyon::engine::{Engine, Limits, Load, Request};
+    use tachyon::token::{Detokenizer, Message, Role, Tokenizer};
+    let (case, clip) = speech().swap_remove(0);
+    let mut engine = Engine::new(0, Limits::default()).unwrap();
+    engine.load("e4b", &model_dir(), &Load::default()).unwrap();
+    let clips = [clip];
+    let messages = [Message { audio: &clips, ..Message::new(Role::User, TRANSCRIBE) }];
+    let mut answer = engine.chat("e4b", &Request { max_tokens: 80, ..Request::new(&messages) }).unwrap();
+    let mut text = String::new();
+    while let Some(piece) = answer.next_text().unwrap() {
+        text.push_str(piece);
+    }
+    assert_eq!(answer.prompt(), ids(&case, "ids").len());
+    drop(answer);
+    let tok = Tokenizer::from_bytes(&std::fs::read(model_dir().join("tokenizer.tok")).unwrap()).unwrap();
+    let (mut want, mut detok) = (String::new(), Detokenizer::default());
+    ids(&case, "answer").iter().filter(|&&t| t != 106 && t != 1).for_each(|&t| detok.push(&tok, t, &mut want));
+    detok.finish(&mut want);
+    let words = |s: &str| s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(String::from).collect::<Vec<_>>();
+    let (got, want) = (words(&text), words(&want));
+    let found = want.iter().filter(|w| got.contains(w)).count();
+    println!("{text}");
+    assert!(found * 5 >= want.len() * 4, "{found} of {} words of {want:?}", want.len());
+}
+
 /// The smallest cosine between rows of `got` and `want`, and the largest error relative to the largest of `want`.
 #[cfg(feature = "gpu")]
 fn compare(got: &[f32], want: &[f32], width: usize) -> (f64, f64) {

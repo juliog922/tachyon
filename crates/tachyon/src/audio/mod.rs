@@ -237,6 +237,11 @@ fn valid(len: usize) -> usize {
     len.min(MAX_SAMPLES).saturating_sub(160).div_ceil(160)
 }
 
+/// The soft tokens Gemma 4 makes of `audio`, once at 16 kHz.
+pub fn count(audio: &media::Audio) -> usize {
+    soft_tokens((audio.samples.len() * SAMPLE_RATE as usize).div_ceil(audio.rate.max(1) as usize))
+}
+
 /// The soft tokens Gemma 4 makes of `len` samples at 16 kHz (at most 30 s of them): one per four valid feature
 /// frames, rounding up twice, as its two convolutions of stride 2 do.
 pub fn soft_tokens(len: usize) -> usize {
