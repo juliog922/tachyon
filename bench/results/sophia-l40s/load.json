@@ -1,57 +1,7 @@
 [
-    {
-        "name": "disk → host tier (O_DIRECT)",
-        "median_ns": 1761713703,
-        "p99_ns": 1764973963,
-        "rate": 2.438,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "disk → VRAM, staged (O_DIRECT)",
-        "median_ns": 1761569720,
-        "p99_ns": 1762828521,
-        "rate": 2.438,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "host tier → VRAM",
-        "median_ns": 171557963,
-        "p99_ns": 171558559,
-        "rate": 25.035,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "page cache → VRAM",
-        "median_ns": 688947031,
-        "p99_ns": 696902330,
-        "rate": 6.234,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "automatic → VRAM",
-        "median_ns": 685527975,
-        "p99_ns": 688575245,
-        "rate": 6.265,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"disk → host tier (O_DIRECT)","median_ns":1758080451,"p99_ns":1761100852,"rate":2.443,"unit":"GB/s","cycles":101036,"instructions":44792,"cache_misses":131,"page_faults":1},
+{"name":"disk → VRAM, staged (O_DIRECT)","median_ns":1751632451,"p99_ns":1756989848,"rate":2.452,"unit":"GB/s","cycles":74617122,"instructions":250411244,"cache_misses":1653,"page_faults":21},
+{"name":"host tier → VRAM","median_ns":171033261,"p99_ns":171033380,"rate":25.112,"unit":"GB/s","cycles":425705226,"instructions":1595789121,"cache_misses":34,"page_faults":0},
+{"name":"page cache → VRAM","median_ns":681797825,"p99_ns":697153685,"rate":6.299,"unit":"GB/s","cycles":430524895,"instructions":1608518883,"cache_misses":9889,"page_faults":12},
+{"name":"automatic → VRAM","median_ns":692364980,"p99_ns":767244139,"rate":6.203,"unit":"GB/s","cycles":618916095,"instructions":2311420436,"cache_misses":40588,"page_faults":0}
 ]

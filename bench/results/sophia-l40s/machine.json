@@ -1,134 +1,14 @@
 [
-    {
-        "name": "vram read 1024 MiB, 4 blocks/SM",
-        "median_ns": 1474976,
-        "p99_ns": 1478432,
-        "rate": 727.972,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram read 1024 MiB, 8 blocks/SM",
-        "median_ns": 1475776,
-        "p99_ns": 1480736,
-        "rate": 727.578,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram read 1024 MiB, 16 blocks/SM",
-        "median_ns": 1484192,
-        "p99_ns": 1486848,
-        "rate": 723.452,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram read 1024 MiB, 32 blocks/SM",
-        "median_ns": 1495328,
-        "p99_ns": 1496608,
-        "rate": 718.064,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram copy 1024 MiB (driver)",
-        "median_ns": 3284320,
-        "p99_ns": 3297632,
-        "rate": 653.859,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "host→device 256 MiB, pinned",
-        "median_ns": 10648608,
-        "p99_ns": 10649056,
-        "rate": 25.209,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "device→host 256 MiB, pinned",
-        "median_ns": 10202816,
-        "p99_ns": 10203808,
-        "rate": 26.310,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "host→device 256 MiB, pageable",
-        "median_ns": 23249068,
-        "p99_ns": 23855254,
-        "rate": 11.546,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "launch ×1000 (CPU)",
-        "median_ns": 1627589,
-        "p99_ns": 1642607,
-        "rate": 1.628,
-        "unit": "µs/launch",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "graph of 100 kernels, replay (CPU)",
-        "median_ns": 1988,
-        "p99_ns": 3851,
-        "rate": 1.988,
-        "unit": "µs",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "graph of 100 kernels, 10 replays queued (CPU)",
-        "median_ns": 19742,
-        "p99_ns": 23752,
-        "rate": 1.974,
-        "unit": "µs/replay",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "graph of 100 kernels (GPU)",
-        "median_ns": 59136,
-        "p99_ns": 59520,
-        "rate": 0.591,
-        "unit": "µs/kernel",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"vram read 1024 MiB, 4 blocks/SM","median_ns":1474144,"p99_ns":1478112,"rate":728.383,"unit":"GB/s","cycles":3686219,"instructions":13855594,"cache_misses":7,"page_faults":0},
+{"name":"vram read 1024 MiB, 8 blocks/SM","median_ns":1474624,"p99_ns":1480672,"rate":728.146,"unit":"GB/s","cycles":3689206,"instructions":13843925,"cache_misses":2,"page_faults":0},
+{"name":"vram read 1024 MiB, 16 blocks/SM","median_ns":1483360,"p99_ns":1486208,"rate":723.858,"unit":"GB/s","cycles":3707267,"instructions":13945823,"cache_misses":3,"page_faults":0},
+{"name":"vram read 1024 MiB, 32 blocks/SM","median_ns":1494304,"p99_ns":1496160,"rate":718.556,"unit":"GB/s","cycles":3730444,"instructions":14001342,"cache_misses":2,"page_faults":0},
+{"name":"vram copy 1024 MiB (driver)","median_ns":3283136,"p99_ns":3296576,"rate":654.095,"unit":"GB/s","cycles":8183131,"instructions":30567170,"cache_misses":8,"page_faults":0},
+{"name":"host→device 256 MiB, pinned","median_ns":10691808,"p99_ns":10694784,"rate":25.107,"unit":"GB/s","cycles":26642186,"instructions":99895787,"cache_misses":4,"page_faults":0},
+{"name":"device→host 256 MiB, pinned","median_ns":10200576,"p99_ns":10207104,"rate":26.316,"unit":"GB/s","cycles":25357187,"instructions":96114203,"cache_misses":9,"page_faults":4},
+{"name":"host→device 256 MiB, pageable","median_ns":23763335,"p99_ns":23824292,"rate":11.296,"unit":"GB/s","cycles":59044879,"instructions":52198001,"cache_misses":4168555,"page_faults":0},
+{"name":"launch ×1000 (CPU)","median_ns":1497136,"p99_ns":1509554,"rate":1.497,"unit":"µs/launch","cycles":3736361,"instructions":7500119,"cache_misses":8,"page_faults":0},
+{"name":"graph of 100 kernels, replay (CPU)","median_ns":1867,"p99_ns":3372,"rate":1.867,"unit":"µs","cycles":151738,"instructions":552082,"cache_misses":0,"page_faults":0},
+{"name":"graph of 100 kernels, 10 replays queued (CPU)","median_ns":19762,"p99_ns":24911,"rate":1.976,"unit":"µs/replay","cycles":1428949,"instructions":5360452,"cache_misses":1,"page_faults":0},
+{"name":"graph of 100 kernels (GPU)","median_ns":59040,"p99_ns":59328,"rate":0.590,"unit":"µs/kernel","cycles":160329,"instructions":565904,"cache_misses":0,"page_faults":0}
 ]

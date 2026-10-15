@@ -1,0 +1,7 @@
+[
+{"name":"SHA-256, SHA-NI, 256 MiB","median_ns":159377904,"p99_ns":252280554,"rate":1.684,"unit":"GB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
+{"name":"AES-128-GCM open, 16 KiB records","median_ns":11365325,"p99_ns":11606035,"rate":5.905,"unit":"GB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
+{"name":"curl, one connection","median_ns":3234263749,"p99_ns":3299121967,"rate":82.997,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
+{"name":"tachyon, 1 connection(s)","median_ns":3481139098,"p99_ns":3655884544,"rate":77.111,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
+{"name":"tachyon, 8 connection(s)","median_ns":3540029870,"p99_ns":3667411172,"rate":75.829,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null}
+]

@@ -1,42 +1,6 @@
 [
-    {
-        "name": "tower, clip-0.wav",
-        "median_ns": 64989864,
-        "p99_ns": 65071349,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "tower, clip-1.wav",
-        "median_ns": 49538477,
-        "p99_ns": 49639042,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "transcription, clip-0.wav (12.5 s)",
-        "median_ns": 235337088,
-        "p99_ns": 236391722,
-        "rate": 0.019,
-        "unit": "× real time",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "transcription, clip-1.wav (9.9 s)",
-        "median_ns": 190135854,
-        "p99_ns": 190401718,
-        "rate": 0.019,
-        "unit": "× real time",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"tower, clip-0.wav","median_ns":41746357,"p99_ns":58319340,"cycles":164107384,"instructions":585028293,"cache_misses":50886,"page_faults":1528},
+{"name":"tower, clip-1.wav","median_ns":32560426,"p99_ns":34116129,"cycles":132618064,"instructions":465292248,"cache_misses":42822,"page_faults":235},
+{"name":"transcription, clip-0.wav (12.5 s)","median_ns":235230198,"p99_ns":243125302,"rate":0.019,"unit":"× real time","cycles":957839776,"instructions":3503426977,"cache_misses":94534,"page_faults":2},
+{"name":"transcription, clip-1.wav (9.9 s)","median_ns":189272437,"p99_ns":190991019,"rate":0.019,"unit":"× real time","cycles":772677767,"instructions":2828765475,"cache_misses":51364,"page_faults":0}
 ]

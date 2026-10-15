@@ -1,35 +1,12 @@
 [
-    {
-        "name": "vram read ceiling, 4 blocks/SM",
-        "median_ns": 2208768,
-        "p99_ns": 2213312,
-        "rate": 729.191,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram read ceiling, 8 blocks/SM",
-        "median_ns": 2213792,
-        "p99_ns": 2216736,
-        "rate": 727.536,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "decode",
-        "median_ns": 4391922,
-        "p99_ns": 4416961,
-        "rate": 227.691,
-        "unit": "tok/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"vram read ceiling, 4 blocks/SM","median_ns":2209408,"p99_ns":2214304,"rate":728.979,"unit":"GB/s","cycles":8736642,"instructions":32314305,"cache_misses":6,"page_faults":0},
+{"name":"vram read ceiling, 8 blocks/SM","median_ns":2213440,"p99_ns":2214560,"rate":727.651,"unit":"GB/s","cycles":8749445,"instructions":32358098,"cache_misses":4,"page_faults":0},
+{"name":"decode","median_ns":4382019,"p99_ns":4408029,"rate":228.205,"unit":"tok/s","cycles":8,"instructions":15,"cache_misses":0,"page_faults":0},
+{"name":"time to first token, 64 tokens","median_ns":12557830,"p99_ns":12827919,"cycles":43805387,"instructions":144294104,"cache_misses":384,"page_faults":0},
+{"name":"time to first token, 256 tokens","median_ns":15832950,"p99_ns":15875449,"cycles":63514151,"instructions":210556868,"cache_misses":80,"page_faults":0},
+{"name":"time to first token, 512 tokens","median_ns":26929013,"p99_ns":27302473,"cycles":106770780,"instructions":356521118,"cache_misses":130,"page_faults":0},
+{"name":"time to first token, 1024 tokens","median_ns":52558674,"p99_ns":52872382,"cycles":212372491,"instructions":706232023,"cache_misses":117,"page_faults":0},
+{"name":"time to first token, 2048 tokens","median_ns":107375413,"p99_ns":108264038,"cycles":435580125,"instructions":1449445153,"cache_misses":160,"page_faults":0},
+{"name":"time to first token, 4096 tokens","median_ns":230789301,"p99_ns":231238231,"cycles":938955011,"instructions":3126536093,"cache_misses":334,"page_faults":78},
+{"name":"time to first token, 8192 tokens","median_ns":531797950,"p99_ns":534547667,"cycles":2167197380,"instructions":7231556576,"cache_misses":724,"page_faults":0}
 ]

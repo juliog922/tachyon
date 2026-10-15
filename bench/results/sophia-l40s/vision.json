@@ -1,74 +1,10 @@
 [
-    {
-        "name": "tower, 63 soft tokens",
-        "median_ns": 18712869,
-        "p99_ns": 19052263,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "tower, 130 soft tokens",
-        "median_ns": 29209281,
-        "p99_ns": 29620838,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "tower, 266 soft tokens",
-        "median_ns": 46867574,
-        "p99_ns": 47445900,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "tower, 540 soft tokens",
-        "median_ns": 83412280,
-        "p99_ns": 84264935,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "tower, 1064 soft tokens",
-        "median_ns": 126987392,
-        "p99_ns": 148869005,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "first token, image at 70",
-        "median_ns": 26188897,
-        "p99_ns": 26724235,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "first token, image at 280",
-        "median_ns": 51277181,
-        "p99_ns": 52114384,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "first token, no image",
-        "median_ns": 12113270,
-        "p99_ns": 12118577,
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"tower, 63 soft tokens","median_ns":19515414,"p99_ns":20060496,"cycles":48379307,"instructions":255625396,"cache_misses":19858,"page_faults":0},
+{"name":"tower, 130 soft tokens","median_ns":28602472,"p99_ns":29197951,"cycles":67275291,"instructions":341378993,"cache_misses":22491,"page_faults":1363},
+{"name":"tower, 266 soft tokens","median_ns":45911115,"p99_ns":56156711,"cycles":105062588,"instructions":498632800,"cache_misses":45632,"page_faults":3246},
+{"name":"tower, 540 soft tokens","median_ns":79412912,"p99_ns":79985009,"cycles":179159808,"instructions":818221279,"cache_misses":99758,"page_faults":6372},
+{"name":"tower, 1064 soft tokens","median_ns":160813185,"p99_ns":170207789,"cycles":363490832,"instructions":1596949812,"cache_misses":233787,"page_faults":11877},
+{"name":"first token, image at 70","median_ns":33505041,"p99_ns":36631649,"cycles":93973726,"instructions":405992404,"cache_misses":17155,"page_faults":1},
+{"name":"first token, image at 280","median_ns":51146991,"p99_ns":54671628,"cycles":226193057,"instructions":889784091,"cache_misses":86138,"page_faults":0},
+{"name":"first token, no image","median_ns":12128368,"p99_ns":12243093,"cycles":65978963,"instructions":211202307,"cache_misses":274,"page_faults":0}
 ]

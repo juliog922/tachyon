@@ -1,123 +1,16 @@
 [
-    {
-        "name": "vram read ceiling, 4 blocks/SM",
-        "median_ns": 2207488,
-        "p99_ns": 2212320,
-        "rate": 729.613,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "vram read ceiling, 8 blocks/SM",
-        "median_ns": 2213504,
-        "p99_ns": 2216128,
-        "rate": 727.630,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "q, sliding, shared kv: 2048×2560 ×579",
-        "median_ns": 2863968,
-        "p99_ns": 2866272,
-        "rate": 563.092,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "qkv, sliding: 3072×2560 ×386",
-        "median_ns": 2601984,
-        "p99_ns": 2605312,
-        "rate": 619.787,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "q, global, shared kv: 4096×2560 ×290",
-        "median_ns": 2504896,
-        "p99_ns": 2506240,
-        "rate": 644.922,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "qkv, global: 6144×2560 ×193",
-        "median_ns": 2348160,
-        "p99_ns": 2348896,
-        "rate": 686.783,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "o, sliding: 2560×2048 ×579",
-        "median_ns": 2863936,
-        "p99_ns": 2867360,
-        "rate": 563.098,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "o, global: 2560×4096 ×290",
-        "median_ns": 2608992,
-        "p99_ns": 2612224,
-        "rate": 619.190,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "gate + up: 20480×2560 ×64",
-        "median_ns": 2387328,
-        "p99_ns": 2388832,
-        "rate": 746.684,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "down: 2560×10240 ×116",
-        "median_ns": 2326208,
-        "p99_ns": 2328832,
-        "rate": 694.462,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    },
-    {
-        "name": "lm head: 262144×2560 ×64",
-        "median_ns": 30209791,
-        "p99_ns": 30233025,
-        "rate": 755.285,
-        "unit": "GB/s",
-        "cycles": null,
-        "instructions": null,
-        "cache_misses": null,
-        "page_faults": null
-    }
+{"name":"vram read ceiling, 4 blocks/SM","median_ns":2210144,"p99_ns":2215328,"rate":728.737,"unit":"GB/s","cycles":4827387,"instructions":18080792,"cache_misses":4,"page_faults":0},
+{"name":"vram read ceiling, 8 blocks/SM","median_ns":2213408,"p99_ns":2214272,"rate":727.662,"unit":"GB/s","cycles":5522320,"instructions":20640499,"cache_misses":2,"page_faults":0},
+{"name":"q, sliding, shared kv: 2048×2560 ×579","median_ns":2862912,"p99_ns":2865024,"rate":563.300,"unit":"GB/s","cycles":7138470,"instructions":26758700,"cache_misses":3,"page_faults":0},
+{"name":"qkv, sliding: 3072×2560 ×386","median_ns":2602144,"p99_ns":2605472,"rate":619.749,"unit":"GB/s","cycles":6492410,"instructions":24321230,"cache_misses":2,"page_faults":0},
+{"name":"q, global, shared kv: 4096×2560 ×290","median_ns":2505824,"p99_ns":2508928,"rate":644.683,"unit":"GB/s","cycles":6252329,"instructions":23347969,"cache_misses":1,"page_faults":0},
+{"name":"qkv, global: 6144×2560 ×193","median_ns":2348352,"p99_ns":2351680,"rate":686.727,"unit":"GB/s","cycles":5860216,"instructions":21945702,"cache_misses":1,"page_faults":0},
+{"name":"o, sliding: 2560×2048 ×579","median_ns":2863968,"p99_ns":2937504,"rate":563.092,"unit":"GB/s","cycles":7108820,"instructions":26551418,"cache_misses":2,"page_faults":8},
+{"name":"o, global: 2560×4096 ×290","median_ns":2609664,"p99_ns":2611680,"rate":619.031,"unit":"GB/s","cycles":6512131,"instructions":24293937,"cache_misses":0,"page_faults":0},
+{"name":"gate + up: 20480×2560 ×64","median_ns":2387680,"p99_ns":2388896,"rate":746.574,"unit":"GB/s","cycles":5588631,"instructions":20831868,"cache_misses":1,"page_faults":0},
+{"name":"down: 2560×10240 ×116","median_ns":2325440,"p99_ns":2328384,"rate":694.691,"unit":"GB/s","cycles":5792170,"instructions":21665867,"cache_misses":1,"page_faults":0},
+{"name":"per-layer gate: 256×2560 ×4627","median_ns":8097280,"p99_ns":8102528,"rate":198.948,"unit":"GB/s","cycles":20174222,"instructions":75232057,"cache_misses":7,"page_faults":0},
+{"name":"per-layer projection: 2560×256 ×4627","median_ns":8909280,"p99_ns":8912416,"rate":180.816,"unit":"GB/s","cycles":22191480,"instructions":83025697,"cache_misses":6,"page_faults":0},
+{"name":"per-layer inputs: 10752×2560 ×111","median_ns":2271168,"p99_ns":2273184,"rate":714.664,"unit":"GB/s","cycles":5660699,"instructions":21170587,"cache_misses":1,"page_faults":0},
+{"name":"lm head: 262144×2560 ×64","median_ns":30208416,"p99_ns":30215136,"rate":755.320,"unit":"GB/s","cycles":74738321,"instructions":280391516,"cache_misses":22,"page_faults":0}
 ]
