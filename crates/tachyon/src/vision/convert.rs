@@ -19,11 +19,20 @@ use std::path::Path;
 const P: &str = "model.vision_tower.";
 
 /// A linear layer read from the checkpoint: rows, columns, weights, and its bounds (input then output).
-struct Linear {
+pub(crate) struct Linear {
     rows: usize,
     cols: usize,
     w: Vec<f32>,
     bounds: [f32; 4],
+}
+
+impl Linear {
+    /// Its first and second halves of rows, as two layers of its bounds (a GLU's two products).
+    pub(crate) fn halves(self) -> [Linear; 2] {
+        let (rows, cols, bounds) = (self.rows / 2, self.cols, self.bounds);
+        let (a, b) = self.w.split_at(rows * cols);
+        [a, b].map(|w| Linear { rows, cols, w: w.to_vec(), bounds })
+    }
 }
 
 /// Writes `vision.wpk` into `dst` if `st` has a vision tower.
@@ -77,7 +86,7 @@ fn layer(w: &mut Writer, st: &Safetensors, i: usize) -> Result<()> {
 }
 
 /// The linear layer `m` (clippable, with `linear.weight` and bounds, or plain, with `weight`).
-fn read(st: &Safetensors, m: &str) -> Result<Linear> {
+pub(crate) fn read(st: &Safetensors, m: &str) -> Result<Linear> {
     let clipped = format!("{m}.linear.weight");
     let weight = if st.has(&clipped) { clipped } else { format!("{m}.weight") };
     let (rows, cols) = st.dims(&weight)?;
@@ -93,8 +102,12 @@ fn read(st: &Safetensors, m: &str) -> Result<Linear> {
 
 /// Writes the linear layers `modules` as one matrix `name`, stacked or with their rows interleaved, and its bounds:
 /// the layers must share their columns and input bounds.
-fn linear(w: &mut Writer, st: &Safetensors, name: &str, modules: &[String], interleave: bool) -> Result<()> {
-    let parts = modules.iter().map(|m| read(st, m)).collect::<Result<Vec<_>>>()?;
+pub(crate) fn linear(w: &mut Writer, st: &Safetensors, name: &str, modules: &[String], interleave: bool) -> Result<()> {
+    write(w, name, &modules.iter().map(|m| read(st, m)).collect::<Result<Vec<_>>>()?, interleave)
+}
+
+/// Writes `parts` as one matrix `name`, as [`linear`] does.
+pub(crate) fn write(w: &mut Writer, name: &str, parts: &[Linear], interleave: bool) -> Result<()> {
     let first = &parts[0];
     if parts.iter().any(|p| p.cols != first.cols || p.bounds[..2] != first.bounds[..2] || interleave && p.rows != first.rows) {
         return Err(Error::Format(format!("{name}: its layers differ in shape or input bounds")));
@@ -114,11 +127,11 @@ fn linear(w: &mut Writer, st: &Safetensors, name: &str, modules: &[String], inte
 }
 
 /// `v` as little-endian `f16`.
-fn halves(v: &[f32]) -> Vec<u8> {
+pub(crate) fn halves(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|&x| f16_bits(x).to_le_bytes()).collect()
 }
 
 /// `v` as little-endian `f32`.
-fn floats(v: &[f32]) -> Vec<u8> {
+pub(crate) fn floats(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

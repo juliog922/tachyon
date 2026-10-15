@@ -23,6 +23,9 @@
 # vision: step 11b, Gemma 4's vision tower on the GPU: its conversion, its pipeline, and its own kernels (an RMS norm
 # with the residual step, per-head norms with 2-D RoPE, pooling); the products and attention are the encoder's.
 600      crates/tachyon/src/vision crates/tachyon/src/ptx/vision.rs
+# audio: step 11c, Gemma 4's audio tower on the GPU: its conversion, its pipeline, and its own kernels (the
+# subsampling convolutions, chunked attention with relative positions, the light convolution).
+700      crates/tachyon/src/audio crates/tachyon/src/ptx/audio.rs
 # media: step 11, std-only decoders (PNG with inflate, baseline JPEG), PIL's resize, WAV, resampling, mel: spec step 11
 # decisions. Planned at 700, raised to 1100 in 11a: matching PIL and libjpeg-turbo bit for bit took 890 lines for images.
 1100     crates/tachyon/src/media

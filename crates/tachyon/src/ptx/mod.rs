@@ -31,13 +31,15 @@
 //!   `packed, scales, token: *const u32, out, cols: u32, scale: f32`. The table may be pinned host memory, read
 //!   over PCIe. Launch `cols.div_ceil(256)` blocks of 256.
 //! - The encoder's kernels, [`GEMM_F16`] to [`ATTEND_F16`]: see [`encoder`]. The vision tower's, [`RMS_F16`],
-//!   [`HEADS_F16`] and [`POOL_F16`]: see [`vision`].
+//!   [`HEADS_F16`] and [`POOL_F16`]: see [`vision`]. The audio tower's, [`SUBSAMPLE`], [`ATTEND_AUDIO`] and
+//!   [`LCONV`]: see [`audio`].
 //! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`] and its `f16` forms: see [`gemm`].
 //! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
 //! Lengths are multiples of 32.
 
 pub mod attend;
+pub mod audio;
 pub mod encoder;
 pub mod gemm;
 pub mod gemv;
@@ -45,6 +47,7 @@ pub mod sample;
 pub mod vision;
 
 pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
+pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
 pub use encoder::{
     ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE,
     NORM_F16, ROPE_F16,
@@ -111,6 +114,9 @@ pub fn module() -> String {
         vision::rms_f16(),
         vision::heads_f16(),
         vision::pool_f16(),
+        audio::subsample(),
+        audio::attend_audio(),
+        audio::lconv(),
         encoder::gelu_f16(),
         encoder::rope_f16(),
         encoder::attend_f16(ATTEND_F16, 64),

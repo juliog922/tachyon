@@ -5,7 +5,7 @@
 //! tensor-core products and attention ([`crate::ptx::encoder`]) and the tower's own kernels
 //! ([`crate::ptx::vision`]). The weights are `vision.wpk` in the decoder's model directory (see [`convert`]).
 
-mod convert;
+pub(crate) mod convert;
 
 pub use convert::convert;
 
@@ -167,7 +167,7 @@ impl Vision {
     fn rms(&self, io: [u64; 5], rows: usize, eps: f32) -> Result<()> {
         let [x, y, w1, w2, a] = io;
         let h = self.shape.hidden as u32;
-        self.launch(RMS_F16, [rows as u32, 1, 1], h / 4, &[A::P(x), A::P(y), A::P(w1), A::P(w2), A::P(a), A::U(h), A::F(eps)])
+        self.launch(RMS_F16, [rows as u32, 1, 1], h / 4, &[A::P(x), A::P(y), A::P(w1), A::P(w2), A::P(a), A::P(0), A::U(h), A::F(eps)])
     }
 
     /// The tower over `n` patches in `a`, a grid `gw` across, to the soft tokens in `t`.

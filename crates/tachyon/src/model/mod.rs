@@ -4,7 +4,8 @@
 //! [`convert`] reads a checkpoint directory (`config.json`, `tokenizer.json`, `*.safetensors`) and writes a model
 //! directory: `weights.wpk`, everything that lives in VRAM; `host.wpk`, the per-layer embedding table, which stays
 //! in pinned host memory and is read one row per token over PCIe; `tokenizer.tok`; `config.json`, copied; and
-//! `vision.wpk`, the vision tower, when the checkpoint has one ([`crate::vision::convert`]). Each
+//! `vision.wpk` and `audio.wpk`, the towers, when the checkpoint has them ([`crate::vision::convert`],
+//! [`crate::audio::convert`]). Each
 //! matrix becomes Q4 ([`crate::quant`]) as `{name}.w` and `{name}.s`; projections that read the same input are
 //! fused into one matrix, rows stacked: query, key and value as `{i}.qkv`, gate and up as `{i}.gate_up`. Vectors
 //! are `f32`.
@@ -144,7 +145,7 @@ pub fn convert(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     weights(dst, &st, &cfg, p)?;
     host(dst, &st, p)?;
-    crate::vision::convert(&st, dst)?;
+    crate::vision::convert(&st, dst).and_then(|()| crate::audio::convert(&st, &text, dst))?;
     tokenizer(src, dst)?;
     Ok(std::fs::write(dst.join("config.json"), text)?)
 }

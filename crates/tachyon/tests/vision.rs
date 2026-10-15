@@ -33,8 +33,9 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
 }
 
-/// The clipped product in modes 0 (`f32`), 2 (`f16`) and 4 (gated, GELU's tanh form) for 70 tokens, in blocks of
-/// 64 and 128: inputs clamped to their bounds, each row's outputs to its own, tight enough that both bite.
+/// The clipped product in modes 0 (`f32`), 2 (`f16`), 3 (`SiLU`), 4 (gated, GELU's tanh form) and 5 (a GLU) for 70
+/// tokens, in blocks of 64 and 128: inputs clamped to their bounds, each row's outputs to its own, tight enough
+/// that both bite.
 #[test]
 fn the_clipped_product_clamps_its_input_and_each_rows_output() {
     let gpu = common::Gpu::new();
@@ -50,7 +51,7 @@ fn the_clipped_product_clamps_its_input_and_each_rows_output() {
     };
     let (ab, wb, cb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&clip));
     for (mode, (kernel, blocks, threads)) in
-        [0, 2, 4].into_iter().flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256)].map(|k| (m, k)))
+        [0, 2, 3, 4, 5].into_iter().flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256)].map(|k| (m, k)))
     {
         let y = gpu.zeros(4 * tokens * rows);
         let sizes = [rows, cols, tokens, mode as usize].map(|v| (v as u32, false));
@@ -64,7 +65,9 @@ fn the_clipped_product_clamps_its_input_and_each_rows_output() {
             let (got, want) = match mode {
                 0 => (f32s[t * rows + r], dot(t, r)),
                 2 => (f16_value(f16s[t * rows + r]), dot(t, r)),
-                _ if r % 2 == 0 => (f16_value(f16s[t * rows / 2 + r / 2]), gelu(dot(t, r)) * dot(t, r + 1)),
+                3 => (f16_value(f16s[t * rows + r]), dot(t, r) / (1.0 + (-dot(t, r)).exp())),
+                4 if r % 2 == 0 => (f16_value(f16s[t * rows / 2 + r / 2]), gelu(dot(t, r)) * dot(t, r + 1)),
+                5 if r % 2 == 0 => (f16_value(f16s[t * rows / 2 + r / 2]), dot(t, r) / (1.0 + (-dot(t, r + 1)).exp())),
                 _ => continue,
             };
             assert!((got - want).abs() <= 1e-3 + 2e-3 * want.abs(), "{kernel} mode {mode}, token {t}, row {r}: {got} against {want}");
@@ -77,7 +80,8 @@ fn rms(v: &[f32], eps: f64) -> f64 {
     common::rms(v.iter().map(|&x| f64::from(x)), eps)
 }
 
-/// The residual step and the norm: `x += w1 ⊙ rms(y)`, `a = w2 ⊙ rms(x)`; then without `y` or weights.
+/// The residual step and the norm: `x += w1 ⊙ rms(y)`, `a = w2 ⊙ rms(x)`; then without `y` or weights, the norm
+/// also as `f32`; then only as `f32`, in place.
 #[test]
 fn the_rms_norm_adds_the_residual_and_normalizes() {
     let gpu = common::Gpu::new();
@@ -85,7 +89,7 @@ fn the_rms_norm_adds_the_residual_and_normalizes() {
     let (x0, y, w1, w2) = (common::values(n * h, 21), common::values(n * h, 22), common::values(h, 23), common::values(h, 24));
     let (xb, yb, w1b, w2b, ab) = (gpu.upload(&x0), gpu.upload(&y), gpu.upload(&w1), gpu.upload(&w2), gpu.zeros(2 * n * h));
     let values = [(h as u32, false), (eps.to_bits(), true)];
-    launch(&gpu, tachyon::ptx::RMS_F16, ([n as u32, 1, 1], h as u32 / 4), &[xb.ptr(), yb.ptr(), w1b.ptr(), w2b.ptr(), ab.ptr()], &values);
+    launch(&gpu, tachyon::ptx::RMS_F16, ([n as u32, 1, 1], h as u32 / 4), &[xb.ptr(), yb.ptr(), w1b.ptr(), w2b.ptr(), ab.ptr(), 0], &values);
     let (x, a) = (gpu.floats(&xb), gpu.halves(&ab));
     for r in 0..n {
         let (row, yr) = (&x0[r * h..][..h], &y[r * h..][..h]);
@@ -97,13 +101,17 @@ fn the_rms_norm_adds_the_residual_and_normalizes() {
             assert!((f16_value(a[r * h + i]) - want).abs() <= 1e-3 * (1.0 + want.abs()), "row {r}, value {i}: a against {want}");
         }
     }
-    launch(&gpu, tachyon::ptx::RMS_F16, ([n as u32, 1, 1], h as u32 / 4), &[xb.ptr(), 0, 0, 0, ab.ptr()], &values);
-    let (again, a) = (gpu.floats(&xb), gpu.halves(&ab));
+    let normed = gpu.zeros(4 * n * h);
+    launch(&gpu, tachyon::ptx::RMS_F16, ([n as u32, 1, 1], h as u32 / 4), &[xb.ptr(), 0, 0, 0, ab.ptr(), normed.ptr()], &values);
+    let (again, a, f) = (gpu.floats(&xb), gpu.halves(&ab), gpu.floats(&normed));
     assert_eq!(again, x, "without y, x stays");
     for (i, &v) in x.iter().enumerate() {
         let want = (f64::from(v) * rms(&x[i / h * h..][..h], 1e-6)) as f32;
         assert!((f16_value(a[i]) - want).abs() <= 1e-3 * (1.0 + want.abs()), "value {i}: unweighted a against {want}");
+        assert!((f[i] - want).abs() <= 1e-5 * (1.0 + want.abs()), "value {i}: unweighted xo {} against {want}", f[i]);
     }
+    launch(&gpu, tachyon::ptx::RMS_F16, ([n as u32, 1, 1], h as u32 / 4), &[xb.ptr(), 0, 0, 0, 0, xb.ptr()], &values);
+    assert_eq!(gpu.floats(&xb), f, "normalized in place");
 }
 
 /// A head of 64 as [`tachyon::ptx::HEADS_F16`] computes it, in `f64`: normalized, weighted (queries and keys), and

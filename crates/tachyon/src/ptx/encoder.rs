@@ -11,7 +11,8 @@
 //!   the same in blocks of 128 tokens (256 threads), reading fewer bytes per operation: for batches that give it
 //!   enough blocks. [`GEMM_CLIP`] and [`GEMM_CLIP_128`] are Gemma 4's clipped linear layers: one more argument,
 //!   `clip: u64`, `f32 [4 + 2·rows]`: the bounds of `a`'s values, two unused, then each row's bounds of `y` (before
-//!   mode 4's GELU, which takes its tanh form).
+//!   any activation). Their mode 3 takes a `SiLU` instead of the ReLU, mode 4 GELU's tanh form, and mode 5 stores
+//!   `y[2j]·σ(y[2j+1])` (a GLU), as mode 4 its pair.
 //! - [`NORM_F16`]: layer norm of each row of `x` (`f32 [n, h]`): `γ ⊙ (x − mean) / √(var + eps) (+ β)` to `a`
 //!   (`f16`), and to `xo` (`f32`, may be `x`) unless 0. Arguments: `x, γ, β (or 0), a, xo (or 0): u64`, `h: u32,
 //!   eps: f32`. `h` is a multiple of 4, at most 4096. Launch `n` blocks of `(h/4).div_ceil(32)·32` threads.
@@ -231,7 +232,10 @@ const GEMM_HEAD: &str = "
     shr.u32 %turns, %r4, 5;
 ";
 
-/// The store's pointers and predicates: the bias, the mode.
+/// `−log2(e)`, as a PTX literal.
+const LOG2E_NEG: &str = "0fBFB8AA3B";
+
+/// The store's pointers and predicates: the bias, the mode (modes 4 and 5 store gated pairs).
 const STORE_HEAD: &str = "    ld.param.u64 %rd4, [py];
     cvta.to.global.u64 %rd4, %rd4;
     ld.param.u64 %rd5, [pb];
@@ -241,7 +245,8 @@ const STORE_HEAD: &str = "    ld.param.u64 %rd4, [py];
     setp.ge.u32 %m2, %mode, 2;
     setp.lt.u32 %n2, %mode, 2;
     setp.eq.u32 %m3, %mode, 3;
-    setp.eq.u32 %m4, %mode, 4;
+    setp.ge.u32 %m4, %mode, 4;
+    setp.eq.u32 %m5, %mode, 5;
     and.pred %m2, %m2, !%m4;
     shr.u32 %r10, %r1, 2;
     and.b32 %r11, %r1, 3;
@@ -273,12 +278,30 @@ fn store_pair(s: &mut String, c: usize, nt: usize, clip: bool) {
             k + 3
         );
     }
-    s.push_str("    @%m3 max.f32 %v0, %v0, 0f00000000;\n    @%m3 max.f32 %v1, %v1, 0f00000000;\n");
+    if clip {
+        // SiLU: v / (1 + e^−v).
+        for v in ["%v0", "%v1"] {
+            let _ = writeln!(
+                s,
+                "    @%m3 mul.f32 %u, {v}, {LOG2E_NEG};\n    @%m3 ex2.approx.f32 %u, %u;\n    @%m3 add.f32 %u, %u, 0f3F800000;\n    @%m3 div.rn.f32 {v}, {v}, %u;"
+            );
+        }
+    } else {
+        s.push_str("    @%m3 max.f32 %v0, %v0, 0f00000000;\n    @%m3 max.f32 %v1, %v1, 0f00000000;\n");
+    }
     let _ = writeln!(s, "    @%sadd ld.global.v2.f32 {{%o0, %o1}}, [%rd6+{}];", 32 * nt);
     s.push_str("    @%sadd add.f32 %v0, %v0, %o0;\n    @%sadd add.f32 %v1, %v1, %o1;\n");
     let _ = writeln!(s, "    @%s32 st.global.v2.f32 [%rd6+{}], {{%v0, %v1}};", 32 * nt);
     let _ = writeln!(s, "    cvt.rn.f16x2.f32 %h, %v1, %v0;\n    @%s16 st.global.b32 [%rd7+{}], %h;", 16 * nt);
-    let gate = if clip { format!("    mov.f32 %y, %v1;\n{}", super::GELU_P) } else { gelu() + "    mul.f32 %x, %x, %v1;\n" };
+    // The clipped products' gates: mode 4 GELU's tanh form, mode 5 a sigmoid (`even · σ(odd)`, a GLU).
+    let gate = if clip {
+        format!(
+            "    mov.f32 %y, %v1;\n    mul.f32 %w, %y, {LOG2E_NEG};\n    ex2.approx.f32 %w, %w;\n    add.f32 %w, %w, 0f3F800000;\n    div.rn.f32 %w, %x, %w;\n{}    @%m5 mov.f32 %x, %w;\n",
+            super::GELU_P
+        )
+    } else {
+        gelu() + "    mul.f32 %x, %x, %v1;\n"
+    };
     let _ = writeln!(s, "    mov.f32 %x, %v0;\n{gate}    cvt.rn.f16.f32 %hg, %x;\n    @%s4 st.global.b16 [%rd2+{}], %hg;", 8 * nt);
 }
 
@@ -324,7 +347,7 @@ pub(super) fn gemm_f16(name: &str, tokens: usize, clip: bool) -> String {
         ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
     .maxntid {}, 1, 1
 {{
-    .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %pt, %s32, %sadd, %s16, %s4, %neg;
+    .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
     .reg .b16 %hg;
     .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
     .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;

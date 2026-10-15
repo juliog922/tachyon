@@ -2,9 +2,9 @@
 //! ([`super::encoder`]). Rows of the residual stream are `f32`; what a product reads, `f16`.
 //!
 //! - [`RMS_F16`]: per row of `x` (`f32 [n, h]`), with `y` (`f32 [n, h]`) unless 0, first the residual step
-//!   `x += w1 ⊙ rms(y)`, written back; then `a = f16(w2 ⊙ rms(x))` unless `a` is 0. `rms(v) = v / √(mean(v²) +
-//!   eps)`; a weight of 0 is all ones. Arguments: `x, y, w1, w2, a: u64`, `h: u32, eps: f32`. `h` is a multiple
-//!   of 128, at most 4096. Launch `n` blocks of `h / 4` threads.
+//!   `x += w1 ⊙ rms(y)`, written back; then `w2 ⊙ rms(x)` as `f16` to `a` and as `f32` to `xo` (may be `x`), each
+//!   unless 0. `rms(v) = v / √(mean(v²) + eps)`; a weight of 0 is all ones. Arguments: `x, y, w1, w2, a, xo: u64`,
+//!   `h: u32, eps: f32`. `h` is a multiple of 128, at most 4096. Launch `n` blocks of `h / 4` threads.
 //! - [`HEADS_F16`]: Gemma 4's per-head norms and 2-D RoPE over `qkv` (`f16 [n, 3h]`, rows `[q, k, v]`, heads of
 //!   64), in place: each head's values to `rms`, queries times `qw`, keys times `kw` (`f32 [64]`); then the queries
 //!   and keys turned, dimensions `j, j + 16` (`j < 16`) by the token's `x` position, `32 + j, 48 + j` by its `y`,
@@ -27,7 +27,7 @@ pub const HEADS_F16: &str = "heads_f16";
 pub const POOL_F16: &str = "pool_f16";
 
 /// `%r = 1 / √(mean(v²) + eps)` over the block's row, the thread's `v` in `%v0..%v3`; through `red`, label `L`.
-fn rms(v: &str, label: &str) -> String {
+pub(super) fn rms(v: &str, label: &str) -> String {
     let mut s = format!("    mul.f32 %s, {v}0, {v}0;\n");
     (1..4).for_each(|e| _ = writeln!(s, "    fma.rn.f32 %s, {v}{e}, {v}{e}, %s;"));
     s += &warp("add.f32", "%s", "%u");
@@ -68,12 +68,12 @@ fn weights(param: &str) -> String {
 /// [`RMS_F16`]'s start: the thread's slot for its warp's sum, its four values of `x` (at `%xa`), and of `y`
 /// unless there is none.
 const RMS_HEAD: &str =
-    ".visible .entry rms_f16(.param .u64 px, .param .u64 py, .param .u64 pw1, .param .u64 pw2, .param .u64 pa, .param .u32 ph, .param .f32 peps)
+    ".visible .entry rms_f16(.param .u64 px, .param .u64 py, .param .u64 pw1, .param .u64 pw2, .param .u64 pa, .param .u64 pxo, .param .u32 ph, .param .f32 peps)
 {
     .reg .pred %p, %lane0;
     .reg .b32 %t, %k, %n, %nw, %hh, %slot, %h0, %h1;
     .reg .f32 %x<4>, %y<4>, %w<4>, %s, %u, %r, %eps, %nh;
-    .reg .b64 %xa, %ad, %o, %wo;
+    .reg .b64 %xa, %ad, %o, %wo, %fo, %wa;
     .shared .align 4 .f32 red[32];
     mov.u32 %t, %tid.x;
     and.b32 %k, %t, 31;
@@ -91,6 +91,7 @@ const RMS_HEAD: &str =
     mul.wide.u32 %o, %k, %hh;
     shl.b64 %o, %o, 2;
     add.u64 %o, %o, %wo;
+    mov.u64 %fo, %o;
     ld.param.u64 %xa, [px];
     cvta.to.global.u64 %xa, %xa;
     add.u64 %xa, %xa, %o;
@@ -104,7 +105,14 @@ const RMS_HEAD: &str =
 ";
 
 /// [`RMS_F16`]'s end: the four values of `a` stored as `f16`.
-const RMS_STORE: &str = "    cvt.rn.f16x2.f32 %h0, %x1, %x0;
+const RMS_STORE: &str = "    ld.param.u64 %ad, [pxo];
+    setp.ne.u64 %p, %ad, 0;
+    cvta.to.global.u64 %ad, %ad;
+    add.u64 %ad, %ad, %fo;
+    @%p st.global.v4.f32 [%ad], {%x0, %x1, %x2, %x3};
+    setp.eq.u64 %p, %o, 0;
+    @%p bra EXIT;
+    cvt.rn.f16x2.f32 %h0, %x1, %x0;
     cvt.rn.f16x2.f32 %h1, %x3, %x2;
     mov.u32 %k, %ctaid.x;
     mul.wide.u32 %ad, %k, %hh;
@@ -125,7 +133,7 @@ pub(super) fn rms_f16() -> String {
     s += &rms("%y", "SUMY");
     s += &weights("pw1");
     (0..4).for_each(|e| _ = writeln!(s, "    mul.f32 %y{e}, %y{e}, %r;\n    fma.rn.f32 %x{e}, %y{e}, %w{e}, %x{e};"));
-    s += "    st.global.v4.f32 [%xa], {%x0, %x1, %x2, %x3};\nNORM:\n    ld.param.u64 %o, [pa];\n    setp.eq.u64 %p, %o, 0;\n    @%p bra EXIT;\n";
+    s += "    st.global.v4.f32 [%xa], {%x0, %x1, %x2, %x3};\nNORM:\n    ld.param.u64 %o, [pa];\n    ld.param.u64 %ad, [pxo];\n    or.b64 %wa, %o, %ad;\n    setp.eq.u64 %p, %wa, 0;\n    @%p bra EXIT;\n";
     s += &rms("%x", "SUMX");
     s += &weights("pw2");
     (0..4).for_each(|e| _ = writeln!(s, "    mul.f32 %x{e}, %x{e}, %r;\n    mul.f32 %x{e}, %x{e}, %w{e};"));

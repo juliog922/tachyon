@@ -33,6 +33,12 @@ tokens move and the largest values layers read, write and leave in the residual 
 the prompt's tokens (the question, then the audio), the float32 soft tokens' file (`soft-<clip>.f16`), and the
 decoder's greedy answer in bfloat16 with the float32 tower, with each token's margin.
 
+`python3 scripts/media.py tiny-audio` writes crates/tachyon/tests/fixtures/tiny-audio/: a Gemma 4 audio tower of
+random weights (hidden 128, one head, two layers, clip bounds that bite; bfloat16 safetensors under Gemma 4's names,
+with its embedder into 256 dimensions), its `config.json`, and `soft.f32`, its float32 soft tokens of the fixture
+`speech-like.wav` through `transformers`' feature extractor, tower and embedder: the GPU tower's test with no
+checkpoint. Needs torch on the CPU.
+
 `python3 scripts/media.py inspect ~/models/gemma-4-E4B-it` prints what converting the vision tower needs to know: its
 tensors (layer 0's, as every layer has the same), whether the clip bounds of linear layers reading the same input
 agree (so they can share one product), and the pad token's embedding row.
@@ -538,6 +544,62 @@ def transcribe(model, enc):
     return answer, margins
 
 
+def tiny_audio():
+    import torch
+    from safetensors.torch import save_file
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4AudioConfig
+    from transformers.models.gemma4.feature_extraction_gemma4 import Gemma4AudioFeatureExtractor
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel, Gemma4MultimodalEmbedder
+    torch.manual_seed(11)
+    cfg = Gemma4AudioConfig(hidden_size=128, num_hidden_layers=2, num_attention_heads=1, output_proj_dims=256)
+
+    class Text:
+        hidden_size = 256
+    tower, embed = Gemma4AudioModel(cfg).eval(), Gemma4MultimodalEmbedder(cfg, Text()).eval()
+    with torch.no_grad():
+        for mod in (tower, embed):
+            for n, p in mod.named_parameters():
+                norm = "norm" in n and n.endswith("weight")
+                p.copy_((1.0 + 0.2 * torch.randn_like(p)) if norm else torch.randn_like(p) * (0.5 if p.dim() == 1 else 1.5 / p.shape[-1] ** 0.5))
+                p.copy_(p.to(torch.bfloat16).float())
+            for n, b in mod.named_buffers():
+                if n.endswith(("_min", "_max")):
+                    b.fill_((-1 if n.endswith("_min") else 1) * float(torch.empty(()).uniform_(2.0, 6.0)))
+        # Queries, keys and values read the same input, under the same bounds, as in Gemma 4's checkpoints.
+        for layer in tower.layers:
+            for p in (layer.self_attn.k_proj, layer.self_attn.v_proj):
+                p.input_min.copy_(layer.self_attn.q_proj.input_min)
+                p.input_max.copy_(layer.self_attn.q_proj.input_max)
+    dst = os.path.join(ROOT, "..", "tiny-audio")
+    os.makedirs(dst, exist_ok=True)
+    tensors = {"model.audio_tower." + k: v.contiguous() for k, v in tower.state_dict().items() if not k.endswith("inv_timescales")}
+    tensors.update({"model.embed_audio." + k: v.contiguous() for k, v in embed.state_dict().items()})
+    tensors = {k: v.to(torch.bfloat16) if v.dim() > 0 else v.float() for k, v in tensors.items()}
+    save_file(tensors, os.path.join(dst, "model.safetensors"))
+    with open(os.path.join(dst, "config.json"), "w") as f:
+        json.dump({"audio_config": cfg.to_dict()}, f, indent=1, default=str)
+    with wave_open(os.path.join(ROOT, "speech-like.wav")) as samples:
+        feats = Gemma4AudioFeatureExtractor()([samples], return_tensors="pt")
+    with torch.no_grad():
+        out = tower(feats["input_features"], feats["input_features_mask"])
+        soft = embed(out.last_hidden_state[out.attention_mask])
+    soft.float().numpy().astype("<f4").tofile(os.path.join(dst, "soft.f32"))
+    print("%d soft tokens of %d, largest %.3g, in %s" % (soft.shape[0], soft.shape[1], float(soft.abs().max()), dst))
+
+
+class wave_open:
+    """A 16 kHz mono 16-bit WAV file's samples, as Tachyon reads them, in a `with`."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        return clip(self.path)
+
+    def __exit__(self, *_):
+        return False
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "images"
     if mode == "vision":
@@ -546,6 +608,8 @@ if __name__ == "__main__":
         inspect(os.path.expanduser(sys.argv[2]))
     elif mode == "speech":
         speech(os.path.expanduser(sys.argv[2]), [os.path.expanduser(p) for p in sys.argv[3:]])
+    elif mode == "tiny-audio":
+        tiny_audio()
     elif mode == "audio":
         audio(os.path.expanduser(sys.argv[2]) if len(sys.argv) > 2 else None)
     else:
