@@ -1,0 +1,6 @@
+[
+{"name":"tower, clip-0.wav","median_ns":73862353,"p99_ns":76791121,"cycles":317238421,"instructions":624340738,"cache_misses":146202,"page_faults":1528},
+{"name":"tower, clip-1.wav","median_ns":57596120,"p99_ns":60193841,"cycles":254421072,"instructions":498303319,"cache_misses":163452,"page_faults":0},
+{"name":"transcription, clip-0.wav (12.5 s)","median_ns":511334796,"p99_ns":513531111,"rate":0.041,"unit":"× real time","cycles":2165725433,"instructions":2277021419,"cache_misses":320355,"page_faults":0},
+{"name":"transcription, clip-1.wav (9.9 s)","median_ns":416732258,"p99_ns":421741091,"rate":0.042,"unit":"× real time","cycles":1763432944,"instructions":1839962283,"cache_misses":263248,"page_faults":0}
+]
