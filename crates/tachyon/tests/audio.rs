@@ -176,6 +176,7 @@ fn a_tiny_tower_matches_transformers() {
 #[test]
 fn the_tower_matches_hugging_faces_soft_tokens() {
     use tachyon::json::Json;
+    let _gpu = e4b();
     let dir = std::env::var("TACHYON_MODEL")
         .map_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/tachyon/gemma-4-e4b"), Into::into);
     let media = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/media");
@@ -199,6 +200,16 @@ fn the_tower_matches_hugging_faces_soft_tokens() {
 /// The question `scripts/media.py speech` asked about each clip.
 #[cfg(all(feature = "gpu", feature = "models"))]
 const TRANSCRIBE: &str = "Transcribe this audio.";
+
+/// Held by each test that loads E4B, so they run one at a time: together they pass a 6 GB GPU's memory.
+#[cfg(all(feature = "gpu", feature = "models"))]
+static E4B: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The [`E4B`] lock, even after a test that held it failed.
+#[cfg(all(feature = "gpu", feature = "models"))]
+fn e4b() -> std::sync::MutexGuard<'static, ()> {
+    E4B.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// E4B's model directory: `$TACHYON_MODEL`, by default `~/.local/share/tachyon/gemma-4-e4b`.
 #[cfg(all(feature = "gpu", feature = "models"))]
@@ -231,13 +242,16 @@ fn ids(case: &tachyon::json::Json, key: &str) -> Vec<u32> {
 
 /// E4B with the tower's soft tokens against Hugging Face's bfloat16 decoder with the float32 tower, on the two
 /// clips: the chat template gives the reference's tokens; fed the prompt and each reference answer token by token,
-/// its pick after every token agrees with the reference's on ≥ 80% of the positions (to be measured against what
-/// 4-bit weights allow, `scripts/agreement.py`). Prefill takes chunks of 128 tokens, so the clips' slots cross chunk
+/// its pick after every token agrees with the reference's on ≥ 87% of the positions. That bound is what 4-bit weights
+/// allow, measured by `scripts/agreement.py` on `speech.ref`: Hugging Face's model with its weights rounded as Tachyon
+/// rounds them, and its activations to 8 bits, agrees on 59 of 64 (Tachyon too); the bound sits three picks below.
+/// Prefill takes chunks of 128 tokens, so the clips' slots cross chunk
 /// boundaries. Disagreements where the reference was sure (a gap of 2 or more) are printed.
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn the_decoder_transcribes_as_hugging_face_does() {
     use tachyon::token::{Chat, Message, Role, Tokenizer};
+    let _gpu = e4b();
     let (dir, ctx) = (model_dir(), tachyon::cuda::Context::new(0).unwrap());
     let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok")).unwrap()).unwrap();
     let mut tower = tachyon::audio::Tower::open(&ctx, &dir).unwrap();
@@ -269,7 +283,7 @@ fn the_decoder_transcribes_as_hugging_face_does() {
         (agree, total) = (agree + mine, total + answer.len());
     }
     println!("top-1 agreement {agree}/{total} ({:.2}%)", 100.0 * agree as f64 / total as f64);
-    assert!(agree as f64 >= 0.80 * total as f64);
+    assert!(agree as f64 >= 0.87 * total as f64);
 }
 
 /// The engine transcribes clip 0: its answer holds at least 80% of the words of Hugging Face's.
@@ -278,6 +292,7 @@ fn the_decoder_transcribes_as_hugging_face_does() {
 fn the_engine_transcribes_a_clip() {
     use tachyon::engine::{Engine, Limits, Load, Request};
     use tachyon::token::{Detokenizer, Message, Role, Tokenizer};
+    let _gpu = e4b();
     let (case, clip) = speech().swap_remove(0);
     let mut engine = Engine::new(0, Limits::default()).unwrap();
     engine.load("e4b", &model_dir(), &Load::default()).unwrap();

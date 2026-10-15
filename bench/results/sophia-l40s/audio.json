@@ -1,0 +1,42 @@
+[
+    {
+        "name": "tower, clip-0.wav",
+        "median_ns": 64989864,
+        "p99_ns": 65071349,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "tower, clip-1.wav",
+        "median_ns": 49538477,
+        "p99_ns": 49639042,
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "transcription, clip-0.wav (12.5 s)",
+        "median_ns": 235337088,
+        "p99_ns": 236391722,
+        "rate": 0.019,
+        "unit": "× real time",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    },
+    {
+        "name": "transcription, clip-1.wav (9.9 s)",
+        "median_ns": 190135854,
+        "p99_ns": 190401718,
+        "rate": 0.019,
+        "unit": "× real time",
+        "cycles": null,
+        "instructions": null,
+        "cache_misses": null,
+        "page_faults": null
+    }
+]
