@@ -18,8 +18,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tachyon::json::Json;
 
-/// Bytes per range request.
-pub const CHUNK: u64 = 32 << 20;
+/// Bytes per chunk: what is marked written, and resumed, at a time. A download ends one chunk's hashing and flushing
+/// after its last byte arrives.
+pub const CHUNK: u64 = 8 << 20;
 /// Connections at once, unless `TACHYON_CONNECTIONS` says otherwise.
 const CONNECTIONS: usize = 8;
 /// Attempts per chunk before the download gives up.
@@ -27,7 +28,7 @@ const ATTEMPTS: usize = 5;
 /// Chunks a download keeps requested at once, shared among its connections: one connection asks for this many in
 /// one request, so the CDN's wait before the first byte is paid once per 256 MiB, not per chunk; several
 /// connections ask for fewer each, which keeps the hashing, which goes in order, close behind.
-const IN_FLIGHT: usize = 8;
+const IN_FLIGHT: usize = 32;
 /// The Hub: where it is, and what its TLS connections trust.
 pub struct Hub {
     base: String,
@@ -123,9 +124,9 @@ fn small(url: &Url, file: &Entry, target: &Path, config: &Arc<ClientConfig>) -> 
     std::fs::write(target, body)
 }
 
-/// A download in chunks: the part file, the chunk states, and the final URL the Hub's redirects lead to.
+/// A download in chunks: the part file, the chunk states, and the URL the Hub's redirects led to once one is known.
 struct Chunked {
-    url: Mutex<Url>,
+    url: Mutex<Option<Url>>,
     first: Url,
     size: u64,
     part: File,
@@ -140,7 +141,7 @@ struct Chunked {
 }
 
 impl Chunked {
-    /// Opens (or reopens) the part and state files of `target`, and finds where the Hub redirects `url`.
+    /// Opens (or reopens) the part and state files of `target`, to be fetched from `url`.
     fn start(url: &Url, size: u64, target: &Path, config: &Arc<ClientConfig>) -> io::Result<Chunked> {
         let open = |ext| OpenOptions::new().read(true).write(true).create(true).truncate(false).open(sibling(target, ext));
         let (part, state) = (open("part")?, open("part.chunks")?);
@@ -151,11 +152,10 @@ impl Chunked {
         flags[have..].fill(0);
         let done: Vec<AtomicBool> = flags.iter().map(|&f| AtomicBool::new(f == 1)).collect();
         let received = done.iter().enumerate().filter(|d| d.1.load(Ordering::Relaxed)).map(|(i, _)| span(i, size).1).sum();
-        let resolved = resolve(url, config)?;
         let (failed, signal) = (Mutex::new(None), (Mutex::new(()), Condvar::new()));
         let (next, received) = (AtomicUsize::new(0), AtomicU64::new(received));
         Ok(Chunked {
-            url: Mutex::new(resolved),
+            url: Mutex::new(None),
             first: url.clone(),
             size,
             part,
@@ -241,13 +241,14 @@ impl Chunked {
     }
 
     /// One attempt at chunks `from..to`: one range request whose body is written in place as it arrives, each chunk
-    /// marked as soon as it is whole.
+    /// marked as soon as it is whole. The first request of a connection goes to the Hub, whose redirect leads to the
+    /// CDN the connection then stays on; later ones go to the CDN straight away.
     fn try_run(&self, conn: &mut Option<Connection>, (from, to): (usize, usize)) -> io::Result<()> {
         let (start, end) = (span(from, self.size).0, span(to - 1, self.size).0 + span(to - 1, self.size).1);
         let range = format!("bytes={start}-{}", end - 1);
-        let url = self.url.lock().expect("no thread panics holding it").clone();
+        let url = self.url.lock().expect("no thread panics holding it").clone().unwrap_or_else(|| self.first.clone());
         let (mut at, mut chunk) = (start, from);
-        let (response, _) = fetch(conn, &url, &[("Range", &range)], &self.config, &mut |b| {
+        let (response, last) = fetch(conn, &url, &[("Range", &range)], &self.config, &mut |b| {
             self.part.write_all_at(b, at)?;
             at += b.len() as u64;
             while chunk < to && at >= span(chunk, self.size).0 + span(chunk, self.size).1 {
@@ -256,10 +257,9 @@ impl Chunked {
             }
             Ok(())
         })?;
-        if matches!(response.status, 401 | 403 | 410) {
-            // A signed CDN URL that expired: ask the Hub again.
-            *self.url.lock().expect("no thread panics holding it") = resolve(&self.first, &self.config)?;
-        }
+        // A signed CDN URL that expired: the next attempt asks the Hub again.
+        let expired = matches!(response.status, 401 | 403 | 410);
+        *self.url.lock().expect("no thread panics holding it") = (!expired).then_some(last);
         if response.status != 206 || at != end {
             return Err(io::Error::other(format!("range {range}: status {}, {} of {} bytes", response.status, at - start, end - start)));
         }
@@ -331,15 +331,6 @@ fn sibling(target: &Path, ext: &str) -> std::path::PathBuf {
 fn span(i: usize, size: u64) -> (u64, u64) {
     let start = i as u64 * CHUNK;
     (start, CHUNK.min(size - start))
-}
-
-/// Where the Hub's redirects for `url` lead (a CDN URL, signed for a while).
-fn resolve(url: &Url, config: &Arc<ClientConfig>) -> io::Result<Url> {
-    let (response, last) = fetch(&mut None, url, &[("Range", "bytes=0-0")], config, &mut |_| Ok(()))?;
-    match response.status {
-        200 | 206 => Ok(last),
-        status => Err(io::Error::other(format!("{} answered {status} for {}", url.host, url.path))),
-    }
 }
 
 #[cfg(test)]
@@ -417,21 +408,23 @@ mod tests {
         Hub::at(&format!("http://127.0.0.1:{port}"), ClientConfig { anchors: Vec::new(), random: crate::net::crypto::random, now: || 0 })
     }
 
-    /// A file of two and a half chunks downloads in ranges and checks; a download that stopped after its second
-    /// chunk fetches only the other two; a corrupted byte is caught by the hash and the next attempt starts over.
+    /// A file of two and a half chunks downloads in ranges and checks, over a connection per chunk and over one; a
+    /// download that stopped after its second chunk fetches only the other two; a corrupted byte is caught by the
+    /// hash and the next attempt starts over. No request is made but for the file's bytes.
     #[test]
     fn downloads_resume_and_catch_corruption() {
         let data: Vec<u8> = (0..CHUNK as usize * 5 / 2).map(|i| (i % 251) as u8 ^ (i >> 20) as u8).collect();
         let dir = std::env::temp_dir().join(format!("tachyon-hub-{}", std::process::id()));
         let good = fake(&data, data.clone());
-        let hub = hub(good.port);
+        let mut hub = hub(good.port);
+        hub.connections = IN_FLIGHT;
         let files = hub.files("r").unwrap();
         assert_eq!(files.iter().map(|f| (f.path.as_str(), f.sha256.is_some())).collect::<Vec<_>>(), [("config.json", false), ("model.bin", true)]);
         for f in &files {
             hub.download("r", f, &dir, &|_, _| {}).unwrap();
         }
         assert!(std::fs::read(dir.join("model.bin")).unwrap() == data && std::fs::read(dir.join("config.json")).unwrap() == b"{}");
-        assert_eq!(good.ranges.lock().unwrap().len(), 4, "three chunks, and the probe of the redirect");
+        assert_eq!(good.ranges.lock().unwrap().len(), 3, "a request per chunk");
         // Killed after chunk 1 of 3: its part file and state are there; only chunks 0 and 2 are fetched again.
         std::fs::remove_file(dir.join("model.bin")).unwrap();
         let (c, n) = (CHUNK as usize, data.len());
@@ -442,7 +435,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("model.bin")).unwrap(), data);
         let mut ranges = good.ranges.lock().unwrap().clone();
         ranges.sort();
-        assert_eq!(ranges, ["0-1", &format!("0-{c}"), &format!("{}-{n}", 2 * c)], "the probe, chunks 0 and 2, in any order");
+        assert_eq!(ranges, [format!("0-{c}"), format!("{}-{n}", 2 * c)], "chunks 0 and 2, in any order");
         // Over one connection the file is one request, and resumed, one request per run of missing chunks.
         let mut one = self::hub(good.port);
         one.connections = 1;
@@ -450,14 +443,14 @@ mod tests {
         good.ranges.lock().unwrap().clear();
         one.download("r", &files[1], &dir, &|_, _| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("model.bin")).unwrap(), data);
-        assert_eq!(*good.ranges.lock().unwrap(), ["0-1", &format!("0-{n}")], "the probe, the whole file");
+        assert_eq!(*good.ranges.lock().unwrap(), [format!("0-{n}")], "the whole file");
         std::fs::remove_file(dir.join("model.bin")).unwrap();
         std::fs::write(dir.join("model.bin.part"), [&vec![0; c][..], &data[c..2 * c], &vec![0; n - 2 * c]].concat()).unwrap();
         std::fs::write(dir.join("model.bin.part.chunks"), [0, 1, 0]).unwrap();
         good.ranges.lock().unwrap().clear();
         one.download("r", &files[1], &dir, &|_, _| {}).unwrap();
         assert_eq!(std::fs::read(dir.join("model.bin")).unwrap(), data);
-        assert_eq!(*good.ranges.lock().unwrap(), ["0-1", &format!("0-{c}"), &format!("{}-{n}", 2 * c)], "the probe, chunks 0 and 2");
+        assert_eq!(*good.ranges.lock().unwrap(), [format!("0-{c}"), format!("{}-{n}", 2 * c)], "chunks 0 and 2");
         // A server that flips one byte.
         let mut bad = data.clone();
         bad[c + 7] ^= 1;

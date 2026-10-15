@@ -45,7 +45,7 @@ cargo run --release -p tachyon-cli -- pull granite-embedding-311m
 cargo run --release -p tachyon-cli -- embed granite-embedding-311m --dims=256 "how do I get a refund"
 ```
 
-`pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 32 MiB ranges, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
+`pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 8 MiB chunks, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
 
 In your program, `tachyon::engine` is the API (see its documentation):
 
