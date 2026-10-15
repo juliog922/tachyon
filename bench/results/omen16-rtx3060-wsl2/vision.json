@@ -1,0 +1,10 @@
+[
+{"name":"tower, 63 soft tokens","median_ns":28820176,"p99_ns":29270428,"cycles":119829625,"instructions":273663783,"cache_misses":77158,"page_faults":0},
+{"name":"tower, 130 soft tokens","median_ns":45509795,"p99_ns":54013770,"cycles":185246013,"instructions":373072603,"cache_misses":107556,"page_faults":1363},
+{"name":"tower, 266 soft tokens","median_ns":88332658,"p99_ns":95253159,"cycles":353049988,"instructions":602928816,"cache_misses":154075,"page_faults":3246},
+{"name":"tower, 540 soft tokens","median_ns":187445643,"p99_ns":195260080,"cycles":749903904,"instructions":1111123927,"cache_misses":256665,"page_faults":6256},
+{"name":"tower, 1064 soft tokens","median_ns":455907797,"p99_ns":465041277,"cycles":1959109043,"instructions":2515589480,"cache_misses":505701,"page_faults":11877},
+{"name":"first token, image at 70","median_ns":59485696,"p99_ns":61535707,"cycles":286096835,"instructions":428183235,"cache_misses":88802,"page_faults":0},
+{"name":"first token, image at 280","median_ns":162440101,"p99_ns":173227870,"cycles":742836666,"instructions":979598466,"cache_misses":354974,"page_faults":0},
+{"name":"first token, no image","median_ns":30030092,"p99_ns":32682702,"cycles":173616190,"instructions":153947471,"cache_misses":14252,"page_faults":0}
+]
