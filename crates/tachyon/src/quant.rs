@@ -12,6 +12,8 @@
 //!
 //! **Q8P activations**, the prefill layout: the same `i8` values, per block of 64 the pair `[s, z]` of [`q8p`].
 //!
+//! **Q8E**, the encoder's 8-bit weights and activations ([`q8e`]): the same `i8` values, per block of 64 only `s`.
+//!
 //! **Sources.** [`Safetensors`] reads the checkpoints models ship as, rows at a time, as `f32`.
 
 use crate::json::Json;
@@ -100,6 +102,16 @@ pub fn q8(x: &[f32]) -> (Vec<i8>, Vec<[f32; 2]>) {
 pub fn q8p(x: &[f32]) -> (Vec<i8>, Vec<[f32; 2]>) {
     let (q, s) = blocks(x, PREFILL_BLOCK);
     (q, s.into_iter().map(|[scale, sum]| [scale, scale.mul_add(-MAGIC, sum * -8.0)]).collect())
+}
+
+/// Quantizes rows to Q8E, the 8-bit weights and activations of [`crate::ptx::GEMM_Q8`]: `i8` values and a scale
+/// `s` per block of [`PREFILL_BLOCK`], `x ≈ q·s`, the largest magnitude of a block over 127, ties to even.
+///
+/// # Panics
+/// When the rows are not a multiple of [`PREFILL_BLOCK`] long.
+pub fn q8e(x: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let (q, s) = blocks(x, PREFILL_BLOCK);
+    (q, s.into_iter().map(|[scale, _]| scale).collect())
 }
 
 /// `i8` values and `[s, s·Σq]` per block of `n`.

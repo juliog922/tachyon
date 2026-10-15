@@ -5,11 +5,11 @@
 //! - [`GEMM_F16`]: `y = a · wᵀ (+ bias)`, `a` `f16 [tokens, cols]`, `w` `f16 [rows, cols]`, on tensor cores
 //!   (`mma.sync` `m16n8k16`, `f32` sums). `mode` 0 stores `f32 [tokens, rows]`, 1 adds into it (the residual), 2
 //!   stores `f16`, 3 stores `f16` after a ReLU, 4 stores `gelu(y[2j])·y[2j+1]` as `f16 [tokens, rows/2]` (a gated
-//!   GELU whose two halves' rows are interleaved). Arguments: `a, w, bias (or 0), y: u64`, `rows, cols, tokens,
+//!   GELU whose two halves' rows are interleaved), 5 `silu(y[2j])·y[2j+1]` likewise. Arguments: `a, w, bias (or 0), y: u64`, `rows, cols, tokens,
 //!   mode: u32`. `rows` is a multiple of [`GEMM_F16_TILE`], `cols` of 64; `a` holds whole blocks of tokens. Blocks
 //!   of 64 tokens × 64 rows: launch `tokens.div_ceil(64) · rows / 64` blocks of 128 threads. [`GEMM_F16_128`] is
-//!   the same in blocks of 128 tokens (256 threads), reading fewer bytes per operation: for batches that give it
-//!   enough blocks. [`GEMM_CLIP`] and [`GEMM_CLIP_128`] are Gemma 4's clipped linear layers: one more argument,
+//!   the same in blocks of 128 tokens (256 threads), reading fewer bytes per operation: which of the two a shape
+//!   takes is raced on the GPU (`encoder::race`). [`GEMM_CLIP`] and [`GEMM_CLIP_128`] are Gemma 4's clipped linear layers: one more argument,
 //!   `clip: u64`, `f32 [4 + 2·rows]`: the bounds of `a`'s values, two unused, then each row's bounds of `y` (before
 //!   any activation). Their mode 3 takes a `SiLU` instead of the ReLU, mode 4 GELU's tanh form, and mode 5 stores
 //!   `y[2j]·σ(y[2j+1])` (a GLU), as mode 4 its pair.
@@ -38,6 +38,12 @@ use std::fmt::Write;
 
 /// Name of the `f16` matrix product.
 pub const GEMM_F16: &str = "gemm_f16";
+/// Name of the 8-bit matrix product: [`GEMM_F16`]'s modes on Q8 weights and activations.
+pub const GEMM_Q8: &str = "gemm_q8";
+/// Name of the 8-bit matrix product in blocks of 128 tokens.
+pub const GEMM_Q8_128: &str = "gemm_q8_128";
+/// Name of the kernel that rounds `f16` rows to Q8, for [`GEMM_Q8`].
+pub const QUANT_F16: &str = "quant_f16";
 /// Name of the `f16` matrix product in blocks of 128 tokens, 256 threads.
 pub const GEMM_F16_128: &str = "gemm_f16_128";
 /// Name of the clipped `f16` matrix product, for Gemma 4's vision tower.
@@ -72,9 +78,18 @@ pub(super) fn f(v: f32) -> String {
 
 /// Bytes of a shared row of 32 `f16` (a `k` slice), padded so `ldmatrix` is free of bank conflicts.
 const ROW: usize = 80;
-/// One stage of a product taking `tokens` rows of activations: those, then 64 weight rows.
-const fn stage(tokens: usize) -> usize {
-    (tokens + 64) * ROW
+/// One stage of a product taking `tokens` rows of activations: those, then 64 weight rows; for Q8, then the
+/// activations' scales and the weights'.
+const fn stage(tokens: usize, q8: bool) -> usize {
+    (tokens + 64) * ROW + if q8 { 4 * tokens + 4 * 64 } else { 0 }
+}
+
+/// What a product multiplies: `f16`, `f16` clipped to bounds, or Q8.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Operands {
+    F16,
+    Clip,
+    Q8,
 }
 
 /// Tiles of tokens a group of [`GEMM_F16`]'s blocks takes together.
@@ -91,15 +106,25 @@ const fn stages(tokens: usize) -> usize {
     if tokens == 128 { 3 } else { 4 }
 }
 
-/// Queues stage `buf`'s copy of the slice `off` bytes past the current, under `guard`, for blocks of `tokens`.
-fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), guard: &str) {
-    let (base, pass) = (buf * stage(tokens), block(tokens).2);
+/// Queues stage `buf`'s copy of the slice `off` bytes past the current, under `%q`, for blocks of `tokens`; with
+/// `q8`, its group's scales too.
+fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), q8: bool) {
+    let (base, pass) = (buf * stage(tokens, q8), block(tokens).2);
     let mut parts = Vec::new();
     for (dst, n, src) in [("%sa", tokens, ["%ga0", "%ga1"]), ("%sw", 64, ["%gw0", "%gw1"])] {
         parts.extend((0..n / pass).map(|p| (dst, p * pass * ROW, src[p])));
     }
     for (dst, at, src) in parts {
-        let _ = writeln!(s, "    {guard}cp.async.cg.shared.global [{dst}+{}], [{src}+{off}], 16;", base + at);
+        let _ = writeln!(s, "    @%q cp.async.cg.shared.global [{dst}+{}], [{src}+{off}], 16;", base + at);
+    }
+    if q8 {
+        s.push_str("    and.pred %qa, %q, %ta;\n    and.pred %qw, %q, %tw;\n");
+        let _ = writeln!(
+            s,
+            "    @%qa cp.async.ca.shared.global [%ss+{base}], [%gs+{}], 4;\n    @%qw cp.async.ca.shared.global [%sd+{base}], [%gd+{}], 4;",
+            off / 16,
+            off / 16
+        );
     }
     s.push_str("    cp.async.commit_group;\n");
 }
@@ -108,7 +133,7 @@ fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), guard: &str) 
 /// blocks of 64 tokens, one for 32), clamped to the input bounds if `clip`, two of weights (four tiles of 8 rows),
 /// and an `mma` per pair of tiles.
 fn products(s: &mut String, tokens: usize, buf: usize, clip: bool) {
-    let base = buf * stage(tokens);
+    let base = buf * stage(tokens, false);
     for ks in 0..2 {
         for mi in 0..block(tokens).1 / 16 {
             let a = 4 * mi;
@@ -185,12 +210,12 @@ const GEMM_HEAD: &str = "
     shl.b32 %r7, %r7, 6;
     shr.u32 %r8, %r0, 2;
     and.b32 %r9, %r0, 3;
-    shl.b32 %r9, %r9, 3;
+    shl.b32 %r9, %r9, CSHIFT;
     cvt.u64.u32 %rd1, %r9;
     add.u32 %r10, %r8, %r6;
     mul.wide.u32 %rd0, %r10, %r4;
     add.u64 %rd0, %rd0, %rd1;
-    shl.b64 %rd0, %rd0, 1;
+    shl.b64 %rd0, %rd0, ESHIFT;
     ld.param.u64 %rd2, [pa];
     cvta.to.global.u64 %rd2, %rd2;
     add.u64 %ga0, %rd2, %rd0;
@@ -199,14 +224,14 @@ const GEMM_HEAD: &str = "
     add.u32 %r10, %r8, %r7;
     mul.wide.u32 %rd0, %r10, %r4;
     add.u64 %rd0, %rd0, %rd1;
-    shl.b64 %rd0, %rd0, 1;
+    shl.b64 %rd0, %rd0, ESHIFT;
     ld.param.u64 %rd2, [pw];
     cvta.to.global.u64 %rd2, %rd2;
     add.u64 %gw0, %rd2, %rd0;
     add.u64 %gw1, %gw0, %rd3;
     mov.u32 %sm, smem;
     mad.lo.u32 %sa, %r8, ROW, %sm;
-    shl.b32 %r9, %r9, 1;
+    shl.b32 %r9, %r9, ESHIFT;
     add.u32 %sa, %sa, %r9;
     add.u32 %sw, %sa, HALF;
     shr.u32 %r10, %r2, 1;
@@ -229,8 +254,112 @@ const GEMM_HEAD: &str = "
     mad.lo.u32 %fb, %r10, 16, %fb;
     add.u32 %r12, %r12, %r6;
     add.u32 %r13, %r13, %r7;
-    shr.u32 %turns, %r4, 5;
+    shr.u32 %turns, %r4, TURNSHIFT;
 ";
+
+/// The Q8 products' scales: copies' sources `%gs` (the thread's token, under `%ta`) and `%gd` (its weight row, under
+/// `%tw`) and destinations `%ss`, `%sd`; fragments' `%fs` (the warp's token `g`) and `%fd` (its rows `2t, 2t + 1`);
+/// `%mz` the integer chains' start, the float `MAGIC`.
+const Q8_HEAD: &str = "    shr.u32 %ng, %r4, 6;
+    ld.param.u64 %rd8, [pas];
+    cvta.to.global.u64 %rd8, %rd8;
+    add.u32 %r14, %r6, %r0;
+    mul.wide.u32 %rd9, %r14, %ng;
+    shl.b64 %rd9, %rd9, 2;
+    add.u64 %gs, %rd8, %rd9;
+    ld.param.u64 %rd8, [pws];
+    cvta.to.global.u64 %rd8, %rd8;
+    add.u32 %r14, %r7, %r0;
+    mul.wide.u32 %rd9, %r14, %ng;
+    shl.b64 %rd9, %rd9, 2;
+    add.u64 %gd, %rd8, %rd9;
+    mad.lo.u32 %ss, %r0, 4, %sm;
+    add.u32 %ss, %ss, SCALES;
+    add.u32 %sd, %ss, TSCALES;
+    setp.lt.u32 %ta, %r0, TOKENS;
+    setp.lt.u32 %tw, %r0, 64;
+    sub.u32 %r14, %r12, %r6;
+    shr.u32 %r15, %r1, 2;
+    add.u32 %r14, %r14, %r15;
+    mad.lo.u32 %fs, %r14, 4, %sm;
+    add.u32 %fs, %fs, SCALES;
+    sub.u32 %r14, %r13, %r7;
+    and.b32 %r15, %r1, 3;
+    mad.lo.u32 %r14, %r15, 2, %r14;
+    mad.lo.u32 %fd, %r14, 4, %sm;
+    add.u32 %fd, %fd, SCALES;
+    add.u32 %fd, %fd, TSCALES;
+    mov.u32 %mz, 0x4B400000;
+";
+
+/// The Q8 products of stage `buf`: per 32 of `k`, the `ldmatrix` of [`products`] (32 bytes of a row are 32 values
+/// here) and an integer `mma` per pair of tiles, two chained per group of 64 from `%mz`, so a chain's sum `i`
+/// reads as the float `MAGIC + i`; then [`scale_q8`].
+fn products_q8(s: &mut String, tokens: usize, buf: usize) {
+    let base = buf * stage(tokens, true);
+    for ks in 0..2 {
+        for mi in 0..block(tokens).1 / 16 {
+            let a = 4 * mi;
+            let _ = writeln!(
+                s,
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%a{a}, %a{}, %a{}, %a{}}}, [%fa+{}];",
+                a + 1,
+                a + 2,
+                a + 3,
+                base + mi * 16 * ROW + 32 * ks
+            );
+        }
+        for pair in 0..2 {
+            let b = 4 * pair;
+            let _ = writeln!(
+                s,
+                "    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%b{b}, %b{}, %b{}, %b{}}}, [%fb+{}];",
+                b + 1,
+                b + 2,
+                b + 3,
+                base + pair * 16 * ROW + 32 * ks
+            );
+        }
+        for mi in 0..block(tokens).1 / 16 {
+            for nt in 0..4 {
+                let (c, a, b) = ((mi * 4 + nt) * 4, 4 * mi, 2 * nt);
+                let acc = if ks == 0 { "%mz, %mz, %mz, %mz".to_string() } else { format!("%i{c}, %i{}, %i{}, %i{}", c + 1, c + 2, c + 3) };
+                let _ = writeln!(
+                    s,
+                    "    mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{%i{c}, %i{}, %i{}, %i{}}}, {{%a{a}, %a{}, %a{}, %a{}}}, {{%b{b}, %b{}}}, {{{acc}}};",
+                    c + 1,
+                    c + 2,
+                    c + 3,
+                    a + 1,
+                    a + 2,
+                    a + 3,
+                    b + 1
+                );
+            }
+        }
+    }
+    scale_q8(s, tokens, base);
+}
+
+/// The Q8 products' integer sums of the stage at `base` scaled into the `f32` sums: per output `fma(i, s, −MAGIC·s)`
+/// with its token's scale `s`, then one more with its row's.
+fn scale_q8(s: &mut String, tokens: usize, base: usize) {
+    (0..4).for_each(|nt| _ = writeln!(s, "    ld.shared.v2.f32 {{%ws{}, %ws{}}}, [%fd+{}];", 2 * nt, 2 * nt + 1, base + 32 * nt));
+    for (mi, j) in (0..block(tokens).1 / 16).flat_map(|mi| [(mi, 0), (mi, 1)]) {
+        let _ = writeln!(s, "    ld.shared.f32 %ts, [%fs+{}];\n    mul.f32 %tz, %ts, 0fCB400000;", base + 4 * (16 * mi + 8 * j));
+        for (nt, e) in (0..4).flat_map(|nt| [(nt, 0), (nt, 1)]) {
+            let c = (mi * 4 + nt) * 4 + 2 * j + e;
+            let _ = writeln!(s, "    fma.rn.f32 %ft, %i{c}, %ts, %tz;\n    fma.rn.f32 %c{c}, %ft, %ws{}, %c{c};", 2 * nt + e);
+        }
+    }
+}
+
+/// The Q8 products' registers.
+const Q8_REGS: &str = "
+    .reg .pred %ta, %tw, %qa, %qw;
+    .reg .b32 %i<32>, %mz, %ng, %ss, %sd, %fs, %fd;
+    .reg .f32 %ws<8>, %ts, %tz, %ft;
+    .reg .b64 %gs, %gd;";
 
 /// `−log2(e)`, as a PTX literal.
 const LOG2E_NEG: &str = "0fBFB8AA3B";
@@ -300,7 +429,11 @@ fn store_pair(s: &mut String, c: usize, nt: usize, clip: bool) {
             super::GELU_P
         )
     } else {
-        gelu() + "    mul.f32 %x, %x, %v1;\n"
+        // Mode 5: a gated SiLU, `even / (1 + e^−even) · odd`.
+        let silu = format!(
+            "    @%m5 mul.f32 %u, %v0, {LOG2E_NEG};\n    @%m5 ex2.approx.f32 %u, %u;\n    @%m5 add.f32 %u, %u, 0f3F800000;\n    @%m5 div.rn.f32 %x, %v0, %u;\n"
+        );
+        gelu() + &silu + "    mul.f32 %x, %x, %v1;\n"
     };
     let _ = writeln!(s, "    mov.f32 %x, %v0;\n{gate}    cvt.rn.f16.f32 %hg, %x;\n    @%s4 st.global.b16 [%rd2+{}], %hg;", 8 * nt);
 }
@@ -338,48 +471,28 @@ fn gemm_store(s: &mut String, tokens: usize, clip: bool) {
     }
 }
 
-/// [`GEMM_F16`] (blocks of 64 tokens) or [`GEMM_F16_128`], or with `clip` [`GEMM_CLIP`] or [`GEMM_CLIP_128`]:
-/// [`stages`] of 32 of `k`, the next slices' copies in flight while one multiplies, and one barrier per slice: the
-/// one that lets a slice in, after which the stage multiplied before it is free to refill. Each warp takes 32 tokens
-/// × 32 rows.
-pub(super) fn gemm_f16(name: &str, tokens: usize, clip: bool) -> String {
-    let mut s = format!(
-        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
-    .maxntid {}, 1, 1
-{{
-    .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
-    .reg .b16 %hg;
-    .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
-    .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
-    .reg .b64 %rd<10>, %ga<2>, %gw<2>;
-    .shared .align 16 .b8 smem[{}];",
-        if clip { ", .param .u64 pclip" } else { "" },
-        32 * block(tokens).0,
-        stages(tokens) * stage(tokens)
-    );
-    let (_, warp, pass) = block(tokens);
-    s += &GEMM_HEAD
-        .replace("HALF", &(tokens * ROW).to_string())
-        .replace("ROW", &ROW.to_string())
-        .replace("TSHIFT", &tokens.trailing_zeros().to_string())
-        .replace("TMASK", &(tokens - 1).to_string())
-        .replace("GROUP", &GROUP.to_string())
-        .replace("PSTRIDE", &(2 * pass).to_string())
-        .replace("WSHIFT", &warp.trailing_zeros().to_string());
-    if clip {
-        s += CLIP_HEAD;
-    }
-    (0..warp).for_each(|c| _ = writeln!(s, "    mov.f32 %c{c}, 0f00000000;"));
+/// [`GEMM_F16`] (blocks of 64 tokens) or [`GEMM_F16_128`], [`GEMM_CLIP`] or [`GEMM_CLIP_128`], [`GEMM_Q8`] or
+/// [`GEMM_Q8_128`] as `ops` says: [`stages`] of 64 bytes of `k` (32 `f16` or 64 Q8 values, one group), the next
+/// slices' copies in flight while one multiplies, and one barrier per slice: the one that lets a slice in, after
+/// which the stage multiplied before it is free to refill. Each warp takes 32 tokens × 32 rows.
+pub(super) fn gemm_f16(name: &str, tokens: usize, ops: Operands) -> String {
+    let (clip, q8) = (ops == Operands::Clip, ops == Operands::Q8);
+    let mut s = gemm_head(name, tokens, ops);
     let n = stages(tokens);
     for p in 0..n - 1 {
         let _ = writeln!(s, "    setp.gt.u32 %q, %turns, {p};");
-        copy(&mut s, tokens, (p, 64 * p), "@%q ");
+        copy(&mut s, tokens, (p, 64 * p), q8);
     }
     s += "TURN:\n";
     for buf in 0..n {
         let _ = writeln!(s, "    cp.async.wait_group {};\n    bar.sync 0;\n    setp.gt.u32 %q, %turns, {};", n - 2, n - 1);
-        copy(&mut s, tokens, ((buf + n - 1) % n, 64 * (n - 1)), "@%q ");
-        products(&mut s, tokens, buf, clip);
+        copy(&mut s, tokens, ((buf + n - 1) % n, 64 * (n - 1)), q8);
+        if q8 {
+            products_q8(&mut s, tokens, buf);
+            s += "    add.u64 %gs, %gs, 4;\n    add.u64 %gd, %gd, 4;\n";
+        } else {
+            products(&mut s, tokens, buf, clip);
+        }
         for p in ["%ga0", "%ga1", "%gw0", "%gw1"] {
             let _ = writeln!(s, "    add.u64 {p}, {p}, 64;");
         }
@@ -388,6 +501,52 @@ pub(super) fn gemm_f16(name: &str, tokens: usize, clip: bool) -> String {
     s += "    bra TURN;\nSTORE:\n";
     gemm_store(&mut s, tokens, clip);
     s + "    ret;\n}\n"
+}
+
+/// The entry of a product kernel (see [`gemm_f16`]), its registers and shared memory, its pointers and fragments'
+/// addresses, and its sums zeroed.
+fn gemm_head(name: &str, tokens: usize, ops: Operands) -> String {
+    let q8 = ops == Operands::Q8;
+    let mut s = format!(
+        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
+    .maxntid {}, 1, 1
+{{
+    .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
+    .reg .b16 %hg;
+    .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
+    .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
+    .reg .b64 %rd<10>, %ga<2>, %gw<2>;{}
+    .shared .align 16 .b8 smem[{}];",
+        match ops {
+            Operands::F16 => "",
+            Operands::Clip => ", .param .u64 pclip",
+            Operands::Q8 => ", .param .u64 pas, .param .u64 pws",
+        },
+        32 * block(tokens).0,
+        if q8 { Q8_REGS } else { "" },
+        stages(tokens) * stage(tokens, q8)
+    );
+    let (_, warp, pass) = block(tokens);
+    s += &GEMM_HEAD
+        .replace("HALF", &(tokens * ROW).to_string())
+        .replace("ROW", &ROW.to_string())
+        .replace("TSHIFT", &tokens.trailing_zeros().to_string())
+        .replace("TMASK", &(tokens - 1).to_string())
+        .replace("GROUP", &GROUP.to_string())
+        .replace("WSHIFT", &warp.trailing_zeros().to_string())
+        .replace("PSTRIDE", &(if q8 { pass } else { 2 * pass }).to_string())
+        .replace("CSHIFT", if q8 { "4" } else { "3" })
+        .replace("ESHIFT", if q8 { "0" } else { "1" })
+        .replace("TURNSHIFT", if q8 { "6" } else { "5" });
+    if ops == Operands::Clip {
+        s += CLIP_HEAD;
+    }
+    if q8 {
+        let scales = stage(tokens, false);
+        s += &Q8_HEAD.replace("TSCALES", &(4 * tokens).to_string()).replace("SCALES", &scales.to_string()).replace("TOKENS", &tokens.to_string());
+    }
+    (0..warp).for_each(|c| _ = writeln!(s, "    mov.f32 %c{c}, 0f00000000;"));
+    s
 }
 
 /// [`NORM_F16`]: a block per row, four values per thread; the sums of the values less the row's first and of
@@ -479,6 +638,81 @@ EXIT:
     ret;
 }
 ";
+
+/// [`QUANT_F16`]: a warp per group of 64 values, two per lane; the group's largest magnitude by shuffles.
+pub(super) const QUANT: &str = "
+.visible .entry quant_f16(.param .u64 pa, .param .u64 pq, .param .u64 ps, .param .u32 pcols)
+{
+    .reg .pred %p, %zero;
+    .reg .b16 %h0, %h1;
+    .reg .b32 %t, %l, %g, %cols, %ng, %h, %q0, %q1, %e;
+    .reg .f32 %x0, %x1, %m, %o, %inv;
+    .reg .b64 %at, %ad, %e64;
+    mov.u32 %t, %tid.x;
+    and.b32 %l, %t, 31;
+    shr.u32 %g, %t, 5;
+    mov.u32 %e, %ctaid.x;
+    mad.lo.u32 %g, %e, 8, %g;
+    ld.param.u32 %cols, [pcols];
+    shr.u32 %ng, %cols, 6;
+    setp.ge.u32 %p, %g, %ng;
+    @%p bra EXIT;
+    mov.u32 %e, %ctaid.y;
+    mul.wide.u32 %at, %e, %cols;
+    shl.b32 %e, %g, 6;
+    mad.lo.u32 %e, %l, 2, %e;
+    cvt.u64.u32 %ad, %e;
+    add.u64 %at, %at, %ad;
+    ld.param.u64 %ad, [pa];
+    cvta.to.global.u64 %ad, %ad;
+    shl.b64 %e64, %at, 1;
+    add.u64 %ad, %ad, %e64;
+    ld.global.b32 %h, [%ad];
+    mov.b32 {%h0, %h1}, %h;
+    cvt.f32.f16 %x0, %h0;
+    cvt.f32.f16 %x1, %h1;
+    abs.f32 %m, %x0;
+    abs.f32 %o, %x1;
+    max.f32 %m, %m, %o;
+MAX
+    setp.eq.f32 %zero, %m, 0f00000000;
+    div.rn.f32 %inv, 0f42FE0000, %m;
+    @%zero mov.f32 %inv, 0f00000000;
+    mul.f32 %x0, %x0, %inv;
+    mul.f32 %x1, %x1, %inv;
+    cvt.rni.s32.f32 %q0, %x0;
+    cvt.rni.s32.f32 %q1, %x1;
+    and.b32 %q0, %q0, 255;
+    shl.b32 %q1, %q1, 8;
+    or.b32 %q0, %q0, %q1;
+    cvt.u16.u32 %h0, %q0;
+    ld.param.u64 %ad, [pq];
+    cvta.to.global.u64 %ad, %ad;
+    add.u64 %ad, %ad, %at;
+    st.global.b16 [%ad], %h0;
+    setp.ne.u32 %p, %l, 0;
+    @%p bra EXIT;
+    div.rn.f32 %m, %m, 0f42FE0000;
+    mov.u32 %e, %ctaid.y;
+    mad.lo.u32 %e, %e, %ng, %g;
+    mul.wide.u32 %at, %e, 4;
+    ld.param.u64 %ad, [ps];
+    cvta.to.global.u64 %ad, %ad;
+    add.u64 %ad, %ad, %at;
+    st.global.f32 [%ad], %m;
+EXIT:
+    ret;
+}
+";
+
+/// [`QUANT_F16`]'s PTX.
+pub(super) fn quant_f16() -> String {
+    let max = (0..5).fold(String::new(), |mut s, k| {
+        let _ = writeln!(s, "    shfl.sync.bfly.b32 %o, %m, {}, 31, -1;\n    max.f32 %m, %m, %o;", 16 >> k);
+        s
+    });
+    QUANT.replace("MAX\n", &max)
+}
 
 /// [`NORM_F16`]'s PTX.
 pub(super) fn norm_f16() -> String {

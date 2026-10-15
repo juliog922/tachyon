@@ -60,6 +60,10 @@ fn gelu(x: f32) -> f32 {
 
 /// Attention of each head over the rows of `q`, `k`, `v` (`n` rows of `heads × d`), each row seeing the rows within
 /// `window` of it, or all of them; RoPE at base `theta` first, if any.
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
 fn attend(qkv: &[f32], n: usize, heads: usize, d: usize, window: Option<usize>, theta: Option<f32>) -> Vec<f32> {
     let h = heads * d;
     let rotate = |row: usize, part: usize| -> Vec<f32> {
@@ -266,8 +270,8 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
     }
 }
 
-/// The `f16` product with the gated GELU over interleaved rows (mode 4: `gelu(y[2j])·y[2j+1]`, `f16`, half as wide),
-/// in blocks of 64 and 128 tokens.
+/// The `f16` product with the gated GELU and `SiLU` over interleaved rows (modes 4 and 5: `gelu(y[2j])·y[2j+1]` and
+/// `silu(…)·…`, `f16`, half as wide), in blocks of 64 and 128 tokens.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_f16_product_gates() {
@@ -278,16 +282,70 @@ fn the_f16_product_gates() {
     let bias = common::values(rows, 7);
     let dot = |t: usize, r: usize| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r];
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
-    for (kernel, blocks, threads) in [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)] {
+    for (mode, (kernel, blocks, threads)) in
+        [4u32, 5].into_iter().flat_map(|m| [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)].map(|k| (m, k)))
+    {
         let y = gpu.upload(&vec![0f32; tokens * rows]);
-        let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, 4]);
+        let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds whole blocks of tokens, `y` room for all of them.
         unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [2 * blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let gated = gpu.halves(&y);
         for (t, r) in (0..tokens).flat_map(|t| (0..rows / 2).map(move |r| (t, 2 * r))) {
-            let (got, want) = (tachyon::quant::f16_value(gated[t * rows / 2 + r / 2]), gelu(dot(t, r)) * dot(t, r + 1));
-            assert!((got - want).abs() <= 1e-3 + 2e-3 * want.abs(), "{kernel}, token {t}, row {r}: {got} against {want}");
+            let gate = if mode == 4 { gelu(dot(t, r)) } else { silu(dot(t, r)) };
+            let (got, want) = (tachyon::quant::f16_value(gated[t * rows / 2 + r / 2]), gate * dot(t, r + 1));
+            assert!((got - want).abs() <= 1e-3 + 2e-3 * want.abs(), "{kernel} mode {mode}, token {t}, row {r}: {got} against {want}");
+        }
+    }
+}
+
+/// Launches product `kernel` (its name, blocks and threads) over `buffers` `[a, a's scales, w, w's scales, y]`
+/// (Q8E) with `sizes` `[rows, cols, tokens, mode]`, `rows` being 128: two tiles of rows.
+#[cfg(feature = "gpu")]
+fn q8_product(gpu: &common::Gpu, kernel: (&str, u32, u32), buffers: [u64; 5], sizes: [u32; 4]) {
+    use tachyon::cuda::arg;
+    let (pointers, scales) = ([buffers[0], buffers[2], 0, buffers[4]], [buffers[1], buffers[3]]);
+    let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).chain(scales.iter().map(arg)).collect();
+    // SAFETY: the kernel's arguments in order; `a` and its scales hold whole blocks of tokens, `y` room for all.
+    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [2 * kernel.1, 1, 1], [kernel.2, 1, 1], 0, &args) }.unwrap();
+}
+
+/// `f16` rows rounded to Q8E on the GPU exactly as on the CPU; then the 8-bit product in every mode (store, add,
+/// `f16`, ReLU, the gated GELU and `SiLU`) against the CPU's product of the rounded values, for 70 tokens, in blocks of 64 and
+/// 128 tokens.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_q8_product_matches_the_cpu_in_every_mode() {
+    use tachyon::cuda::arg;
+    use tachyon::quant::{f16_value, q8e};
+    let gpu = common::Gpu::new();
+    let (rows, cols, tokens) = (128, 192, 70);
+    let ((a16, a), w) = (halves(&common::values(128 * cols, 8)), common::values(rows * cols, 9));
+    let ((aq, sa), (wq, sw)) = (q8e(&a), q8e(&w));
+    let (ab, qb, sb) = (gpu.upload(&a16), gpu.zeros(128 * cols), gpu.zeros(128 * cols / 16));
+    let (pointers, width) = ([ab.ptr(), qb.ptr(), sb.ptr()], cols as u32);
+    let args: Vec<_> = pointers.iter().map(arg).chain([arg(&width)]).collect();
+    // SAFETY: QUANT_F16's arguments in order, on 128 rows of `cols`.
+    unsafe { gpu.stream.launch(&gpu.module.function(tachyon::ptx::QUANT_F16).unwrap(), [1, 128, 1], [256, 1, 1], 0, &args) }.unwrap();
+    assert!(gpu.download(&qb) == common::bytes(&aq) && gpu.floats(&sb) == sa, "the GPU's rounding differs from the CPU's");
+    let value = |q: &[i8], s: &[f32], i: usize| f64::from(q[i]) * f64::from(s[i / 64]);
+    let dot = |t: usize, r: usize| (0..cols).map(|k| value(&aq, &sa, t * cols + k) * value(&wq, &sw, r * cols + k)).sum::<f64>() as f32;
+    let (wb, swb, base) = (gpu.upload(&wq), gpu.upload(&sw), common::values(128 * rows, 10));
+    for (mode, kernel) in (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 2, 128), (tachyon::ptx::GEMM_Q8_128, 1, 256)].map(|k| (m, k))) {
+        let y = gpu.upload(&base);
+        q8_product(&gpu, kernel, [qb.ptr(), sb.ptr(), wb.ptr(), swb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
+        let (f32s, f16s) = (gpu.floats(&y), gpu.halves(&y));
+        let width = if mode >= 4 { rows / 2 } else { rows };
+        for (t, r) in (0..tokens).flat_map(|t| (0..width).map(move |r| (t, r))) {
+            let (got, want) = match mode {
+                0 => (f32s[t * rows + r], dot(t, r)),
+                1 => (f32s[t * rows + r], dot(t, r) + base[t * rows + r]),
+                2 => (f16_value(f16s[t * rows + r]), dot(t, r)),
+                3 => (f16_value(f16s[t * rows + r]), dot(t, r).max(0.0)),
+                4 => (f16_value(f16s[t * width + r]), gelu(dot(t, 2 * r)) * dot(t, 2 * r + 1)),
+                _ => (f16_value(f16s[t * width + r]), silu(dot(t, 2 * r)) * dot(t, 2 * r + 1)),
+            };
+            assert!((got - want).abs() <= 1e-3 + 2e-3 * want.abs(), "{} mode {mode}, token {t}, row {r}: {got} against {want}", kernel.0);
         }
     }
 }
@@ -343,6 +401,40 @@ fn the_gpu_encoder_matches_the_reference_on_the_tiny_laya() {
     }
 }
 
+/// The tiny Laya's encoder alone, so converted as an embedding model, with its layers' matrices in Q8: every
+/// token's hidden state within a cosine of 0.99999 of the float32 reference's (a random model's layers add little).
+#[cfg(feature = "gpu")]
+#[test]
+fn the_q8_encoder_follows_the_reference_on_the_tiny_model() {
+    use tachyon::encoder::{Encoder, Settings, convert};
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let (src, dir) = (tmp.join("tiny-embedder"), tmp.join("tiny-embedder-q8"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::copy(Path::new(TINY).join("config.json"), src.join("config.json")).unwrap();
+    // The encoder's tensors under the names an embedding model's checkpoint gives them: `encoder.` dropped from the
+    // header, whose offsets count from the data after it.
+    let file = std::fs::read(Path::new(TINY).join("model.safetensors")).unwrap();
+    let n = u64::from_le_bytes(file[..8].try_into().unwrap()) as usize;
+    let header = String::from_utf8(file[8..8 + n].to_vec()).unwrap().replace("\"encoder.", "\"");
+    std::fs::write(src.join("model.safetensors"), [&(header.len() as u64).to_le_bytes()[..], header.as_bytes(), &file[8 + n..]].concat()).unwrap();
+    convert(&src, &dir).unwrap();
+    let wpk = tachyon::wpk::Wpk::open(dir.join("weights.wpk")).unwrap();
+    assert!(wpk.tensor("1.up").is_some_and(|t| t.dtype == tachyon::wpk::Dtype::I8) && wpk.tensor("1.up.scale").is_some());
+    let ctx = tachyon::cuda::Context::new(0).unwrap();
+    let mut enc = Encoder::open(&ctx, &dir, &Settings { tokens: 64 }).unwrap();
+    let cases = tiny_cases();
+    let seqs: Vec<&[u32]> = cases.iter().map(|c| c.0.as_slice()).collect();
+    let (hidden, h) = (enc.hidden(&seqs).unwrap(), enc.config().hidden);
+    let want: Vec<f32> = cases.iter().flat_map(|c| c.3.clone()).collect();
+    let cosine = |a: &[f32], b: &[f32]| {
+        let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| f64::from(*p) * f64::from(*q)).sum::<f64>();
+        dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
+    };
+    let low = hidden.chunks(h).zip(want.chunks(h)).map(|(a, b)| cosine(a, b)).fold(1.0, f64::min);
+    println!("tiny encoder in Q8: lowest cosine 1 − {:.2e}", 1.0 - low);
+    assert!(low >= 0.99999, "lowest cosine {low:.6}");
+}
+
 /// The checkpoint `$TACHYON_MODELS/name`, converted once into the test's temporary directory.
 #[cfg(all(feature = "gpu", feature = "models"))]
 fn converted(name: &str) -> std::path::PathBuf {
@@ -354,16 +446,15 @@ fn converted(name: &str) -> std::path::PathBuf {
     dst
 }
 
-/// Laya multilingual on the GPU against the float32 references of all 500 cases: probabilities within 2e-4 on
-/// average and 1e-2 at most, the same answer in at least 499.
+/// A Laya checkpoint (`$TACHYON_MODELS/name`) on the GPU against the float32 references of all 500 cases (fixture
+/// `reference`): probabilities within 2e-4 on average and 1e-2 at most, the same answer in at least 499.
 #[cfg(all(feature = "gpu", feature = "models"))]
-#[test]
-fn laya_on_the_gpu_matches_the_reference() {
+fn laya_matches(name: &str, reference: &str) {
     use tachyon::encoder::laya::{Kind, probabilities};
     use tachyon::encoder::{Encoder, Settings};
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut enc = Encoder::open(&ctx, &converted("laya-multilingual"), &Settings::default()).unwrap();
-    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join("laya-multilingual.ref")).unwrap();
+    let mut enc = Encoder::open(&ctx, &converted(name), &Settings::default()).unwrap();
+    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join(reference)).unwrap();
     let cases: Vec<Json> = lines.lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect();
     let ids: Vec<Vec<u32>> = cases.iter().map(|c| numbers(c.get("ids")).iter().map(|&v| v as u32).collect()).collect();
     let marks: Vec<Vec<usize>> = cases.iter().map(|c| numbers(c.get("markers")).iter().map(|&v| v as usize).collect()).collect();
@@ -383,45 +474,79 @@ fn laya_on_the_gpu_matches_the_reference() {
         same += usize::from(top(&p.iter().map(|&x| f64::from(x)).collect::<Vec<_>>()) == top(&want));
     }
     let mean = sum / f64::from(count);
-    println!("Laya on the GPU: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/{}", cases.len());
-    assert!(mean <= 2e-4 && worst <= 1e-2 && same >= 499, "mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/500");
+    println!("{name} on the GPU: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/{}", cases.len());
+    assert!(mean <= 2e-4 && worst <= 1e-2 && same >= 499, "{name}: mean |Δp| {mean:.2e}, largest {worst:.2e}, same answer {same}/500");
 }
 
-/// Granite Embedding 311M on the GPU against the 54 float32 references: cosine ≥ 0.9999 each.
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
-fn granite_on_the_gpu_matches_the_reference() {
+fn laya_on_the_gpu_matches_the_reference() {
+    laya_matches("laya-multilingual", "laya-multilingual.ref");
+}
+
+/// Laya English: ModernBERT-large, its byte-level tokenizer, sequences of up to 512 tokens.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn laya_english_on_the_gpu_matches_the_reference() {
+    laya_matches("laya", "laya-english.ref");
+}
+
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn laya_typed_decisions_on_the_gpu_matches_the_reference() {
+    laya_matches("laya-typed-decisions", "laya-typed-decisions.ref");
+}
+
+/// A Granite Embedding checkpoint (`$TACHYON_MODELS/name`, its layers in Q8) on the GPU against the 54 float32
+/// references of fixture `reference`, its inputs as they are: cosine ≥ 0.9999 each.
+#[cfg(all(feature = "gpu", feature = "models"))]
+fn granite_matches(name: &str, reference: &str) {
     use tachyon::encoder::{Encoder, Settings};
     let ctx = tachyon::cuda::Context::new(0).unwrap();
-    let mut enc = Encoder::open(&ctx, &converted("granite-embedding-311m-multilingual-r2"), &Settings::default()).unwrap();
-    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join("granite-311m.ref")).unwrap();
+    let mut enc = Encoder::open(&ctx, &converted(name), &Settings::default()).unwrap();
+    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join(reference)).unwrap();
     let cases: Vec<Json> = lines.lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect();
     let ids: Vec<Vec<u32>> = cases.iter().map(|c| numbers(c.get("ids")).iter().map(|&v| v as u32).collect()).collect();
     let seqs: Vec<&[u32]> = ids.iter().map(Vec::as_slice).collect();
     let got = enc.embeddings(&seqs).unwrap();
     let cosines: Vec<f64> = got.iter().zip(&cases).map(|(e, c)| e.iter().zip(numbers(c.get("embedding"))).map(|(a, b)| f64::from(*a) * b).sum()).collect();
     let (text, low) = cosines.iter().copied().enumerate().fold((0, 1.0), |a, (i, c)| if c < a.1 { (i, c) } else { a });
-    println!("Granite on the GPU: lowest cosine {low:.6}, text {text}");
-    assert!(low >= 0.9999, "lowest cosine {low:.6}, text {text}");
+    println!("{name} on the GPU: lowest cosine {low:.6}, text {text}");
+    assert!(low >= 0.9999, "{name}: lowest cosine {low:.6}, text {text}");
 }
 
-/// Text in, vectors out: `Engine::embed` on the 54 texts against the float32 references (cosine ≥ 0.9999), and cut to
-/// 256 values, still of unit length.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn granite_on_the_gpu_matches_the_reference() {
+    granite_matches("granite-embedding-311m-multilingual-r2", "granite-311m.ref");
+}
+
+/// Granite 97M: heads of 32, a gated `SiLU`, `<|startoftext|>` and `<|return|>` around each text.
+#[cfg(all(feature = "gpu", feature = "models"))]
+#[test]
+fn granite_97m_on_the_gpu_matches_the_reference() {
+    granite_matches("granite-embedding-97m-multilingual-r2", "granite-97m.ref");
+}
+
+/// Text in, vectors out: `Engine::embed` with both Granites on their 54 texts against the float32 references (cosine
+/// ≥ 0.9999), each framed as its tokenizer frames it, and cut to 256 values, still of unit length.
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn the_engine_embeds_text() {
     use tachyon::engine::{Engine, Limits, Load};
     let mut engine = Engine::new(0, Limits::default()).unwrap();
-    engine.load("granite", &converted("granite-embedding-311m-multilingual-r2"), &Load::default()).unwrap();
-    let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join("granite-311m.ref")).unwrap();
-    let cases: Vec<Json> = lines.lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect();
-    let texts: Vec<&str> = cases.iter().map(|c| c.get("text").and_then(Json::str).unwrap()).collect();
-    for (i, (e, c)) in engine.embed("granite", &texts, None).unwrap().iter().zip(&cases).enumerate() {
-        let cosine: f64 = e.iter().zip(numbers(c.get("embedding"))).map(|(a, b)| f64::from(*a) * b).sum();
-        assert!(cosine >= 0.9999, "text {i}: cosine {cosine}");
-    }
-    for e in engine.embed("granite", &texts, Some(256)).unwrap() {
-        let len: f32 = e.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(e.len() == 256 && (len - 1.0).abs() < 1e-5, "{} values of length {len}", e.len());
+    for (name, reference) in [("granite-embedding-311m-multilingual-r2", "granite-311m.ref"), ("granite-embedding-97m-multilingual-r2", "granite-97m.ref")] {
+        engine.load(name, &converted(name), &Load::default()).unwrap();
+        let lines = std::fs::read_to_string(Path::new(TINY).parent().unwrap().join(reference)).unwrap();
+        let cases: Vec<Json> = lines.lines().map(|l| Json::parse(l.as_bytes()).unwrap()).collect();
+        let texts: Vec<&str> = cases.iter().map(|c| c.get("text").and_then(Json::str).unwrap()).collect();
+        for (i, (e, c)) in engine.embed(name, &texts, None).unwrap().iter().zip(&cases).enumerate() {
+            let cosine: f64 = e.iter().zip(numbers(c.get("embedding"))).map(|(a, b)| f64::from(*a) * b).sum();
+            assert!(cosine >= 0.9999, "{name}, text {i}: cosine {cosine}");
+        }
+        for e in engine.embed(name, &texts, Some(256)).unwrap() {
+            let len: f32 = e.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!(e.len() == 256 && (len - 1.0).abs() < 1e-5, "{name}: {} values of length {len}", e.len());
+        }
     }
 }

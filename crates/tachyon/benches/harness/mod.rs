@@ -48,8 +48,12 @@ pub struct Suite {
 }
 
 impl Suite {
-    /// An empty suite.
+    /// An empty suite; says so when this process may not count `perf` events, whose fields are then `null`.
     pub fn new(name: &'static str) -> Suite {
+        if let Err(e) = Counter::open(1, 2) {
+            let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid").unwrap_or_default();
+            println!("perf counters unavailable ({}; kernel.perf_event_paranoid = {}, they need ≤ 2): their fields are null", e, paranoid.trim());
+        }
         Suite { name, rows: Vec::new() }
     }
 
@@ -58,7 +62,7 @@ impl Suite {
         for _ in 0..=runs / 5 {
             f();
         }
-        let counters = COUNTERS.map(|(kind, config, _)| Counter::open(kind, config));
+        let counters = COUNTERS.map(|(kind, config, _)| Counter::open(kind, config).ok());
         counters.iter().flatten().for_each(|c| c.ctl(0x2400));
         let mut times: Vec<Duration> = (0..runs).map(|_| f()).collect();
         counters.iter().flatten().for_each(|c| c.ctl(0x2401));
@@ -143,15 +147,18 @@ impl Suite {
 struct Counter(File);
 
 impl Counter {
-    fn open(kind: u32, config: u64) -> Option<Counter> {
+    fn open(kind: u32, config: u64) -> std::io::Result<Counter> {
         let mut attr = [0u64; 16];
         attr[0] = u64::from(kind) | 128 << 32;
         attr[1] = config;
         attr[5] = 1 | 1 << 5 | 1 << 6; // disabled, exclude_kernel, exclude_hv
         // SAFETY: `perf_event_open(attr, this thread, any CPU, no group, FD_CLOEXEC)` with a live 128-byte attribute block.
         let fd = unsafe { syscall(298, attr.as_ptr() as usize, 0, usize::MAX, usize::MAX, 8) };
+        if fd < 0 {
+            return Err(std::io::Error::from_raw_os_error(-fd as i32));
+        }
         // SAFETY: a successful call returns a new descriptor that nothing else owns.
-        (fd >= 0).then(|| Counter(unsafe { File::from_raw_fd(fd as i32) }))
+        Ok(Counter(unsafe { File::from_raw_fd(fd as i32) }))
     }
 
     /// `PERF_EVENT_IOC_ENABLE` (0x2400) or `PERF_EVENT_IOC_DISABLE` (0x2401).

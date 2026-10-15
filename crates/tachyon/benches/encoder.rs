@@ -3,7 +3,8 @@
 //! step-10 gate: one Laya question answers in ≤ 6 ms, the whole call (tokenizing, encoder, head, probabilities),
 //! and ten questions in one call take ≤ 4 ms each.
 //! Then where the GPU time of one, ten questions and 64 embeddings goes, kernel by kernel, with the matrix
-//! products' rates against the tensor cores' `f16` ceilings, and the GPU's share of each call's wall time.
+//! products' rates against the tensor cores' ceilings (`f16`, or 8-bit for Granite's Q8 layers), and the GPU's share
+//! of each call's wall time.
 //!
 //! `cargo bench -p tachyon --features gpu --bench encoder` uses the model directories in `$TACHYON_LAYA` (default
 //! `~/.local/share/tachyon/laya-multilingual`) and `$TACHYON_GRANITE` (default `…/granite-embedding-311m`), made by
@@ -127,8 +128,8 @@ fn flops(kind: &str) -> Option<f64> {
 }
 
 /// Prints where the GPU time of `call` goes: each kind of kernel with its count, total, share and, for products,
-/// rate against `peak` TFLOPS; then the GPU's total against the call's wall time.
-fn profile(name: &str, enc: &mut Encoder, peak: f64, call: impl Fn(&mut Encoder)) {
+/// rate against `peaks` (`f16`, 8-bit) in TOPS; then the GPU's total against the call's wall time.
+fn profile(name: &str, enc: &mut Encoder, peaks: [f64; 2], call: impl Fn(&mut Encoder)) {
     let runs: Vec<_> = (0..PROFILED)
         .map(|_| {
             enc.timeline(|e| {
@@ -150,12 +151,12 @@ fn profile(name: &str, enc: &mut Encoder, peak: f64, call: impl Fn(&mut Encoder)
     }
     kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
     println!("{name}: {total:.2?} of GPU time in {} kernels (median of {PROFILED} calls)", ops.len());
-    println!("  {:<28} {:>5} {:>10} {:>9} {:>6} {:>7} {:>6}", "kernel", "count", "total", "each", "share", "TFLOPS", "%peak");
+    println!("  {:<31} {:>5} {:>10} {:>9} {:>6} {:>7} {:>6}", "kernel", "count", "total", "each", "share", "TOPS", "%peak");
     for (kind, n, t) in &kinds {
-        let rate = flops(kind).map(|f| f * *n as f64 / t.as_secs_f64() / 1e12);
+        let (rate, peak) = (flops(kind).map(|f| f * *n as f64 / t.as_secs_f64() / 1e12), peaks[usize::from(kind.ends_with("q8"))]);
         let (tf, pct) = rate.map_or((String::new(), String::new()), |r| (format!("{r:.1}"), format!("{:.0}%", 100.0 * r / peak)));
         let share = 100.0 * t.as_secs_f64() / total.as_secs_f64();
-        println!("  {kind:<28} {n:>5} {t:>10.2?} {:>9.2?} {share:>5.1}% {tf:>7} {pct:>6}", *t / *n as u32);
+        println!("  {kind:<31} {n:>5} {t:>10.2?} {:>9.2?} {share:>5.1}% {tf:>7} {pct:>6}", *t / *n as u32);
     }
     let mut wall: Vec<Duration> = (0..PROFILED).map(|_| cpu(|| call(enc))).collect();
     wall.sort();
@@ -163,27 +164,31 @@ fn profile(name: &str, enc: &mut Encoder, peak: f64, call: impl Fn(&mut Encoder)
     println!("  the call: {wall:.2?} of wall time, {:.0}% of it kernels back to back", 100.0 * total.as_secs_f64() / wall.as_secs_f64());
 }
 
-/// Each product kernel alone on the encoder's shapes, for one question's tokens and ten questions': its time and rate.
-fn products(suite: &mut Suite, gpu: &Gpu, peak: f64) {
-    use tachyon::ptx::{GEMM_F16, GEMM_F16_128};
-    const KERNELS: [(&str, u32, u32); 2] = [(GEMM_F16, 64, 128), (GEMM_F16_128, 128, 256)];
+/// Each product kernel alone on the encoder's shapes, for one question's tokens and ten questions': its time and rate
+/// against `peaks` (`f16`, 8-bit): the `f16` kernels, then the Q8.
+fn products(suite: &mut Suite, gpu: &Gpu, peaks: [f64; 2]) {
+    use tachyon::ptx::{GEMM_F16, GEMM_F16_128, GEMM_Q8, GEMM_Q8_128};
+    const KERNELS: [(&str, u32, u32); 4] = [(GEMM_F16, 64, 128), (GEMM_F16_128, 128, 256), (GEMM_Q8, 64, 128), (GEMM_Q8_128, 128, 256)];
     println!("each product kernel alone (median of 20):");
     for (tokens, (cols, rows)) in [223u32, 2140].into_iter().flat_map(|t| [(768u32, 2304u32), (768, 768), (1152, 768)].map(|s| (t, s))) {
         let act = gpu.ctx.alloc(2 * (tokens as usize + 128) * cols as usize).unwrap();
         let (weights, out) = (gpu.ctx.alloc(2 * (rows * cols) as usize).unwrap(), gpu.ctx.alloc(4 * (tokens * rows) as usize).unwrap());
+        let scales = gpu.ctx.alloc(4 * (tokens as usize + 128).max(rows as usize) * cols as usize / 64).unwrap();
         let line = KERNELS.map(|(name, tile, threads)| {
-            let kernel = gpu.module.function(name).unwrap();
+            let (kernel, q8) = (gpu.module.function(name).unwrap(), name.contains("q8"));
             let (ptrs, sizes) = ([act.ptr(), weights.ptr(), 0, out.ptr()], [rows, cols, tokens, 0]);
-            let args: Vec<_> = ptrs.iter().map(arg).chain(sizes.iter().map(arg)).collect();
+            let extra = [scales.ptr(), scales.ptr()];
+            let args: Vec<_> = ptrs.iter().map(arg).chain(sizes.iter().map(arg)).chain(extra.iter().filter(|_| q8).map(arg)).collect();
             let blocks = tokens.div_ceil(tile) * rows / 64;
             let launch = |s: &tachyon::cuda::Stream| {
                 // SAFETY: the kernel's arguments in order; `act` holds whole blocks of tokens, `out` every token's row.
                 unsafe { s.launch(&kernel, [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
             };
-            let t = suite.run(&format!("gemm {tokens}×{cols}→{rows} /{tile}"), 20, || gpu.time(launch));
+            let label = format!("/{tile}{}", if q8 { " q8" } else { "" });
+            let t = suite.run(&format!("gemm {tokens}×{cols}→{rows} {label}"), 20, || gpu.time(launch));
             let tf = 2.0 * f64::from(tokens * cols) * f64::from(rows) / t.as_secs_f64() / 1e12;
-            suite.rate(tf, "TFLOPS");
-            format!("/{tile} {t:>8.2?} {tf:>4.1} TFLOPS {:>3.0}%", 100.0 * tf / peak)
+            suite.rate(tf, "TOPS");
+            format!("{label} {t:>8.2?} {tf:>5.1} TOPS {:>3.0}%", 100.0 * tf / peaks[usize::from(q8)])
         });
         println!("  gemm {tokens}×{cols}→{rows}: {}", line.join(" · "));
     }
@@ -194,18 +199,19 @@ fn profiles(suite: &mut Suite, laya: &Path, granite: &Path) {
     let gpu = Gpu::new();
     let peak = gpu.peak(suite, tachyon::ptx::MMA_PEAK_F16, "f16 mma peak, f32 sums");
     gpu.peak(suite, tachyon::ptx::MMA_PEAK_F16H, "f16 mma peak, f16 sums");
-    products(suite, &gpu, peak);
+    let peaks = [peak, gpu.peak(suite, tachyon::ptx::MMA_PEAK, "int8 mma peak")];
+    products(suite, &gpu, peaks);
     let ctx = Context::new(0).unwrap();
     let mut enc = Encoder::open(&ctx, laya, &Settings::default()).unwrap();
     let qs = questions();
     for k in [1, 10] {
-        profile(&format!("decide, {k} question(s)"), &mut enc, peak, |e| _ = e.decide(STATE, false, &qs[..k]).unwrap());
+        profile(&format!("decide, {k} question(s)"), &mut enc, peaks, |e| _ = e.decide(STATE, false, &qs[..k]).unwrap());
     }
     drop(enc);
     let mut enc = Encoder::open(&ctx, granite, &Settings::default()).unwrap();
     let texts: Vec<String> = (0..64).map(text).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-    profile("embed, 64 texts", &mut enc, peak, |e| _ = e.embed(&refs, None).unwrap());
+    profile("embed, 64 texts", &mut enc, peaks, |e| _ = e.embed(&refs, None).unwrap());
 }
 
 fn main() -> ExitCode {

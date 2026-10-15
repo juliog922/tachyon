@@ -45,6 +45,8 @@ cargo run --release -p tachyon-cli -- pull granite-embedding-311m
 cargo run --release -p tachyon-cli -- embed granite-embedding-311m --dims=256 "how do I get a refund"
 ```
 
+Laya comes in three checkpoints, each pulled by name: `laya-multilingual` (100+ languages, the default choice), `laya-english` (ModernBERT-large, the most accurate in English) and `laya-typed-decisions` (fine-tuned on four triage workflows). Tachyon does not route between them as the `laya` package's `Router` does: name the one to use. Granite comes in two sizes, `granite-embedding-311m` and `granite-embedding-97m` (384 dims, the fastest); their layers run in 8-bit (Q8).
+
 `pull` downloads from Hugging Face over 8 connections (`TACHYON_CONNECTIONS`) in 8 MiB chunks, checks each file's SHA-256, and resumes where an interrupted pull stopped. Checkpoints wait in `$XDG_CACHE_HOME/tachyon` and are removed after conversion unless `--keep`; models live in `$TACHYON_HOME`, by default `~/.local/share/tachyon`. `TACHYON_HUB` points it at a mirror. A checkpoint downloaded some other way still converts with `tachyon convert <checkpoint> <model>`.
 
 In your program, `tachyon::engine` is the API (see its documentation):
@@ -73,6 +75,8 @@ crates/tachyon/          the library
   src/model/decode.rs    the decode step as one CUDA Graph: every layer's kernels, KV caches, sampling
   src/json.rs            a JSON reader for the files models ship with
   src/token/mod.rs       the tokenizer: Gemma's BPE with byte fallback, stored ready to use, streaming detokenizer
+  src/token/bytes.rs     byte-level BPE: GPT-2's byte characters, its pre-tokenizer patterns matched by hand
+  src/token/unicode.rs   Unicode letters and NFC, from tables scripts/unicode.py writes (unicode.bin)
   src/token/chat.rs      Gemma 4's chat template, coded by hand
   src/ptx/mod.rs         the GPU kernels, generated as PTX text: quantizers, residual norm, embedding lookup
   src/ptx/gemv.rs        the Q4 × Q8 decode GEMV
@@ -83,9 +87,10 @@ crates/tachyon/          the library
   benches/               machine ceilings and the bench harness
   src/encoder/mod.rs     ModernBERT encoders (Laya multilingual, Granite Embedding 311M): configuration
   src/encoder/laya.rs    Laya's question sequences, head settings and probabilities
-  src/encoder/convert.rs encoder checkpoints to model directories, f16
+  src/encoder/convert.rs encoder checkpoints to model directories: f16, Granite's layers in Q8
   src/encoder/run.rs     the encoder on the GPU: packed sequences, embeddings, Laya's logits
-  src/ptx/encoder.rs     the encoder's kernels: f16 tensor-core product, layer norm, attention
+  src/encoder/race.rs    which product kernel each shape takes, raced on the GPU
+  src/ptx/encoder.rs     the encoder's kernels: f16 and Q8 tensor-core products, layer norm, attention
 crates/tachyon-cli/      the `tachyon` command
   src/models.rs          the catalog and pull, list, rm, doctor
   src/net/               downloads with std only: SHA-256 (SHA-NI), HMAC/HKDF, AES-128-GCM (AES-NI), X25519,

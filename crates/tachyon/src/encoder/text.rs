@@ -34,17 +34,21 @@ impl Encoder {
 
     /// Granite's embedding of each of `texts` (its first token's last state, to unit length), cut to its first
     /// `dims` values and back to unit length if asked (Matryoshka: Granite 311M is trained for 768, 512, 384, 256 and
-    /// 128). A text longer than the encoder's capacity is cut, as sentence-transformers does at its limit.
+    /// 128). Each text is framed as its tokenizer's post-processor frames it (`<bos>` before, for a tokenizer that
+    /// says nothing). A text longer than the encoder's capacity is cut, as sentence-transformers does at its limit,
+    /// keeping the token after it.
     pub fn embed(&mut self, texts: &[&str], dims: Option<usize>) -> Result<Vec<Vec<f32>>> {
         let seqs: Vec<Vec<u32>> = {
             let tok = self.tokenizer().ok_or_else(|| Error::Format("the model directory has no tokenizer.tok".into()))?;
-            let (cls, cap) = (special(tok, &["<bos>", "[CLS]"])?, self.capacity());
+            let [before, after] = tok.frame();
+            let (cls, cap) = (before.map_or_else(|| special(tok, &["<bos>", "[CLS]"]), Ok)?, self.capacity());
             texts
                 .iter()
                 .map(|t| {
                     let mut ids = vec![cls];
                     tok.encode(t, &mut ids);
-                    ids.truncate(cap);
+                    ids.truncate(cap - usize::from(after.is_some()));
+                    ids.extend(after);
                     ids
                 })
                 .collect()

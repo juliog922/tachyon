@@ -16,6 +16,13 @@ Needs a CUDA GPU, the `laya` package (which brings torch and transformers 5) and
     pip install laya sentence-transformers
     python3 scripts/encoders.py
 
+`python3 scripts/encoders.py laya REPO NAME` and `python3 scripts/encoders.py granite REPO NAME` do the same for one
+other checkpoint (a Hub id or a directory), into NAME.ref:
+
+    python3 scripts/encoders.py laya convaiinnovations/laya laya-english
+    python3 scripts/encoders.py laya convaiinnovations/laya-typed-decisions laya-typed-decisions
+    python3 scripts/encoders.py granite ibm-granite/granite-embedding-97m-multilingual-r2 granite-97m
+
 `python3 scripts/encoders.py tiny` instead writes crates/tachyon/tests/fixtures/tiny-encoder/: a small random Laya
 (the package's own model on a 3-layer ModernBERT, weights in f16) and its outputs in float32, for the tests that
 run without the real checkpoints. It needs only the CPU.
@@ -234,60 +241,89 @@ def granite_embeddings(model, batches):
     return out
 
 
-def main():
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+def laya_reference(repo, name):
+    """Writes `name`.ref for the Laya checkpoint `repo` (a Hub id or a directory); returns the agent, its items and
+    their float32 logits."""
     import laya
-    import transformers
-    from transformers import AutoModel, AutoTokenizer
-    print("laya %s, transformers %s, torch %s" % (getattr(laya, "__version__", "?"), transformers.__version__, torch.__version__))
-
-    agent = laya.load("convaiinnovations/laya-multilingual", device="cuda")
+    agent = laya.load(repo, device="cuda")
     agent.model.float().eval()
     cfg = agent.model.encoder.config
-    print("laya-multilingual: rope %s, window %s, layers %s, temperatures %s %s" % (
-        getattr(cfg, "rope_parameters", None), cfg.local_attention, cfg.layer_types[:3], agent.temperature,
+    print("%s: rope %s, window %s, layers %s, temperatures %s %s" % (
+        name, getattr(cfg, "rope_parameters", None), cfg.local_attention, cfg.layer_types[:3], agent.temperature,
         agent.temperature_by_options))
     pairs = laya_cases()
     items = laya_items(agent, pairs)
     ref = laya_logits(agent, items)
-    with open(os.path.join(ROOT, "laya-multilingual.ref"), "w") as f:
+    with open(os.path.join(ROOT, name + ".ref"), "w") as f:
         for (state, q), it, lg in zip(pairs, items, ref):
             p = laya_probs(agent, lg, it["qtype"])
             f.write(json.dumps({"state": state, "question": q, "ids": it["ids"], "markers": it["markers"],
                                 "qtype": it["qtype"], "logits": [round(float(v), 6) for v in lg],
                                 "probs": [round(float(v), 7) for v in p]}, ensure_ascii=False) + "\n")
-    print("laya: %d cases, %d to %d tokens" % (len(items), min(len(i["ids"]) for i in items),
-                                               max(len(i["ids"]) for i in items)))
+    print("%s: %d cases, %d to %d tokens" % (name, len(items), min(len(i["ids"]) for i in items),
+                                             max(len(i["ids"]) for i in items)))
+    return agent, items, ref
 
-    name = "ibm-granite/granite-embedding-311m-multilingual-r2"
-    tok = AutoTokenizer.from_pretrained(name)
-    model = AutoModel.from_pretrained(name, torch_dtype=torch.float32).cuda().eval()
-    print("granite: %s" % {k: getattr(model.config, k, None) for k in
-                           ("global_rope_theta", "local_rope_theta", "rope_parameters", "local_attention", "norm_eps")})
+
+def granite_reference(repo, name):
+    """Writes `name`.ref for the Granite Embedding checkpoint `repo`; returns the model, its inputs and their float32
+    embeddings."""
+    from transformers import AutoModel, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(repo)
+    model = AutoModel.from_pretrained(repo, torch_dtype=torch.float32).cuda().eval()
+    print("%s: %s" % (name, {k: getattr(model.config, k, None) for k in ("global_rope_theta", "local_rope_theta",
+                                                                          "rope_parameters", "local_attention", "norm_eps", "hidden_activation")}))
     texts = [text_of(s) for s in STATES + LONG] + QUERIES
     batches = [tok(t, return_tensors="pt").to("cuda") for t in texts]
     gref = granite_embeddings(model, batches)
-    with open(os.path.join(ROOT, "granite-311m.ref"), "w") as f:
+    with open(os.path.join(ROOT, name + ".ref"), "w") as f:
         for t, enc, e in zip(texts, batches, gref):
             f.write(json.dumps({"text": t, "ids": enc["input_ids"][0].tolist(),
                                 "embedding": [round(float(v), 7) for v in e]}, ensure_ascii=False) + "\n")
-    print("granite: %d texts, %d to %d tokens" % (len(texts), min(b["input_ids"].shape[1] for b in batches),
-                                                  max(b["input_ids"].shape[1] for b in batches)))
+    print("%s: %d texts, %d to %d tokens" % (name, len(texts), min(b["input_ids"].shape[1] for b in batches),
+                                             max(b["input_ids"].shape[1] for b in batches)))
+    return model, batches, gref
 
+
+def study(laya_run=None, granite_run=None):
+    """How far each format of `FORMATS` moves Laya's answers and Granite's embeddings from float32."""
     print("\n%-6s %12s %12s %10s %14s %14s" % ("format", "max |dp|", "mean |dp|", "top-1", "min cosine", "mean cosine"))
     for fmt in FORMATS:
-        with Quantized(agent.model.encoder, fmt):
-            got = laya_logits(agent, items)
-        dp = [(laya_probs(agent, g, it["qtype"]) - laya_probs(agent, r, it["qtype"])).abs()
-              for g, r, it in zip(got, ref, items)]
-        top = sum(int(g.argmax() == r.argmax()) for g, r in zip(got, ref)) / len(ref)
-        with Quantized(model, fmt):
-            emb = granite_embeddings(model, batches)
-        cos = torch.tensor([float((a * b).sum()) for a, b in zip(emb, gref)])
-        print("%-6s %12.2e %12.2e %9.1f%% %14.6f %14.6f" % (
-            fmt, max(float(d.max()) for d in dp), float(torch.cat(dp).mean()), 100 * top, float(cos.min()),
-            float(cos.mean())))
+        row = [fmt]
+        if laya_run:
+            agent, items, ref = laya_run
+            with Quantized(agent.model.encoder, fmt):
+                got = laya_logits(agent, items)
+            dp = [(laya_probs(agent, g, it["qtype"]) - laya_probs(agent, r, it["qtype"])).abs()
+                  for g, r, it in zip(got, ref, items)]
+            top = sum(int(g.argmax() == r.argmax()) for g, r in zip(got, ref)) / len(ref)
+            row += ["%12.2e" % max(float(d.max()) for d in dp), "%12.2e" % float(torch.cat(dp).mean()), "%9.1f%%" % (100 * top)]
+        else:
+            row += ["%12s" % "", "%12s" % "", "%10s" % ""]
+        if granite_run:
+            model, batches, gref = granite_run
+            with Quantized(model, fmt):
+                emb = granite_embeddings(model, batches)
+            cos = torch.tensor([float((a * b).sum()) for a, b in zip(emb, gref)])
+            row += ["%14.6f" % float(cos.min()), "%14.6f" % float(cos.mean())]
+        print("%-6s " % row[0] + " ".join(row[1:]))
+
+
+def main(args):
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    import laya
+    import transformers
+    print("laya %s, transformers %s, torch %s" % (getattr(laya, "__version__", "?"), transformers.__version__, torch.__version__))
+    if not args:
+        study(laya_reference("convaiinnovations/laya-multilingual", "laya-multilingual"),
+              granite_reference("ibm-granite/granite-embedding-311m-multilingual-r2", "granite-311m"))
+    elif args[0] == "laya" and len(args) == 3:
+        study(laya_run=laya_reference(args[1], args[2]))
+    elif args[0] == "granite" and len(args) == 3:
+        study(granite_run=granite_reference(args[1], args[2]))
+    else:
+        sys.exit(__doc__)
 
 
 @torch.no_grad()
@@ -334,4 +370,4 @@ def tiny():
 
 
 if __name__ == "__main__":
-    sys.exit(tiny() if sys.argv[1:] == ["tiny"] else main())
+    sys.exit(tiny() if sys.argv[1:] == ["tiny"] else main(sys.argv[1:]))

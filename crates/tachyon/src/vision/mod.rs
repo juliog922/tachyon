@@ -10,6 +10,7 @@ pub(crate) mod convert;
 pub use convert::convert;
 
 use crate::cuda::{Context, DevBuf, HostBuf, Module, Stream, arg};
+use crate::encoder::race::Products;
 use crate::json::Json;
 use crate::media::{BUDGETS, Image, PATCH, POOL};
 use crate::ptx::{ADD_ROWS_F16, ATTEND_F16, GEMM_CLIP, GEMM_CLIP_128, HEADS_F16, POOL_F16, RMS_F16};
@@ -66,7 +67,8 @@ pub struct Vision {
     stream: Stream,
     /// The most patches an image has.
     cap: usize,
-    sms: u32,
+    /// The product kernel each shape takes.
+    products: Products,
 }
 
 impl Vision {
@@ -82,7 +84,7 @@ impl Vision {
         let ((weights, rope), (scratch, bufs)) = (weights(ctx, &wpk, shape)?, scratch(ctx, shape, cap)?);
         let inputs = ctx.alloc_host(4 * (2 * cap + 3 * (cap / 64 + 1)))?;
         let (module, stream) = (ctx.load(&crate::ptx::module())?, ctx.stream()?);
-        Ok(Vision { shape, wpk, weights, rope, scratch, bufs, inputs, module, stream, cap, sms: ctx.info().sms })
+        Ok(Vision { shape, wpk, weights, rope, scratch, bufs, inputs, module, stream, cap, products: Products::default() })
     }
 
     /// The width of a soft token: the decoder's hidden size.
@@ -108,7 +110,9 @@ impl Vision {
         self.fill(gw, n);
         let at = (self.bufs.a - self.scratch.ptr()) as usize;
         // SAFETY: `patches` lives until the stream is synchronized below, also when a launch fails.
-        let run = unsafe { self.stream.upload(&self.scratch, at, &patches) }.and_then(|()| self.run(n, gw));
+        let pass = || unsafe { self.stream.upload(&self.scratch, at, &patches) }.and_then(|()| self.run(n, gw));
+        // A pass that raced products is done again, with the kernels picked.
+        let run = pass().and_then(|()| if self.products.raced() { pass() } else { Ok(()) });
         self.stream.sync()?;
         run?;
         self.download(self.bufs.t, n / (POOL * POOL) * self.shape.out)
@@ -152,15 +156,18 @@ impl Vision {
         unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }
     }
 
-    /// `y = clip(clip(a) · wᵀ)` (`io` is `[a, y]`, `shape` is `(tokens, mode)`) for `tokens` rows of `a`, stored as `mode` says (see [`crate::ptx::GEMM_CLIP`]): in
-    /// blocks of 128 tokens when they give each multiprocessor four.
+    /// `y = clip(clip(a) · wᵀ)` (`io` is `[a, y]`, `shape` is `(tokens, mode)`) for `tokens` rows of `a`, stored as `mode` says (see [`crate::ptx::GEMM_CLIP`]), by
+    /// the kernel [`Products`] picks.
     fn gemm(&self, w: &str, io: [u64; 2], shape: (usize, u32)) -> Result<()> {
         let ([a, y], (tokens, mode)) = (io, shape);
         let matrix = self.wpk.tensor(w).ok_or_else(|| Error::Format(format!("vision.wpk: no tensor {w}")))?;
         let (rows, cols, n) = (matrix.shape[0] as u32, matrix.shape[1] as u32, tokens as u32);
         let args = [A::P(a), A::P(self.at(w)), A::P(0), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(self.at(&format!("{w}.clip")))];
-        let (tile, kernel, threads) = if n.div_ceil(128) * (rows / 64) >= 4 * self.sms { (128, GEMM_CLIP_128, 256) } else { (64, GEMM_CLIP, 128) };
-        self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+        let run = |k: usize| {
+            let (tile, kernel, threads) = [(128, GEMM_CLIP_128, 256), (64, GEMM_CLIP, 128)][k];
+            self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+        };
+        run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)
     }
 
     /// [`RMS_F16`] over `rows` rows, `io` being `[x, y, w1, w2, a]`: `x += w1 ⊙ rms(y)` unless `y` is 0, then `a = w2 ⊙ rms(x)` unless `a` is 0.

@@ -2,11 +2,15 @@
 //! [`crate::ptx::encoder`]; the hidden states, Granite's embeddings or Laya's option logits out.
 
 use super::laya::{Head, Kind};
+use super::race::Products;
 use super::{Config, Settings};
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Module, Stream, arg};
-use crate::ptx::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE, NORM_F16, ROPE_F16, SPIN};
+use crate::ptx::{
+    ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, NORM_F16, QUANT_F16,
+    ROPE_F16, SPIN,
+};
 use crate::token::Tokenizer;
-use crate::wpk::{Loader, Wpk};
+use crate::wpk::{Dtype, Loader, Wpk};
 use crate::{Error, Result};
 use std::cell::RefCell;
 use std::path::Path;
@@ -14,8 +18,12 @@ use std::time::Duration;
 
 /// Rows of the last scorer layer, padded for the matrix product.
 const SCORES: u32 = 64;
-/// The matrix products, largest blocks first: tokens per block, kernel, threads.
-const PRODUCTS: [(u32, &str, u32); 2] = [(128, GEMM_F16_128, 256), (64, GEMM_F16, 128)];
+/// Two product kernels, largest blocks first: tokens per block, kernel, threads.
+type Kernels = [(u32, &'static str, u32); 2];
+/// The matrix products.
+const PRODUCTS: Kernels = [(128, GEMM_F16_128, 256), (64, GEMM_F16, 128)];
+/// The same for Q8 weights.
+const PRODUCTS_Q8: Kernels = [(128, GEMM_Q8_128, 256), (64, GEMM_Q8, 128)];
 /// Batch shapes whose graphs an encoder keeps.
 const GRAPHS: usize = 16;
 /// Rows past the capacity in each `f16` buffer, so a product's last block of 128 tokens stays inside it.
@@ -29,7 +37,8 @@ enum A {
 }
 
 /// Where the activations live: the residual stream `x`, the wide `f32` rows `big` (the MLP's two halves, picked
-/// rows), and two buffers of `f16` rows: what a matrix product reads, and queries, keys and values (`b`).
+/// rows; a Q8 product's activations and their scales), and two buffers of `f16` rows: what a matrix product reads,
+/// and queries, keys and values (`b`).
 #[derive(Clone, Copy)]
 struct Buffers {
     x: u64,
@@ -82,8 +91,8 @@ pub struct Encoder {
     module: Module,
     stream: Stream,
     cap: usize,
-    /// The GPU's multiprocessors.
-    sms: u32,
+    /// The product kernel each shape takes, an index of [`PRODUCTS`].
+    products: Products,
     /// While [`Encoder::timeline`] runs: each launch's kind and an event recorded after it.
     marks: RefCell<Option<Vec<(String, Event)>>>,
 }
@@ -113,7 +122,7 @@ impl Encoder {
             module,
             stream,
             cap,
-            sms: ctx.info().sms,
+            products: Products::default(),
             marks: RefCell::new(None),
         };
         enc.check().and_then(|()| enc.interleave())?;
@@ -237,7 +246,8 @@ impl Encoder {
                 names.extend(["norm1", "qkv", "o", "norm2", "up", "down"].iter().flat_map(|n| [format!("h{l}.{n}.w"), format!("h{l}.{n}.b")]));
             }
         }
-        match names.iter().find(|n| self.wpk.tensor(n).is_none()) {
+        let q8 = names.iter().filter(|n| self.wpk.tensor(n).is_some_and(|t| t.dtype == Dtype::I8)).map(|n| format!("{n}.scale")).collect::<Vec<_>>();
+        match names.iter().chain(&q8).find(|n| self.wpk.tensor(n).is_none()) {
             Some(n) => Err(Error::Format(format!("weights.wpk: no tensor {n}"))),
             None => Ok(()),
         }
@@ -264,7 +274,7 @@ impl Encoder {
     }
 
     /// Runs `work` kernel by kernel, each timed on the GPU, and returns its result and every kernel's kind (its name;
-    /// for a matrix product `gemm tokens×cols→rows /tile`) and time, in order. A [`SPIN`] kernel first holds the GPU while the CPU
+    /// for a matrix product `gemm tokens×cols→rows /tile`, ` q8` after it for 8-bit weights) and time, in order. A [`SPIN`] kernel first holds the GPU while the CPU
     /// queues the kernels, up to the first wait for a result, so they run back to back: GPU time without launch gaps.
     pub fn timeline<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<(T, Vec<(String, Duration)>)> {
         let start = self.stream.context().event(true)?;
@@ -284,22 +294,46 @@ impl Encoder {
 
     /// `p.y = p.a · wᵀ + bias` for `tokens` rows, stored as `mode` says (see [`crate::ptx::GEMM_F16`]).
     fn gemm(&self, p: &Product, tokens: usize, mode: u32) -> Result<()> {
+        let (args, [rows, cols], kernels) = self.operands(p, tokens, mode)?;
+        let run = |k: usize| {
+            let (tile, kernel, threads) = kernels[k];
+            self.launch(kernel, [(tokens as u32).div_ceil(tile) * (rows / GEMM_F16_TILE), 1, 1], threads, &args)
+        };
+        let marks = self.marks.take();
+        let k = self.products.pick(&self.stream, &self.module, [rows, cols, tokens as u32], &run);
+        *self.marks.borrow_mut() = marks;
+        let k = k?;
+        run(k)?;
+        let (tile, q8) = (kernels[k].0, if kernels == PRODUCTS_Q8 { " q8" } else { "" });
+        if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
+            last.0 = format!("gemm {tokens}×{cols}→{rows} /{tile}{q8}");
+        }
+        Ok(())
+    }
+
+    /// The arguments of `p`'s product over `tokens` rows, stored as `mode` says; its matrix's rows and columns; the
+    /// kernels that take it, [`PRODUCTS_Q8`] for 8-bit weights, after rounding the activations to Q8.
+    fn operands(&self, p: &Product, tokens: usize, mode: u32) -> Result<(Vec<A>, [u32; 2], Kernels)> {
         let t = self.wpk.tensor(p.w).ok_or_else(|| Error::Format(format!("weights.wpk: no tensor {}", p.w)))?;
         let (rows, cols) = (t.shape[0] as u32, t.shape[1] as u32);
         if rows % GEMM_F16_TILE != 0 || cols % 64 != 0 {
             return Err(Error::Unsupported(format!("a {rows} × {cols} matrix: products take multiples of 64")));
         }
         let bias = if p.bias.is_empty() { 0 } else { self.at(p.bias) };
-        let args = [A::P(p.a), A::P(self.at(p.w)), A::P(bias), A::P(p.y), A::U(rows), A::U(cols), A::U(tokens as u32), A::U(mode)];
-        // The largest blocks that still give each multiprocessor two.
-        // Blocks of 128 tokens when they give each multiprocessor four; they are slower on shorter batches.
-        let wide = (tokens as u32).div_ceil(128) * (rows / GEMM_F16_TILE) >= 4 * self.sms;
-        let (tile, kernel, threads) = PRODUCTS[usize::from(!wide)];
-        self.launch(kernel, [(tokens as u32).div_ceil(tile) * (rows / GEMM_F16_TILE), 1, 1], threads, &args)?;
-        if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
-            last.0 = format!("gemm {tokens}×{cols}→{rows} /{tile}");
-        }
-        Ok(())
+        let q8 = t.dtype == Dtype::I8;
+        let (a, scales) = if q8 { self.quantize(p.a, cols, tokens)? } else { (p.a, 0) };
+        let mut args = vec![A::P(a), A::P(self.at(p.w)), A::P(bias), A::P(p.y), A::U(rows), A::U(cols), A::U(tokens as u32), A::U(mode)];
+        args.extend(q8.then(|| [A::P(scales), A::P(self.at(&format!("{}.scale", p.w)))]).into_iter().flatten());
+        Ok((args, [rows, cols], if q8 { PRODUCTS_Q8 } else { PRODUCTS }))
+    }
+
+    /// Rounds `tokens` rows of `cols` `f16` at `a` to Q8 in `big`: the values, then a scale per 64 of them; their
+    /// addresses.
+    fn quantize(&self, a: u64, cols: u32, tokens: usize) -> Result<(u64, u64)> {
+        let (q, widest) = (self.bufs.big, self.cfg.hidden.max(self.cfg.inter));
+        let scales = q + ((self.cap + SLACK) * widest) as u64;
+        self.launch(QUANT_F16, [(cols / 64).div_ceil(8), tokens as u32, 1], 256, &[A::P(a), A::P(q), A::P(scales), A::U(cols)])?;
+        Ok((q, scales))
     }
 
     /// Layer norm of `rows` rows (see [`Norm`]).
@@ -355,13 +389,23 @@ impl Encoder {
         let shape = (tokens.div_ceil(64) * 64, tokens.div_ceil(64) + seqs.len(), kinds.is_some());
         self.fill(seqs, kinds, (shape.0, shape.1));
         self.batch = (shape.0, shape.1 as u32);
+        let known = self.graphs.iter().position(|g| g.0 == shape);
+        if known.is_none() {
+            // A pass that measures the shape's products, whose result the next pass overwrites from the inputs.
+            let marks = self.marks.take();
+            self.layers(shape.2)?;
+            *self.marks.get_mut() = marks;
+        }
         if self.marks.get_mut().is_some() {
             return self.layers(shape.2).map(|()| tokens);
         }
-        let at = if let Some(at) = self.graphs.iter().position(|g| g.0 == shape) {
+        let at = if let Some(at) = known {
             at
         } else {
-            let graph = self.stream.capture(|_| self.layers(shape.2))?;
+            self.products.recording.set(true);
+            let graph = self.stream.capture(|_| self.layers(shape.2));
+            self.products.recording.set(false);
+            let graph = graph?;
             if self.graphs.len() == GRAPHS {
                 self.graphs.remove(0);
             }
@@ -401,27 +445,28 @@ impl Encoder {
         self.gemm(&Product { a, w: &format!("{i}.o"), bias: "", y: x }, n, 1)
     }
 
-    /// Encoder layer `i`'s gated MLP over the batch's `n` tokens, added to `x`: the GELU in the up product (its rows
-    /// interleaved, see [`Encoder::interleave`]).
+    /// Encoder layer `i`'s gated MLP over the batch's `n` tokens, added to `x`: the GELU (or `SiLU`) in the up product
+    /// (its rows interleaved, see [`Encoder::interleave`]).
     fn mlp(&self, i: usize, n: usize) -> Result<()> {
         let (cfg, Buffers { x, a, b, .. }) = (&self.cfg, self.bufs);
         self.norm(&Norm { x, a, xo: 0, weight: &format!("{i}.mlp_norm"), bias: "" }, n, cfg.eps)?;
-        self.gemm(&Product { a, w: &format!("{i}.up"), bias: "", y: b }, n, 4)?;
+        self.gemm(&Product { a, w: &format!("{i}.up"), bias: "", y: b }, n, if cfg.silu { 5 } else { 4 })?;
         self.gemm(&Product { a: b, w: &format!("{i}.down"), bias: "", y: x }, n, 1)
     }
 
-    /// Interleaves the rows of each layer's up product, the GELU half's row `j` then the gate's, so the product
-    /// stores `gelu(a)·b` itself (mode 4): through a scratch copy, rows as `f32` words.
+    /// Interleaves the rows of each layer's up product (and of its Q8 scales), the GELU half's row `j` then the
+    /// gate's, so the product stores `gelu(a)·b` itself (mode 4): through a scratch copy, rows as `f32` words.
     fn interleave(&self) -> Result<()> {
-        let (inter, words) = (self.cfg.inter, self.cfg.hidden as u32 / 2);
+        let inter = self.cfg.inter;
         let ctx = self.stream.context();
         let (scratch, mut maps) = (ctx.alloc(4 * inter * self.cfg.hidden)?, ctx.alloc_host(16 * inter)?);
         for (i, r) in (0..inter).flat_map(|j| [j, inter + j]).chain(0..2 * inter).enumerate() {
             maps[4 * i..][..4].copy_from_slice(&(r as u32).to_le_bytes());
         }
-        let (there, back, grid) = (maps.device_ptr()?, maps.device_ptr()? + 8 * inter as u64, [words.div_ceil(256), 2 * inter as u32, 1]);
-        for i in 0..self.cfg.layers() {
-            let up = self.at(&format!("{i}.up"));
+        let (there, back) = (maps.device_ptr()?, maps.device_ptr()? + 8 * inter as u64);
+        for t in (0..self.cfg.layers()).flat_map(|i| [format!("{i}.up"), format!("{i}.up.scale")]).filter_map(|n| self.wpk.tensor(&n)) {
+            let (up, words) = (self.weights.ptr() + t.offset, (t.len / t.shape[0] / 4) as u32);
+            let grid = [words.div_ceil(256), 2 * inter as u32, 1];
             self.launch(GATHER_ROWS, grid, 256, &[A::P(up), A::P(there), A::P(scratch.ptr()), A::U(words)])?;
             self.launch(GATHER_ROWS, grid, 256, &[A::P(scratch.ptr()), A::P(back), A::P(up), A::U(words)])?;
         }

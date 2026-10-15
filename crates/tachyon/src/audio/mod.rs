@@ -11,6 +11,7 @@ mod convert;
 pub use convert::convert;
 
 use crate::cuda::{Context, DevBuf, Module, Stream, arg};
+use crate::encoder::race::Products;
 use crate::json::Json;
 use crate::media::{self, MAX_SAMPLES, MEL_BINS, SAMPLE_RATE};
 use crate::ptx::{ATTEND_AUDIO, GEMM_CLIP, GEMM_CLIP_128, LCONV, RMS_F16, SUBSAMPLE};
@@ -71,7 +72,8 @@ pub struct Tower {
     bufs: Buffers,
     module: Module,
     stream: Stream,
-    sms: u32,
+    /// The product kernel each shape takes.
+    products: Products,
 }
 
 impl Tower {
@@ -83,7 +85,7 @@ impl Tower {
         Loader::new(ctx)?.to_device(&wpk, &weights)?;
         let (scratch, bufs) = scratch(ctx, shape)?;
         let (module, stream) = (ctx.load(&crate::ptx::module())?, ctx.stream()?);
-        Ok(Tower { shape, wpk, weights, scratch, bufs, module, stream, sms: ctx.info().sms })
+        Ok(Tower { shape, wpk, weights, scratch, bufs, module, stream, products: Products::default() })
     }
 
     /// The width of a soft token: the decoder's hidden size.
@@ -106,7 +108,9 @@ impl Tower {
         let mel: Vec<u8> = media::mel(&samples).iter().flat_map(|v| v.to_le_bytes()).collect();
         let at = (self.bufs.mel - self.scratch.ptr()) as usize;
         // SAFETY: `mel` lives until the stream is synchronized below, also when a launch fails.
-        let run = unsafe { self.stream.upload(&self.scratch, at, &mel) }.and_then(|()| self.run(valid(samples.len()), n));
+        let pass = || unsafe { self.stream.upload(&self.scratch, at, &mel) }.and_then(|()| self.run(valid(samples.len()), n));
+        // A pass that raced products is done again, with the kernels picked.
+        let run = pass().and_then(|()| if self.products.raced() { pass() } else { Ok(()) });
         self.stream.sync()?;
         run?;
         self.download(self.bufs.t, n * self.shape.width)
@@ -139,8 +143,11 @@ impl Tower {
         let (rows, cols, n) = (matrix.shape[0] as u32, matrix.shape[1] as u32, tokens as u32);
         let (bias, clip) = (self.at(&format!("{w}.bias")), self.at(&format!("{w}.clip")));
         let args = [A::P(a), A::P(self.at(w)), A::P(bias), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(clip)];
-        let (tile, kernel, threads) = if n.div_ceil(128) * (rows / 64) >= 4 * self.sms { (128, GEMM_CLIP_128, 256) } else { (64, GEMM_CLIP, 128) };
-        self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+        let run = |k: usize| {
+            let (tile, kernel, threads) = [(128, GEMM_CLIP_128, 256), (64, GEMM_CLIP, 128)][k];
+            self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+        };
+        run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)
     }
 
     /// [`RMS_F16`] over `rows` rows of `h`, `io` being `[x, y, w1, w2, a, xo]`.

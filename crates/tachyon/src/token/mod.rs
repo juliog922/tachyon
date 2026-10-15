@@ -1,7 +1,8 @@
 //! Text to token IDs and back, for Gemma's SentencePiece-style BPE: spaces become `▁`, the text is split into
 //! characters, characters the vocabulary lacks fall back to their UTF-8 bytes (`<0xHH>` tokens), and adjacent
-//! tokens merge, lowest-ranked pair first, until no merge applies. IDs match Hugging Face `tokenizers` on the same
-//! `tokenizer.json`.
+//! tokens merge, lowest-ranked pair first, until no merge applies; and for byte-level BPE (see `token/bytes.rs`), whose
+//! symbols are the text's bytes, after NFC normalization if the tokenizer asks for it. IDs match Hugging Face
+//! `tokenizers` on the same `tokenizer.json`.
 //!
 //! [`Tokenizer::from_json`] reads a `tokenizer.json` once, at conversion; [`Tokenizer::to_bytes`] and
 //! [`Tokenizer::from_bytes`] store and load the result, whose lookup tables are ready to use as read: loading is a
@@ -10,7 +11,9 @@
 //! Text is encoded literally: a special token's text in a prompt stays text. Special tokens enter only by ID,
 //! from the chat template, so user text cannot forge a turn.
 
+mod bytes;
 mod chat;
+mod unicode;
 
 pub use chat::{Chat, Message, Role};
 
@@ -29,13 +32,21 @@ const BYTES: u32 = 2;
 const SPLIT: u32 = 4;
 /// Flag: a text that does not start with a space gets one (Metaspace's `prepend_scheme`).
 const PREPEND: u32 = 8;
+/// Flag: byte-level BPE, the text cut into pieces by GPT-2's pattern, or with [`CL100K`] or [`O200K`] by that one.
+const BYTE_LEVEL: u32 = 16;
+/// Flag: the cl100k pattern (see [`bytes::Pattern`]).
+const CL100K: u32 = 32;
+/// Flag: the text is put in Unicode Normalization Form C first.
+const NFC: u32 = 64;
+/// Flag: the o200k pattern (see [`bytes::Pattern`]).
+const O200K: u32 = 128;
 /// Characters with a direct entry in [`Tokenizer::chars`]: the first two Unicode planes.
 const DIRECT: usize = 0x20000;
 
 /// A BPE vocabulary with its merges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tokenizer {
-    /// [`META`], [`BYTES`], [`SPLIT`], [`PREPEND`].
+    /// [`META`], [`BYTES`], [`SPLIT`], [`PREPEND`], [`BYTE_LEVEL`], [`CL100K`], [`NFC`], [`O200K`].
     flags: u32,
     /// The unknown token, or [`NONE`].
     unk: u32,
@@ -45,7 +56,7 @@ pub struct Tokenizer {
     text: Vec<u8>,
     /// Special tokens' IDs, sorted.
     special: Vec<u32>,
-    /// The token of each byte.
+    /// The token of each byte: its `<0xHH>` token, or in byte-level BPE the one of its character.
     bytes: Vec<u32>,
     /// The token of each character below [`DIRECT`], or [`NONE`].
     chars: Vec<u32>,
@@ -58,6 +69,11 @@ pub struct Tokenizer {
     added: Vec<u32>,
     /// Open addressing table of `(left, right, rank, merged)`.
     merges: Vec<u32>,
+    /// Open addressing table of the vocabulary's tokens by their text, when the model ignores merges for a piece
+    /// that is a token (`ignore_merges`); empty otherwise.
+    words: Vec<u32>,
+    /// The special tokens the post-processor puts before and after a text, or [`NONE`].
+    frame: [u32; 2],
 }
 
 /// Slot of `key` in a table of `mask + 1` entries.
@@ -80,20 +96,27 @@ fn find(table: &[u32], a: u32, b: u32) -> (usize, &[u32]) {
 
 impl Tokenizer {
     /// Reads a Hugging Face `tokenizer.json` of the kind Gemma ships: BPE, optionally with byte fallback, no
-    /// pre-tokenizer, and either no normalizer or one that replaces spaces with `▁`; or of mmBERT's kind, whose
-    /// Metaspace pre-tokenizer splits the text at every space and prepends one.
+    /// pre-tokenizer, and either no normalizer or one that replaces spaces with `▁`; of mmBERT's kind, whose
+    /// Metaspace pre-tokenizer splits the text at every space and prepends one; or byte-level BPE, as GPT-2 and `OLMo`
+    /// ship it, with an NFC normalizer or none, and one of three pre-tokenizer patterns (GPT-2's, cl100k, o200k).
     pub fn from_json(json: &[u8]) -> Result<Tokenizer> {
         let doc = Json::parse(json)?;
         let model = doc.get("model").filter(|m| m.get("type").and_then(Json::str) == Some("BPE")).ok_or_else(|| unsupported("a model other than BPE"))?;
-        let meta = spaces_to_meta(doc.get("normalizer"))?;
-        let pre = pre_tokenizer(doc.get("pre_tokenizer"), meta)?;
+        let (meta, nfc) = normalizer(doc.get("normalizer"))?;
+        let pre = pre_tokenizer(doc.get("pre_tokenizer"), meta)? | (u32::from(nfc) * NFC);
         let fallback = model.get("byte_fallback").and_then(Json::bool) == Some(true);
         let mut vocab: Vec<(&str, u32)> =
             model.get("vocab").and_then(Json::obj).unwrap_or_default().iter().map(|(k, v)| (k.as_str(), v.num().unwrap_or(-1.0) as u32)).collect();
         let (special, plain) = added(doc.get("added_tokens"), &mut vocab);
         let merges: Vec<(&str, &str)> = model.get("merges").and_then(Json::arr).unwrap_or_default().iter().filter_map(pair).collect();
         let unk = model.get("unk_token").and_then(Json::str);
-        Tokenizer::build(&vocab, &merges, [special, plain], unk, pre | (u32::from(meta) * META) | (u32::from(fallback) * BYTES))
+        let skip: Vec<u32> = special.iter().chain(&plain).copied().collect();
+        let mut t = Tokenizer::build(&vocab, &merges, [special, plain], unk, pre | (u32::from(meta) * META) | (u32::from(fallback) * BYTES))?;
+        t.frame = frame(doc.get("post_processor"));
+        if model.get("ignore_merges").and_then(Json::bool) == Some(true) {
+            t.index_words(&skip);
+        }
+        Ok(t)
     }
 
     /// The tokenizer of `vocab` and `merges`, whose added tokens are `[special, plain]`.
@@ -117,9 +140,11 @@ impl Tokenizer {
             joins: Vec::new(),
             added: Vec::new(),
             merges: vec![NONE; 4 * (2 * merges.len()).next_power_of_two().max(2)],
+            words: Vec::new(),
+            frame: [NONE; 2],
         };
         for (id, name) in names.iter().enumerate() {
-            t.add_token(id as u32, name);
+            t.add(id as u32, name);
         }
         let plain = names.iter().enumerate().filter(|&(id, _)| !t.is_special(id as u32));
         let pairs = plain.flat_map(|(_, name)| name.chars().zip(name.chars().skip(1)));
@@ -157,6 +182,54 @@ impl Tokenizer {
             (Some(c), None, false) => self.rare.extend([c as u32, id]),
             _ => {}
         }
+    }
+
+    /// Records token `id`, named `name` in the vocabulary.
+    fn add(&mut self, id: u32, name: &str) {
+        if self.flags & BYTE_LEVEL != 0 && !self.is_special(id) { self.add_byte_token(id, name) } else { self.add_token(id, name) }
+    }
+
+    /// Records token `id` of a byte-level vocabulary: a name of byte characters is those bytes; another (an added
+    /// token's) is its own text.
+    fn add_byte_token(&mut self, id: u32, name: &str) {
+        let decoded: Option<Vec<u8>> = name.chars().map(bytes::byte_of).collect();
+        if let Some(&[b]) = decoded.as_deref() {
+            self.bytes[usize::from(b)] = id;
+        }
+        self.text.extend(decoded.unwrap_or_else(|| name.as_bytes().to_vec()));
+        self.offsets.push(self.text.len() as u32);
+    }
+
+    /// Fills [`Tokenizer::words`] with every token but those of `skip`, the added ones.
+    fn index_words(&mut self, skip: &[u32]) {
+        let mut table = vec![NONE; (2 * self.len()).next_power_of_two().max(2)];
+        let mask = table.len() - 1;
+        for id in (0..self.len() as u32).filter(|id| !skip.contains(id)) {
+            let mut i = slot(fnv(self.bytes(id)), mask);
+            while table[i] != NONE {
+                i = (i + 1) & mask;
+            }
+            table[i] = id;
+        }
+        self.words = table;
+    }
+
+    /// The token whose text is `text`, if the model ignores merges for such a piece.
+    fn word(&self, text: &[u8]) -> Option<u32> {
+        let mask = self.words.len().checked_sub(1)?;
+        let mut i = slot(fnv(text), mask);
+        loop {
+            match self.words[i] {
+                NONE => return None,
+                id if self.bytes(id) == text => return Some(id),
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    /// The special tokens Hugging Face's post-processor puts before and after a single text, if any.
+    pub fn frame(&self) -> [Option<u32>; 2] {
+        self.frame.map(|id| (id != NONE).then_some(id))
     }
 
     /// The number of tokens.
@@ -200,6 +273,8 @@ impl Tokenizer {
     /// (with a splitting Metaspace pre-tokenizer, before every space), so no merge can cross a cut, and each piece is
     /// merged on its own.
     pub fn encode(&self, text: &str, out: &mut Vec<u32>) {
+        let normalized = if self.flags & NFC != 0 { unicode::nfc(text) } else { text.into() };
+        let text = normalized.as_ref();
         let (mut work, mut from, mut i) = (Work::default(), 0, 0);
         while let Some(c) = text[i..].chars().next() {
             match self.added_at(&text.as_bytes()[i..]) {
@@ -227,11 +302,14 @@ impl Tokenizer {
     fn segment(&self, text: &str, work: &mut Work, out: &mut Vec<u32>) {
         let prefixed;
         let text = if self.flags & PREPEND != 0 && !text.is_empty() && !text.starts_with([' ', '▁']) {
-            prefixed = format!("▁{text}");
+            prefixed = format!("{}{text}", if self.flags & BYTE_LEVEL != 0 { ' ' } else { '▁' });
             &prefixed
         } else {
             text
         };
+        if self.flags & BYTE_LEVEL != 0 {
+            return self.byte_segment(text, work, out);
+        }
         let (mut start, mut last) = (0, '▁');
         for (i, c) in text.char_indices() {
             if i > start && self.cuts(last, c) {
@@ -245,6 +323,17 @@ impl Tokenizer {
         }
     }
 
+    /// Appends the tokens of `text` in byte-level BPE: each piece its pattern cuts is a token of its own if the model
+    /// ignores merges for pieces that are tokens, else merged on its own.
+    fn byte_segment(&self, text: &str, work: &mut Work, out: &mut Vec<u32>) {
+        let pattern = [bytes::Pattern::Gpt2, bytes::Pattern::Cl100k, bytes::Pattern::O200k]
+            [usize::from(self.flags & CL100K != 0) + 2 * usize::from(self.flags & O200K != 0)];
+        bytes::pieces(text, pattern, |piece| match self.word(piece.as_bytes()) {
+            Some(id) => out.push(id),
+            None => self.merge_all(piece, work, out),
+        });
+    }
+
     /// Whether the text is cut between `last` and `c`: before a space, unless a token joins `last` to it.
     fn cuts(&self, last: char, c: char) -> bool {
         let space = c == ' ' || c == '▁';
@@ -254,7 +343,12 @@ impl Tokenizer {
 
     /// Merges the symbols of `text`, lowest-ranked pair first, and appends the result to `out`.
     fn merge_all(&self, text: &str, w: &mut Work, out: &mut Vec<u32>) {
-        self.symbols(text, &mut w.ids);
+        if self.flags & BYTE_LEVEL == 0 {
+            self.symbols(text, &mut w.ids);
+        } else {
+            w.ids.clear();
+            w.ids.extend(text.bytes().map(|b| self.bytes[usize::from(b)]));
+        }
         let n = w.ids.len() as u32;
         w.next.clear();
         w.next.extend(1..=n);
@@ -299,7 +393,8 @@ impl Tokenizer {
         (u64::from(rank) << 32 | u64::from(i), merged)
     }
 
-    /// The tokens before merging, into `ids`: one per character, or per byte of a character the vocabulary lacks.
+    /// The tokens before merging, into `ids`: one per character, or per byte of a character the vocabulary lacks (in
+    /// byte-level BPE, [`Tokenizer::merge_all`] takes one per byte).
     fn symbols(&self, text: &str, ids: &mut Vec<u32>) {
         ids.clear();
         for c in text.chars() {
@@ -324,8 +419,9 @@ impl Tokenizer {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         let text: Vec<u32> = self.text.chunks(4).map(|c| c.iter().rev().fold(0, |w, &b| w << 8 | u32::from(b))).collect();
-        let head = [self.flags, self.unk, self.text.len() as u32];
-        for section in [&head[..], &self.offsets, &text, &self.special, &self.bytes, &self.chars, &self.rare, &self.joins, &self.added, &self.merges] {
+        let head = [self.flags, self.unk, self.text.len() as u32, self.frame[0], self.frame[1]];
+        let sections = [&head[..], &self.offsets, &text, &self.special, &self.bytes, &self.chars, &self.rare, &self.joins, &self.added, &self.merges];
+        for section in sections.into_iter().chain((!self.words.is_empty()).then_some(&self.words[..])) {
             out.extend((section.len() as u32).to_le_bytes());
             for w in section {
                 out.extend(w.to_le_bytes());
@@ -341,14 +437,17 @@ impl Tokenizer {
         let [head, offsets, text, special, bytes, chars, rare, joins, added, merges] = std::array::from_fn(|i| std::mem::take(&mut s[i]));
         let mut text: Vec<u8> = text.iter().flat_map(|w| w.to_le_bytes()).collect();
         text.truncate(*head.get(2).ok_or_else(damaged)? as usize);
-        let t = Tokenizer { flags: head[0], unk: head[1], offsets, text, special, bytes, chars, rare, joins, added, merges };
+        // Older files end after the merges, and their head holds no frame.
+        let words = if words.len() > 0 { section(&mut words)? } else { Vec::new() };
+        let frame = [3, 4].map(|i| head.get(i).copied().unwrap_or(NONE));
+        let t = Tokenizer { flags: head[0], unk: head[1], offsets, text, special, bytes, chars, rare, joins, added, merges, words, frame };
         let sound = t.offsets.last() == Some(&(t.text.len() as u32)) && t.bytes.len() == 256 && t.chars.len() == DIRECT;
         if sound && t.merges.len().is_power_of_two() { Ok(t) } else { Err(damaged()) }
     }
 }
 
 fn damaged() -> Error {
-    Error::Format("tokenizer: damaged".into())
+    Error::Format("tokenizer.tok: damaged, or written by an older Tachyon; convert the model again".into())
 }
 
 /// A length-prefixed run of words.
@@ -358,11 +457,12 @@ fn section(words: &mut impl Iterator<Item = u32>) -> Result<Vec<u32>> {
     if s.len() == n { Ok(s) } else { Err(damaged()) }
 }
 
-/// Whether the normalizer turns spaces into `▁`; none is fine, any other is not supported.
-fn spaces_to_meta(normalizer: Option<&Json>) -> Result<bool> {
+/// Whether the normalizer turns spaces into `▁`, and whether it is NFC; none is fine, any other is not supported.
+fn normalizer(normalizer: Option<&Json>) -> Result<(bool, bool)> {
     match normalizer {
-        None | Some(Json::Null) => Ok(false),
-        Some(n) if n.get("type").and_then(Json::str) == Some("Replace") && n.get("content").and_then(Json::str) == Some("▁") => Ok(true),
+        None | Some(Json::Null) => Ok((false, false)),
+        Some(n) if n.get("type").and_then(Json::str) == Some("Replace") && n.get("content").and_then(Json::str) == Some("▁") => Ok((true, false)),
+        Some(n) if n.get("type").and_then(Json::str) == Some("NFC") => Ok((false, true)),
         Some(_) => Err(unsupported("this normalizer")),
     }
 }
@@ -376,9 +476,13 @@ fn matched(names: &[&str], mut added: Vec<u32>) -> Vec<u32> {
 }
 
 /// The flags of the pre-tokenizer: none; Gemma's split on spaces, which never splits once the normalizer `meta`
-/// has turned them into `▁`; or a Metaspace with `▁`, which may split and prepend.
+/// has turned them into `▁`; a Metaspace with `▁`, which may split and prepend; a byte-level one with GPT-2's
+/// pattern; or a split by another pattern of [`bytes::PATTERNS`] (its matches kept) then a byte-level one.
 fn pre_tokenizer(pre: Option<&Json>, meta: bool) -> Result<u32> {
     let Some(pre) = pre.filter(|p| **p != Json::Null) else { return Ok(0) };
+    if let Some(flags) = byte_level(pre) {
+        return Ok(flags);
+    }
     let field = |k| pre.get(k).and_then(Json::str);
     match field("type") {
         Some("Split") if meta && pre.get("pattern").and_then(|p| p.get("String")).and_then(Json::str) == Some(" ") => Ok(0),
@@ -388,6 +492,59 @@ fn pre_tokenizer(pre: Option<&Json>, meta: bool) -> Result<u32> {
         }
         _ => Err(unsupported("this pre-tokenizer")),
     }
+}
+
+/// The flags of a byte-level pre-tokenizer: one with GPT-2's pattern, or a split by a pattern of [`bytes::PATTERNS`]
+/// (its matches kept, alone or with what lies between them) then one with none; `None` for any other.
+fn byte_level(pre: &Json) -> Option<u32> {
+    let flags = |p: &Json, regex: bool| {
+        let prepend = u32::from(p.get("add_prefix_space").and_then(Json::bool) == Some(true)) * PREPEND;
+        (p.get("type").and_then(Json::str) == Some("ByteLevel") && p.get("use_regex").and_then(Json::bool) == Some(regex)).then_some(BYTE_LEVEL | prepend)
+    };
+    if let Some(f) = flags(pre, true) {
+        return Some(f);
+    }
+    let [split, last] = pre.get("pretokenizers").and_then(Json::arr).unwrap_or_default() else { return None };
+    let regex = split.get("pattern").and_then(|p| p.get("Regex")).and_then(Json::str);
+    // Matches kept, or matches and what lies between them: the same with patterns that match everything.
+    let kept = matches!(
+        (split.get("behavior").and_then(Json::str), split.get("invert").and_then(Json::bool)),
+        (Some("Removed"), Some(true)) | (Some("Isolated"), Some(false))
+    );
+    let &(_, pattern) = bytes::PATTERNS.iter().find(|p| Some(p.0) == regex).filter(|_| kept)?;
+    let bit = match pattern {
+        bytes::Pattern::Gpt2 => 0,
+        bytes::Pattern::Cl100k => CL100K,
+        bytes::Pattern::O200k => O200K,
+    };
+    Some(flags(last, false)? | bit)
+}
+
+/// FNV-1a 64 of `bytes`.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xCBF2_9CE4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01B3))
+}
+
+/// The special tokens a `TemplateProcessing` post-processor (alone or in a sequence) puts before and after a single
+/// text; [`NONE`] where it puts none, or more than one.
+fn frame(post: Option<&Json>) -> [u32; 2] {
+    let template = post.and_then(|p| {
+        let all = std::iter::once(p).chain(p.get("processors").and_then(Json::arr).unwrap_or_default());
+        all.into_iter().find(|q| q.get("type").and_then(Json::str) == Some("TemplateProcessing"))
+    });
+    let Some(t) = template else { return [NONE; 2] };
+    let id = |item: &Json| {
+        let name = item.get("SpecialToken")?.get("id")?.str()?;
+        let ids = t.get("special_tokens")?.get(name)?.get("ids")?.arr()?;
+        ids.first()?.num().map(|v| v as u32).filter(|_| ids.len() == 1)
+    };
+    let single = t.get("single").and_then(Json::arr).unwrap_or_default();
+    let at = single.iter().position(|i| i.get("Sequence").is_some()).unwrap_or(single.len());
+    let side = |items: &[Json]| match items {
+        [one] => id(one).unwrap_or(NONE),
+        _ => NONE,
+    };
+    [side(&single[..at]), side(single.get(at + 1..).unwrap_or_default())]
 }
 
 /// Adds the added tokens to `vocab`; returns the special ones' IDs and the others'.

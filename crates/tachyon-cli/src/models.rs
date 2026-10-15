@@ -28,7 +28,15 @@ pub struct Model {
 }
 
 /// Every model the catalog knows: the encoders, then the chat models, smallest first.
-pub const CATALOG: [Model; 6] = [
+pub const CATALOG: [Model; 9] = [
+    Model {
+        name: "granite-embedding-97m",
+        repo: "ibm-granite/granite-embedding-97m-multilingual-r2",
+        task: "embed",
+        about: "Granite Embedding 97M R2: embeddings in 200+ languages, 384 dims, fastest",
+        vram: 150 << 20,
+        later: None,
+    },
     Model {
         name: "granite-embedding-311m",
         repo: "ibm-granite/granite-embedding-311m-multilingual-r2",
@@ -43,6 +51,22 @@ pub const CATALOG: [Model; 6] = [
         task: "decide",
         about: "Laya multilingual: typed decisions in one pass, 100+ languages",
         vram: 350 << 20,
+        later: None,
+    },
+    Model {
+        name: "laya-english",
+        repo: "convaiinnovations/laya",
+        task: "decide",
+        about: "Laya English: typed decisions in one pass, the most accurate in English",
+        vram: 900 << 20,
+        later: None,
+    },
+    Model {
+        name: "laya-typed-decisions",
+        repo: "convaiinnovations/laya-typed-decisions",
+        task: "decide",
+        about: "Laya typed-decisions: tuned for support, invoices, security and agent triage",
+        vram: 950 << 20,
         later: None,
     },
     Model {
