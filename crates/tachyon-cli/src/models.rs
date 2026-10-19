@@ -97,9 +97,9 @@ pub const CATALOG: [Model; 10] = [
         name: "gemma-4-26b-a4b",
         repo: "google/gemma-4-26B-A4B-it",
         task: "run",
-        about: "Gemma 4 26B A4B: mixture of experts, the default on 24 GB",
+        about: "Gemma 4 26B A4B: mixture of experts, text only for now, the default on 24 GB",
         vram: 15 << 30,
-        later: Some(12),
+        later: None,
     },
     Model {
         name: "gemma-4-31b",

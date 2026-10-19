@@ -8,6 +8,12 @@
 //! [`GEMV_Q4_NARROW`] is the same product for rows of at most 256 weights (8 chunks): 8 lanes per row, so a warp
 //! takes 4 rows and a block 16, and a matrix of such rows runs in a quarter of the blocks. Its rows are a multiple
 //! of 4. Launch `rows.div_ceil(16)` blocks of 128 threads.
+//!
+//! [`GEMV_Q4_MOE`] runs [`GEMV_Q4`] for the experts a decode step chose: block row `y` takes expert `idx[y]` of a
+//! matrix that stacks every expert's `rows`, reads its input `slot · y` values into the Q8 vector (`slot` 0: one
+//! input for all), and writes its rows at `y · rows` of the output, times `w[y]` unless `w` is null. Arguments:
+//! [`GEMV_Q4`]'s, then `idx: *const u32`, `w: *const f32`, `slot: u32` (a multiple of 32). Launch a grid of
+//! `(rows.div_ceil(GEMV_ROWS), k)` blocks of `32 · GEMV_ROWS`.
 
 use std::fmt::Write;
 
@@ -17,6 +23,8 @@ pub const GEMV_Q4: &str = "gemv_q4";
 pub const GEMV_ROWS: u32 = 4;
 /// Name of [`GEMV_Q4`] for rows of at most 256 weights.
 pub const GEMV_Q4_NARROW: &str = "gemv_q4_narrow";
+/// Name of [`GEMV_Q4`] over the experts a decode step chose.
+pub const GEMV_Q4_MOE: &str = "gemv_q4_moe";
 /// Chunks of 32 weights each [`GEMV_Q4`] lane has in flight per loop turn.
 pub const UNROLL: usize = 4;
 
@@ -41,10 +49,10 @@ const GEMV_HEAD: &str = "
     cvta.to.global.u64 %rd1, %rd1;
     cvta.to.global.u64 %rd2, %rd2;
     cvta.to.global.u64 %rd3, %rd3;
-    shr.u32 %r8, %r6, 1;
-    mul.wide.u32 %rd4, %r4, %r8;
+EXPERT    shr.u32 %r8, %r6, 1;
+    mul.wide.u32 %rd4, %r16, %r8;
     add.u64 %rd0, %rd0, %rd4;
-    mul.wide.u32 %rd4, %r4, %r7;
+    mul.wide.u32 %rd4, %r16, %r7;
     add.u64 %rd1, %rd1, %rd4;
     mul.wide.u32 %rd4, %r1, 16;
     add.u64 %rd0, %rd0, %rd4;
@@ -101,22 +109,72 @@ fn dot(ptx: &mut String, i: usize) {
     let _ = writeln!(ptx, "    fma.rn.f32 %f{i}, %ss{i}, 0fC1000000, %f{i};\n    fma.rn.f32 %sum, %f{i}, %sw{i}, %sum;");
 }
 
-/// [`GEMV_Q4`] with `u` chunks in flight per loop turn, or with `lanes` 8, [`GEMV_Q4_NARROW`].
-pub(super) fn gemv_q4(u: usize, lanes: usize) -> String {
-    let name = if lanes == 32 { GEMV_Q4 } else { GEMV_Q4_NARROW };
+/// [`GEMV_Q4_MOE`]'s head: `%r17` the block's slot, `%r16` its row of the stacked matrix, the Q8 input moved to its
+/// slot's.
+const EXPERT: &str = "    mov.u32 %r17, %ctaid.y;
+    ld.param.u64 %rd6, [pidx];
+    cvta.to.global.u64 %rd6, %rd6;
+    mul.wide.u32 %rd7, %r17, 4;
+    add.u64 %rd6, %rd6, %rd7;
+    ld.global.u32 %r18, [%rd6];
+    mad.lo.u32 %r16, %r18, %r5, %r4;
+    ld.param.u32 %r18, [pslot];
+    mul.lo.u32 %r18, %r18, %r17;
+    cvt.u64.u32 %rd6, %r18;
+    add.u64 %rd2, %rd2, %rd6;
+    shr.u32 %r18, %r18, 2;
+    cvt.u64.u32 %rd6, %r18;
+    add.u64 %rd3, %rd3, %rd6;
+";
+
+/// [`GEMV_Q4_MOE`]'s tail: the sum times the slot's weight, if any, stored at row `slot · rows + row`.
+const EXPERT_TAIL: &str = "
+    setp.ne.u32 %p, %r1, 0;
+    @%p bra EXIT;
+    ld.param.u64 %rd6, [pwts];
+    setp.eq.u64 %p, %rd6, 0;
+    @%p bra STORE;
+    cvta.to.global.u64 %rd6, %rd6;
+    mul.wide.u32 %rd7, %r17, 4;
+    add.u64 %rd6, %rd6, %rd7;
+    ld.global.f32 %o, [%rd6];
+    mul.f32 %sum, %sum, %o;
+STORE:
+    mad.lo.u32 %r18, %r17, %r5, %r4;
+    ld.param.u64 %rd5, [py];
+    cvta.to.global.u64 %rd5, %rd5;
+    mul.wide.u32 %rd6, %r18, 4;
+    add.u64 %rd5, %rd5, %rd6;
+    st.global.f32 [%rd5], %sum;
+EXIT:
+    ret;
+}
+";
+
+/// [`GEMV_Q4`] with `u` chunks in flight per loop turn, or with `lanes` 8, [`GEMV_Q4_NARROW`]; with `moe`,
+/// [`GEMV_Q4_MOE`].
+pub(super) fn gemv_q4(u: usize, lanes: usize, moe: bool) -> String {
+    let name = if moe {
+        GEMV_Q4_MOE
+    } else if lanes == 32 {
+        GEMV_Q4
+    } else {
+        GEMV_Q4_NARROW
+    };
+    let extra = if moe { ", .param .u64 pidx, .param .u64 pwts, .param .u32 pslot" } else { "" };
     let mut s = format!(
-        ".visible .entry {name}(.param .u64 pw, .param .u64 pws, .param .u64 pq, .param .u64 ps, .param .u64 py, .param .u32 prows, .param .u32 pcols)
+        ".visible .entry {name}(.param .u64 pw, .param .u64 pws, .param .u64 pq, .param .u64 ps, .param .u64 py, .param .u32 prows, .param .u32 pcols{extra})
 {{
     .reg .pred %p, %q<{u}>;
     .reg .b16 %h<{u}>;
-    .reg .b32 %r<16>, %w<{}>, %a<{}>, %acc<{u}>;
+    .reg .b32 %r<20>, %w<{}>, %a<{}>, %acc<{u}>;
     .reg .f32 %sx<{u}>, %ss<{u}>, %sw<{u}>, %f<{u}>, %sum, %o;
     .reg .b64 %rd<8>;",
         4 * u,
         8 * u
     );
     let head = GEMV_HEAD.replace("LMASK", &(lanes - 1).to_string()).replace("LSHIFT", &lanes.trailing_zeros().to_string());
-    s += &head.replace("ROWS", &(128 / lanes).to_string());
+    s += &head.replace("ROWS", &(128 / lanes).to_string()).replace("EXPERT", if moe { EXPERT } else { "    mov.u32 %r16, %r4;\n" });
     let _ = writeln!(s, "TURN:\n    add.u32 %r11, %r10, {};\n    setp.ge.u32 %p, %r11, %r7;\n    @%p bra LAST;", lanes * (u - 1));
     (0..u).for_each(|i| load(&mut s, i, false, lanes));
     (0..u).for_each(|i| dot(&mut s, i));
@@ -133,5 +191,5 @@ pub(super) fn gemv_q4(u: usize, lanes: usize) -> String {
         let _ = writeln!(s, "    shfl.sync.bfly.b32 %o, %sum, {k}, 31, -1;\n    add.f32 %sum, %sum, %o;");
         k /= 2;
     }
-    s + GEMV_TAIL
+    s + if moe { EXPERT_TAIL } else { GEMV_TAIL }
 }

@@ -15,8 +15,10 @@
 //! - [`QUANT_Q8P`] quantizes an `f32` vector to Q8P, the prefill layout ([`crate::quant::q8p`]). Arguments as
 //!   [`QUANT_Q8`]; `len` is a multiple of 64. Launch `len.div_ceil(256)` blocks of 256. [`GEGLU_Q8P`] quantizes
 //!   `gelu(a)·b` to Q8P over rows: value `i` reads `a[(i / width)·sa + i % width]` and `b` alike with `sb`, so
-//!   gate and up stacked in one row, or one layer's slice of the per-layer inputs, are read in place. Arguments:
-//!   `a, b`, Q8P out, `len, width, sa, sb: u32`. Launch as [`QUANT_Q8P`].
+//!   gate and up stacked in one row, or one layer's slice of the per-layer inputs, are read in place, and is stored
+//!   as value `(i / width)·so + i % width`, so rows can be padded as a matrix's are (the padding is not written).
+//!   Arguments: `a, b`, Q8P out, `len, width, sa, sb, so: u32`; `width` a multiple of 64. Launch as [`QUANT_Q8P`].
+//!   [`GEGLU_Q8S`] is the same with Q8 out (`width` a multiple of 32), for the experts of a decode step.
 //! - [`GEGLU_Q8`] quantizes `gelu(a[i]) · b[i]`, GELU in its tanh form, to Q8. Arguments: `a`, `b`, Q8 out,
 //!   `len: u32`. Launch as [`QUANT_Q8`].
 //! - [`NORM_Q8`] is the residual step (and [`NORM_Q8P`] the same with Q8P out, chunks being tokens): when `y` is not null, `h' = (h + w1 ⊙ rmsnorm(y)) · scale` is written to
@@ -33,7 +35,7 @@
 //! - The encoder's kernels, [`GEMM_F16`] to [`ATTEND_F16`]: see [`encoder`]. The vision tower's, [`RMS_F16`],
 //!   [`HEADS_F16`] and [`POOL_F16`]: see [`vision`]. The audio tower's, [`SUBSAMPLE`], [`ATTEND_AUDIO`] and
 //!   [`LCONV`]: see [`audio`].
-//! - [`GEMV_Q4`]: see [`gemv`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`] and its `f16` forms: see [`gemm`].
+//! - [`GEMV_Q4`] and [`GEMV_Q4_MOE`]: see [`gemv`]. [`ROUTE_TOPK`] and [`MOE_ADD`]: see [`moe`]. [`GEMM_Q4`], the prefill product on tensor cores, and [`MMA_PEAK`] and its `f16` forms: see [`gemm`].
 //! - [`SPIN`] holds the GPU for a while, for profiling. Arguments: `ns: u64`. Launch one block of 32. [`ATTEND_256`], [`ATTEND_512`]: see [`attend`]. [`SAMPLE`]: see [`sample`].
 //!
 //! Lengths are multiples of 32.
@@ -44,6 +46,7 @@ pub mod encoder;
 pub mod flash;
 pub mod gemm;
 pub mod gemv;
+pub mod moe;
 pub mod sample;
 pub mod vision;
 
@@ -56,7 +59,8 @@ pub use encoder::{
 use encoder::{LARGE, Operands, SMALL, TALL};
 pub use flash::{FLASH_256, FLASH_256_PAIRS, FLASH_512, shared};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H, SUM_SLICES, slices};
-pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
+pub use gemv::{GEMV_Q4, GEMV_Q4_MOE, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
+pub use moe::{MOE_ADD, ROUTE_TOPK};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
 pub use vision::{HEADS_F16, POOL_F16, RMS_F16};
 
@@ -72,6 +76,8 @@ pub const GEGLU_Q8P: &str = "geglu_q8p";
 pub const NORM_Q8P: &str = "norm_q8p";
 /// Name of the GELU-gated quantizer.
 pub const GEGLU_Q8: &str = "geglu_q8";
+/// Name of the GELU-gated quantizer over rows, as [`GEGLU_Q8P`] reads and writes them, with Q8 out.
+pub const GEGLU_Q8S: &str = "geglu_q8s";
 /// Name of the residual and normalization step.
 pub const NORM_Q8: &str = "norm_q8";
 /// Name of the embedding lookup.
@@ -89,20 +95,19 @@ pub fn module() -> String {
         quant(GEGLU_Q8, GELU),
         quant_p(QUANT_Q8P, false),
         quant_p(GEGLU_Q8P, true),
+        geglu_strided(),
         norm(false),
         norm(true),
         EMBED.into(),
-        gemv::gemv_q4(UNROLL, 32),
-        gemv::gemv_q4(UNROLL, 8),
+        gemv::gemv_q4(UNROLL, 32, false),
+        gemv::gemv_q4(UNROLL, 8, false),
+        moe::kernels(),
         gemm::gemm_q4(),
         gemm::PEAKS.map(gemm::mma_peak).concat(),
         attend::query(256) + &attend::query(512),
         flash::flash(256, 4) + &flash::flash(512, 4) + &flash::flash(256, 2),
-        attend::attend(256, 4),
-        attend::attend(512, 4),
-        attend::attend(256, 2),
-        attend::store(256),
-        attend::store(512),
+        attend::attend(256, 4) + &attend::attend(512, 4) + &attend::attend(256, 2),
+        attend::store(256) + &attend::store(512),
         SPIN_PTX.into(),
         encoder::gemm_f16(GEMM_F16, SMALL, Operands::F16),
         encoder::gemm_f16(GEMM_F16_128, LARGE, Operands::F16),
@@ -247,20 +252,17 @@ fn q8p(x: &str, i: &str, valid: &str) -> String {
 /// `ia = (i / width)·sa + i % width`, `ib` alike with `sb`. Threads past `len` take 0 and store nothing.
 fn quant_p(name: &str, gate: bool) -> String {
     let params = if gate { ".param .u64 pb, " } else { "" };
-    let extra = if gate { ", .param .u32 pwidth, .param .u32 psa, .param .u32 psb" } else { "" };
-    let (mut index, mut load) = ("    mul.wide.u32 %qo, %i, 4;\n    add.u64 %a, %a, %qo;\n".to_string(), String::new());
+    let extra = if gate { ", .param .u32 pwidth, .param .u32 psa, .param .u32 psb, .param .u32 pso" } else { "" };
+    let (mut index, mut load) = ("    mul.wide.u32 %qo, %i, 4;\n    add.u64 %a, %a, %qo;\n    mov.u32 %o, %i;\n".to_string(), String::new());
     if gate {
-        index = "    ld.param.u32 %w, [pwidth];\n    div.u32 %t, %i, %w;\n    rem.u32 %j, %i, %w;\n    ld.param.u32 %sa, [psa];
-    mad.lo.u32 %sa, %t, %sa, %j;\n    mul.wide.u32 %qo, %sa, 4;\n    add.u64 %a, %a, %qo;\n    ld.param.u32 %sb, [psb];
-    mad.lo.u32 %sb, %t, %sb, %j;\n    mul.wide.u32 %qo, %sb, 4;\n    ld.param.u64 %b, [pb];\n    cvta.to.global.u64 %b, %b;\n    add.u64 %b, %b, %qo;\n"
-            .into();
+        index = STRIDED.into();
         load = "    @%in ld.global.f32 %y, [%b];\n".to_string() + GELU_P;
     }
     format!(
         ".visible .entry {name}(.param .u64 px, {params}.param .u64 pq, .param .u64 ps, .param .u32 plen{extra})
 {{{BLOCK}{Q8}
     .reg .pred %in;
-    .reg .b32 %i, %n, %len, %w, %t, %j, %sa, %sb;
+    .reg .b32 %i, %n, %len, %w, %t, %j, %sa, %sb, %o;
     .reg .f32 %x, %y, %u;
     .reg .b64 %a, %b;
     mov.u32 %i, %ctaid.x;
@@ -280,7 +282,59 @@ fn quant_p(name: &str, gate: bool) -> String {
 {load}{}    ret;
 }}
 ",
-        q8p("%x", "%i", "%in")
+        q8p("%x", "%o", "%in")
+    )
+}
+
+/// The gated quantizers' indexing: value `i` is row `t = i / width`, column `j`; it reads `a[t·sa + j]` and
+/// `b[t·sb + j]` (`%a`, `%b`) and is stored as value `%o = t·so + j` of the output.
+const STRIDED: &str = "    ld.param.u32 %w, [pwidth];
+    div.u32 %t, %i, %w;
+    rem.u32 %j, %i, %w;
+    ld.param.u32 %sa, [psa];
+    mad.lo.u32 %sa, %t, %sa, %j;
+    mul.wide.u32 %qo, %sa, 4;
+    add.u64 %a, %a, %qo;
+    ld.param.u32 %sb, [psb];
+    mad.lo.u32 %sb, %t, %sb, %j;
+    mul.wide.u32 %qo, %sb, 4;
+    ld.param.u64 %b, [pb];
+    cvta.to.global.u64 %b, %b;
+    add.u64 %b, %b, %qo;
+    ld.param.u32 %o, [pso];
+    mad.lo.u32 %o, %t, %o, %j;
+";
+
+/// [`GEGLU_Q8S`]: [`GEGLU_Q8`] over rows, indexed as [`GEGLU_Q8P`]'s.
+fn geglu_strided() -> String {
+    format!(
+        ".visible .entry geglu_q8s(.param .u64 px, .param .u64 pb, .param .u64 pq, .param .u64 ps, .param .u32 plen, .param .u32 pwidth,
+    .param .u32 psa, .param .u32 psb, .param .u32 pso)
+{{{Q8}
+    .reg .pred %p;
+    .reg .b32 %i, %n, %len, %w, %t, %j, %sa, %sb, %o;
+    .reg .f32 %x, %y, %u;
+    .reg .b64 %a, %b;
+    mov.u32 %i, %ctaid.x;
+    mov.u32 %n, %ntid.x;
+    mov.u32 %len, %tid.x;
+    mad.lo.u32 %i, %i, %n, %len;
+    ld.param.u32 %len, [plen];
+    setp.ge.u32 %p, %i, %len;
+    @%p bra EXIT;
+    ld.param.u64 %qp, [pq];
+    ld.param.u64 %sp, [ps];
+    cvta.to.global.u64 %qp, %qp;
+    cvta.to.global.u64 %sp, %sp;
+    ld.param.u64 %a, [px];
+    cvta.to.global.u64 %a, %a;
+{STRIDED}    ld.global.f32 %x, [%a];
+    ld.global.f32 %y, [%b];
+{GELU_P}{}EXIT:
+    ret;
+}}
+",
+        q8("%x", "%o")
     )
 }
 

@@ -72,6 +72,32 @@ fn dense_checkpoint_converts_without_loss() {
     std::fs::remove_dir_all(src).unwrap();
 }
 
+/// The 26B A4B's layout: the router (Q4, its scale over √hidden), every expert's gate and up stacked and its down,
+/// and widths that are no multiple of 128 padded with zero weights (the MLP's 320 to 384, the experts' 192 to 256).
+#[test]
+fn experts_convert_without_loss() {
+    let src = common::tiny::checkpoint("convert-moe", 1, tiny::MOE);
+    let dst = src.join("out");
+    convert(&src, &dst).unwrap();
+    let cfg = Config::from_json(&std::fs::read(dst.join("config.json")).unwrap()).unwrap();
+    assert_eq!((cfg.experts, cfg.ffn, cfg.moe()), ([64, 4, 192], 320, true));
+    let source: std::collections::HashMap<String, Vec<f32>> = tiny::tensors(1, tiny::MOE).into_iter().map(|(n, _, v)| (n, v)).collect();
+    let l = "model.language_model.layers.3.";
+    let padded =
+        |m: &[f32], cols: usize, to: usize| m.chunks(cols).flat_map(|r| r.iter().copied().chain(std::iter::repeat_n(0.0, to - cols))).collect::<Vec<f32>>();
+    let weights = dst.join("weights.wpk");
+    assert_eq!(dequant(&dst, "weights.wpk", "3.down"), padded(&source[&format!("{l}mlp.down_proj.weight")], 320, 384), "the MLP's down, padded");
+    assert_eq!(dequant(&dst, "weights.wpk", "3.experts.down"), padded(&source[&format!("{l}experts.down_proj")], 192, 256), "the experts' downs");
+    assert_eq!(dequant(&dst, "weights.wpk", "3.experts.gate_up"), source[&format!("{l}experts.gate_up_proj")]);
+    assert_eq!(dequant(&dst, "weights.wpk", "3.router"), source[&format!("{l}router.proj.weight")]);
+    let floats = |b: Vec<u8>| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
+    let scale: Vec<f32> = source[&format!("{l}router.scale")].iter().map(|v| v / 16.0).collect();
+    assert_eq!(floats(tensor(&weights, "3.router_scale")), scale, "the router's scale over √256");
+    assert_eq!(floats(tensor(&weights, "3.expert_scale")), source[&format!("{l}router.per_expert_scale")]);
+    assert_eq!(floats(tensor(&weights, "3.post_feedforward_layernorm_2")), source[&format!("{l}post_feedforward_layernorm_2.weight")]);
+    std::fs::remove_dir_all(src).unwrap();
+}
+
 #[test]
 fn unsupported_features_are_refused_by_name() {
     let base = tiny::config(tiny::E4B);
@@ -79,18 +105,20 @@ fn unsupported_features_are_refused_by_name() {
         Err(tachyon::Error::Unsupported(what)) => what,
         other => panic!("{to}: {other:?}"),
     };
-    assert!(refused(r#""enable_moe_block":false"#, r#""enable_moe_block":true"#).contains("mixture-of-experts"));
+    let moe = tiny::config(tiny::MOE);
+    let refused_moe = |from: &str, to: &str| matches!(Config::from_json(moe.replace(from, to).as_bytes()), Err(tachyon::Error::Unsupported(_)));
+    assert!(refused_moe(r#""num_experts":64"#, r#""num_experts":256"#) && refused_moe(r#""top_k_experts":4"#, r#""top_k_experts":32"#));
     assert!(refused(r#""num_key_value_heads":2"#, r#""num_key_value_heads":8"#).contains("fewer than two"));
 }
 
-/// The tiny model on the GPU against the CPU reference in `f32`, in E4B's shape and the larger models': after each of 20 tokens (past the 8-position sliding
+/// The tiny model on the GPU against the CPU reference in `f32`, in E4B's shape and the larger models' (with experts too): after each of 20 tokens (past the 8-position sliding
 /// window), the logits agree within the error of Q8 activations and an `f16` cache (2–4.2% RMS measured over the
 /// shapes and positions, bound at 5%), and the greedy
 /// pick is the reference's best or within that error of it.
 #[cfg(feature = "gpu")]
 #[test]
 fn tiny_model_decodes_as_the_reference() {
-    for shape in [("decode", tiny::E4B), ("decode-dense", tiny::DENSE)] {
+    for shape in [("decode", tiny::E4B), ("decode-dense", tiny::DENSE), ("decode-moe", tiny::MOE)] {
         decodes_as_the_reference(shape);
     }
 }
@@ -136,14 +164,14 @@ fn decodes_as_the_reference((name, shape): (&str, tiny::Shape)) {
     std::fs::remove_dir_all(src).unwrap();
 }
 
-/// Prefill of the tiny model, in E4B's shape, E2B's and the larger models' ([`tiny::DENSE`]): 19 tokens through prefill and the 20th through a decode
+/// Prefill of the tiny model, in E4B's shape, E2B's and the larger models' ([`tiny::DENSE`], [`tiny::MOE`]): 19 tokens through prefill and the 20th through a decode
 /// step give the logits of the CPU reference (within the error of Q8P activations and an `f16` cache: 2–4% RMS
 /// measured, bound at 5%), and the same
 /// logits, bit for bit, whether prefill runs them in chunks of 8 (so sliding caches wrap their ring) or all at once.
 #[cfg(feature = "gpu")]
 #[test]
 fn tiny_model_prefills_as_the_reference_in_any_chunks() {
-    for (name, shape) in [("prefill-e4b", tiny::E4B), ("prefill-e2b", tiny::E2B), ("prefill-dense", tiny::DENSE)] {
+    for (name, shape) in [("prefill-e4b", tiny::E4B), ("prefill-e2b", tiny::E2B), ("prefill-dense", tiny::DENSE), ("prefill-moe", tiny::MOE)] {
         let src = common::tiny::checkpoint(name, 4, shape);
         let dst = src.join("out");
         convert(&src, &dst).unwrap();

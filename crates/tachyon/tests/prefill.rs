@@ -65,6 +65,8 @@ fn gelu(x: f64) -> f64 {
     0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044_715 * x * x * x)).tanh())
 }
 
+/// [`GEGLU_Q8P`] over rows read in place, its output rows packed, or padded (by 64 values, as a matrix of 704
+/// columns pads to 768) with the padding left alone.
 #[test]
 fn geglu_q8p_gates_strided_rows() {
     let gpu = Gpu::new();
@@ -72,19 +74,28 @@ fn geglu_q8p_gates_strided_rows() {
     let (width, tokens) = (512, 3);
     let gate_up: Vec<f32> = values(2 * width * tokens, 1).iter().map(|x| 6.0 * x).collect();
     let table = values(3 * width * tokens, 2);
-    let (a, b, (q, s)) = (gpu.upload(&gate_up), gpu.upload(&table), out(&gpu, width * tokens));
-    let (pa, pb, pq, ps) = (a.ptr(), b.ptr() + 4 * width as u64, q.ptr(), s.ptr());
-    let (len, w, sa, sb) = ((width * tokens) as u32, width as u32, 2 * width as u32, 3 * width as u32);
-    let args = [arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len), arg(&w), arg(&sa), arg(&sb)];
-    // SAFETY: eight arguments of the kernel's types; every row read lies inside its buffer, the outputs hold `len`.
-    unsafe { gpu.stream.launch(&gpu.module.function(GEGLU_Q8P).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &args) }.unwrap();
     let want: Vec<f64> = (0..width * tokens)
         .map(|i| {
             let (t, j) = (i / width, i % width);
             gelu(f64::from(gate_up[t * 2 * width + j])) * f64::from(table[t * 3 * width + width + j])
         })
         .collect();
-    assert_q8p(&gpu.download(&q), &gpu.floats(&s), &want, 1e-5);
+    for so in [width, width + 64] {
+        let (a, b, (q, s)) = (gpu.upload(&gate_up), gpu.upload(&table), out(&gpu, so * tokens));
+        let (pa, pb, pq, ps) = (a.ptr(), b.ptr() + 4 * width as u64, q.ptr(), s.ptr());
+        let (len, w, sa, sb, pso) = ((width * tokens) as u32, width as u32, 2 * width as u32, 3 * width as u32, so as u32);
+        let args = [arg(&pa), arg(&pb), arg(&pq), arg(&ps), arg(&len), arg(&w), arg(&sa), arg(&sb), arg(&pso)];
+        // SAFETY: nine arguments of the kernel's types; every row read lies inside its buffer, the outputs hold
+        // `tokens` rows of `so`.
+        unsafe { gpu.stream.launch(&gpu.module.function(GEGLU_Q8P).unwrap(), [len.div_ceil(256), 1, 1], [256, 1, 1], 0, &args) }.unwrap();
+        let (q, s) = (gpu.download(&q), gpu.floats(&s));
+        let rows = |v: &[u8], per: usize| (0..tokens).flat_map(|t| v[t * so / per..][..width / per].to_vec()).collect::<Vec<_>>();
+        let scales: Vec<f32> = (0..tokens).flat_map(|t| s[t * so / 32..][..width / 32].to_vec()).collect();
+        assert_q8p(&rows(&q, 1), &scales, &want, 1e-5);
+        if so > width {
+            assert!(q[width..so].iter().all(|&b| b == 0), "the padding is not written");
+        }
+    }
 }
 
 #[test]

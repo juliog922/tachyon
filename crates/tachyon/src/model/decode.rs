@@ -27,8 +27,8 @@ use super::prefill::Chunk;
 use crate::Result;
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Stream, arg};
 use crate::ptx::{
-    ATTEND_256, ATTEND_256_PAIRS, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE,
-    SAMPLE_THREADS, SPIN, Sampling, rope,
+    ATTEND_256, ATTEND_256_PAIRS, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEGLU_Q8S, GEMV_Q4, GEMV_Q4_MOE, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8,
+    NORM_THREADS, ROUTE_TOPK, SAMPLE, SAMPLE_THREADS, SPIN, SUM_SLICES, Sampling, rope,
 };
 use crate::wpk::{ALIGN, Loader, Wpk};
 use std::os::unix::fs::FileExt;
@@ -135,6 +135,9 @@ pub(super) struct Bufs {
     partial: [u64; 2],
     count: [u64; 2],
     pub(super) kv: Vec<[u64; 2]>,
+    /// The mixture of experts' buffers: zeros, two sums, the router's logits, the chosen experts and their weights,
+    /// their gate and up, and their weighted outputs (a slice each).
+    moe: [u64; 8],
     pub(super) context: u32,
     /// Slots of a sliding layer's cache: the window and a prefill chunk.
     pub(super) ring: u32,
@@ -161,6 +164,9 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
     // Attention's scratch: per block (at most heads / 2) and split (at most 256), the block's maxima, sums and outputs.
     let partial = [take(f * cfg.heads / 2 * 256 * (8 + 4 * d)), take(f * 8 * 1024)];
     let count = [take(f * cfg.heads / 2), take(f)];
+    let [e, k, w] = cfg.experts;
+    let (hm, ke) = (if cfg.moe() { cfg.hidden } else { 0 }, k * 2 * w);
+    let moe = [take(f * hm), take(f * hm), take(f * hm), take(f * e), take(f * k), take(f * k), take(f * ke), take(f * k * hm)];
     let caches: Vec<[u64; 2]> = (0..l)
         .map(|i| {
             let len = 2 * cfg.kv(i) * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
@@ -170,7 +176,7 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
     let kv = (0..l).map(|i| caches[cfg.source(i)]).collect();
     let chunk = super::prefill::layout(cfg, settings.chunk, &mut take);
     let (context, ring) = (context as u32, ring as u32);
-    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context, ring, control: [0; 5], token: [0; 2] };
+    let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, moe, context, ring, control: [0; 5], token: [0; 2] };
     (bufs, chunk, end)
 }
 
@@ -631,6 +637,16 @@ fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
         geglu(b.y, b.y + 4 * cfg.mlp(i) as u64, b.q, cfg.mlp(i)),
         gemv(w.mat(&format!("{i}.down")), b.q, b.y),
     ];
+    if cfg.moe() {
+        ops.extend(experts(cfg, w, b, i));
+        let [zero, t, sum, .., yd] = b.moe;
+        ops.extend([
+            norm([zero, t, b.y, n("post_feedforward_layernorm_1"), 0], [0, 0], [h, 1], [eps, 1.0]),
+            norm([t, sum, yd, n("post_feedforward_layernorm_2"), 0], [0, 0], [h, 1], [eps, 1.0]),
+            norm([x1, x0, sum, n("post_feedforward_layernorm"), next], b.q, [h, 1], [eps, scalar]),
+        ]);
+        return ops;
+    }
     if cfg.per_layer == 0 {
         ops.push(norm([x1, x0, b.y, n("post_feedforward_layernorm"), next], b.q, [h, 1], [eps, scalar]));
         return ops;
@@ -643,6 +659,31 @@ fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
         norm([x0, x1, b.y, n("post_per_layer_input_norm"), next], b.q, [h, 1], [eps, scalar]),
     ]);
     ops
+}
+
+/// Layer `i`'s experts on the residual stream after attention: the router (an RMS norm with its scale, the Q4
+/// projection, [`ROUTE_TOPK`]), then the chosen experts' gate and up, GELU, and their downs times their weights,
+/// added up in order, into the last of the experts' buffers.
+fn experts(cfg: &Config, w: &Weights, b: &Bufs, i: usize) -> Vec<Op> {
+    let ([e, k, width], h, eps) = (cfg.experts.map(|v| v as u32), cfg.hidden, cfg.eps);
+    let (n, x1) = (|name: &str| w.at(&format!("{i}.{name}")), residual(cfg, b.x, i).1);
+    let [.., logits, idx, wts, ye, yd] = b.moe;
+    let (up, down) = (w.mat(&format!("{i}.experts.gate_up")), w.mat(&format!("{i}.experts.down")));
+    let moe = |m: Mat, y: u64, (rows, wts, slot): (u32, u64, u32)| {
+        let args = [m.w[0], m.w[1], b.q[0], b.q[1], y].map(A::P).into_iter().chain([A::U(rows), A::U(m.cols), A::P(idx), A::P(wts), A::U(slot)]);
+        (GEMV_Q4_MOE, [rows.div_ceil(GEMV_ROWS), k, 1], 32 * GEMV_ROWS, args.collect())
+    };
+    let gate = [ye, ye + 4 * u64::from(width), b.q[0], b.q[1]].map(A::P).into_iter().chain([k * width, width, 2 * width, 2 * width, down.cols].map(A::U));
+    vec![
+        norm([x1, 0, 0, 0, n("router_scale")], b.q, [h, 1], [eps, 1.0]),
+        gemv(w.mat(&format!("{i}.router")), b.q, logits),
+        (ROUTE_TOPK, [1, 1, 1], 128, [logits, n("expert_scale"), idx, wts].map(A::P).into_iter().chain([A::U(e), A::U(k)]).collect()),
+        norm([x1, 0, 0, 0, n("pre_feedforward_layernorm_2")], b.q, [h, 1], [eps, 1.0]),
+        moe(up, ye, (up.rows / e, 0, 0)),
+        (GEGLU_Q8S, [(k * width).div_ceil(256), 1, 1], 256, gate.collect()),
+        moe(down, yd, (down.rows / e, wts, down.cols)),
+        (SUM_SLICES, [(h as u32).div_ceil(1024), 1, 1], 256, vec![A::P(yd), A::U(h as u32), A::U(k)]),
+    ]
 }
 
 /// `v` rounded to bfloat16, as Gemma's embedding scale is applied.

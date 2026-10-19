@@ -55,6 +55,9 @@ pub struct Config {
     pub eps: f32,
     /// Final logits become `softcap · tanh(x / softcap)`.
     pub softcap: f32,
+    /// The mixture of experts beside each layer's MLP (26B A4B): experts, how many each token takes, and the width
+    /// of an expert's MLP; `[0, 0, 0]` for a model without one.
+    pub experts: [usize; 3],
 }
 
 impl Config {
@@ -97,12 +100,18 @@ impl Config {
             fraction: rope("full_attention", "partial_rotary_factor", 1.0),
             eps: n[9] as f32,
             softcap: c.get("final_logit_softcapping").and_then(Json::num).unwrap_or(0.0) as f32,
+            experts: experts(c),
         })
     }
 
     /// Layers.
     pub fn layers(&self) -> usize {
         self.global.len()
+    }
+
+    /// Whether the layers have a mixture of experts beside their MLP.
+    pub fn moe(&self) -> bool {
+        self.experts[0] > 0
     }
 
     /// Width of layer `i`'s MLP: twice [`Config::ffn`] in a shared layer of a [`Config::wide`] model.
@@ -134,13 +143,19 @@ impl Config {
     }
 }
 
-/// Refuses, as [`Error::Unsupported`], what Gemma 4's 26B A4B adds (step 12b brings it), and head counts the
-/// attention kernels do not take: `c` is the decoder's configuration.
+/// The mixture of experts `c` describes: experts, experts a token takes, an expert's width; zeros without one.
+fn experts(c: &Json) -> [usize; 3] {
+    let num = |k: &str| c.get(k).and_then(Json::num).unwrap_or(0.0) as usize;
+    if c.get("enable_moe_block").and_then(Json::bool) == Some(true) { [num("num_experts"), num("top_k_experts"), num("moe_intermediate_size")] } else { [0; 3] }
+}
+
+/// Refuses, as [`Error::Unsupported`], head counts the attention kernels do not take, and a mixture of experts the
+/// routing kernel does not (more than 128 experts, or more than 16 a token): `c` is the decoder's configuration.
 fn unsupported(c: &Json, heads: usize, kv: [usize; 2]) -> Result<()> {
-    let on = |k: &str| c.get(k).and_then(Json::bool) == Some(true);
+    let [e, k, _] = experts(c);
     let features = [
-        (on("enable_moe_block"), "a mixture-of-experts block (26B A4B)"),
         (kv.iter().any(|&k| k == 0 || heads % k != 0 || (heads / k) % 2 != 0), "a key-value head serving fewer than two query heads, or an odd number"),
+        (e > 128 || k > 16 || (e > 0 && (k == 0 || k > e)), "a mixture of more than 128 experts, or of more than 16 a token"),
     ];
     features.iter().find(|f| f.0).map_or(Ok(()), |f| Err(Error::Unsupported(f.1.into())))
 }
@@ -215,22 +230,52 @@ fn layer(w: &mut Writer, st: &Safetensors, l: &str, i: usize, kv: bool) -> Resul
         matrix(w, st, &format!("{i}.{name}"), &parts.iter().map(|n| format!("{l}{n}.weight")).collect::<Vec<_>>())?;
     }
     let norms = ["self_attn.q_norm", "self_attn.k_norm", "input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm"];
-    for n in norms.into_iter().chain(["post_feedforward_layernorm", "post_per_layer_input_norm"]).filter(|n| st.has(&format!("{l}{n}.weight"))) {
+    let more = [
+        "post_feedforward_layernorm",
+        "post_per_layer_input_norm",
+        "pre_feedforward_layernorm_2",
+        "post_feedforward_layernorm_1",
+        "post_feedforward_layernorm_2",
+    ];
+    for n in norms.into_iter().chain(more).filter(|n| st.has(&format!("{l}{n}.weight"))) {
         vector(w, st, &format!("{i}.{}", n.trim_start_matches("self_attn.")), &format!("{l}{n}.weight"))?;
+    }
+    if st.has(&format!("{l}router.proj.weight")) {
+        experts_of(w, st, l, i)?;
     }
     vector(w, st, &format!("{i}.layer_scalar"), &format!("{l}layer_scalar"))
 }
 
+/// Layer `i`'s mixture of experts: the router's projection as Q4 `{i}.router`, its input scale over `√hidden` as
+/// `{i}.router_scale` (the router reads `rmsnorm(x) · scale / √hidden`), `{i}.expert_scale`, and every expert's
+/// gate and up (`{i}.experts.gate_up`, expert after expert, as the checkpoint stacks them) and down
+/// (`{i}.experts.down`).
+fn experts_of(w: &mut Writer, st: &Safetensors, l: &str, i: usize) -> Result<()> {
+    matrix(w, st, &format!("{i}.router"), &[format!("{l}router.proj.weight")])?;
+    let scale = st.rows(&format!("{l}router.scale"), 0..1)?;
+    let root = (scale.len() as f32).sqrt();
+    w.add(&format!("{i}.router_scale"), Dtype::F32, &[scale.len() as u64], &scale.iter().flat_map(|v| (v / root).to_le_bytes()).collect::<Vec<_>>())?;
+    vector(w, st, &format!("{i}.expert_scale"), &format!("{l}router.per_expert_scale"))?;
+    matrix(w, st, &format!("{i}.experts.gate_up"), &[format!("{l}experts.gate_up_proj")])?;
+    matrix(w, st, &format!("{i}.experts.down"), &[format!("{l}experts.down_proj")])
+}
+
 /// Writes the source matrices, rows stacked, as one Q4 matrix: `{name}.w` (`u8 [rows, cols/2]`) and `{name}.s`
-/// (`f16 [rows, cols/64]`). Rows are read and quantized a slice at a time.
+/// (`f16 [rows, cols/64]`). Rows are read and quantized a slice at a time. Rows are padded with zeros to a multiple
+/// of 128 weights, as the prefill product reads them (the 26B A4B's 2112 and 704); the zero weights take their
+/// activations' place without adding to any sum.
 fn matrix(w: &mut Writer, st: &Safetensors, name: &str, parts: &[String]) -> Result<()> {
     let (mut packed, mut scales, mut cols) = (Vec::new(), Vec::new(), 0);
     for part in parts {
         let (rows, c) = st.dims(part)?;
-        cols = c;
+        cols = c.next_multiple_of(128);
         let step = (1 << 22) / c.max(1) + 1;
         for start in (0..rows).step_by(step) {
-            let q = q4(&st.rows(part, start..rows.min(start + step))?, c);
+            let mut slice = st.rows(part, start..rows.min(start + step))?;
+            if cols != c {
+                slice = slice.chunks(c).flat_map(|r| r.iter().copied().chain(std::iter::repeat_n(0.0, cols - c))).collect();
+            }
+            let q = q4(&slice, cols);
             packed.extend(q.packed);
             scales.extend(q.scales.iter().flat_map(|s| s.to_le_bytes()));
         }

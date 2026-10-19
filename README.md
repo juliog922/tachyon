@@ -102,6 +102,7 @@ crates/tachyon/          the library
   src/ptx/gemv.rs        the Q4 × Q8 decode GEMV
   src/ptx/attend.rs      decode attention: QK norms, RoPE, KV cache, split over positions, merged by the last block
   src/ptx/sample.rs      sampling on the GPU: greedy, temperature, top-k, top-p, min-p, penalty, allowed tokens
+  src/ptx/moe.rs         the mixture of experts: routing (softmax, top-k), prefill's sums of each token's experts
   tests/                 tests; GPU ones behind feature `gpu`, model-file ones behind `models`
   tests/fixtures/        tokenizer fixtures: 10,000 strings and the reference token IDs
   benches/               machine ceilings and the bench harness
@@ -186,7 +187,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 9 | `pull`, catalog, conversion | under validation |
 | 10 | ModernBERT encoder: Laya decisions, Granite embeddings | |
 | 11 | Vision and audio inputs | |
-| 12 | Larger tiers: 12B, 31B, FP8, MoE | 12a (12B and 31B text) under validation |
+| 12 | Larger tiers: 12B, 31B, FP8, MoE | 12a done: 12B 101.8 tok/s, 31B 41.7 tok/s (L40S); 12b (26B A4B MoE) under validation |
 | 13 | Speculative decoding | |
 | 14 | `tachyon serve`: other processes over shared memory, `interface/` | under validation |
 

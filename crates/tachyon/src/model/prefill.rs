@@ -19,8 +19,8 @@
 use super::Config;
 use super::decode::{A, Bufs, Mat, Op, Weights};
 use crate::ptx::{
-    EMBED_Q4, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS, QUANT_Q8P, QUERY_256, QUERY_512, SUM_SLICES,
-    flash::Shape,
+    EMBED_Q4, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, MOE_ADD, NORM_Q8P, NORM_THREADS, QUANT_Q8P, QUERY_256, QUERY_512,
+    ROUTE_TOPK, SUM_SLICES, flash::Shape,
 };
 
 /// Device addresses of prefill's buffers, each for a chunk of tokens: the residual stream (two), Q8P values and
@@ -34,6 +34,9 @@ pub(super) struct Chunk {
     pub(super) y: u64,
     pub(super) per_layer: [u64; 3],
     pub(super) attend: [u64; 2],
+    /// The mixture of experts' buffers: zeros, two sums, the dense MLP's output, the experts' sum, one expert's
+    /// output, the router's logits, the chosen experts and their weights, and the experts' Q8P input.
+    pub(super) moe: [u64; 11],
     pub(super) ids: u64,
     pub(super) room: u32,
     pub(super) sms: u32,
@@ -49,7 +52,12 @@ pub(super) fn layout(cfg: &Config, chunk: usize, take: &mut impl FnMut(usize) ->
     let (qkv, y) = (take(f * super::decode::qkv_width(cfg)), take(f * room));
     let per_layer = [take(f * pl), take(f * pl), take(f * pl)];
     let attend = [take(f * cfg.heads / 4 * (8 + 4 * d)), take(f * cfg.heads / 4)];
-    Chunk { x, q, qkv, y, per_layer, attend, ids: 0, room: room as u32, sms: 0 }
+    let ([e, k, _], hm) = (cfg.experts, if cfg.moe() { cfg.hidden } else { 0 });
+    let mut moe = [0; 11];
+    for (m, len) in moe.iter_mut().zip([f * hm, f * hm, f * hm, f * hm, f * hm, f * hm, f * e, f * k, f * k, f / 4 * hm, f / 32 * hm]) {
+        *m = take(len);
+    }
+    Chunk { x, q, qkv, y, per_layer, attend, moe, ids: 0, room: room as u32, sms: 0 }
 }
 
 /// `y = X·Mᵀ` over `n` tokens of Q8P input `q`; into `c.y` in slices of the columns where they fill the GPU
@@ -69,11 +77,40 @@ fn norm(p: [u64; 5], q: [u64; 2], len: usize, chunks: u32, k: [f32; 2]) -> Op {
     (NORM_Q8P, [len as u32 / NORM_THREADS, chunks, 1], NORM_THREADS, args)
 }
 
-/// Q8P of `gelu(a) · b` over `n` rows of `width`, `a` and `b` rows `stride` floats apart.
-fn geglu([a, b]: [u64; 2], q: [u64; 2], n: u32, width: usize, stride: [usize; 2]) -> Op {
+/// Q8P of `gelu(a) · b` over `n` rows of `width`, `a` and `b` rows `stride[0]`, `stride[1]` floats apart, the output's
+/// `stride[2]` (the reading matrix's padded columns).
+fn geglu([a, b]: [u64; 2], q: [u64; 2], n: u32, width: usize, stride: [u32; 3]) -> Op {
     let len = n * width as u32;
-    let args = [a, b, q[0], q[1]].map(A::P).into_iter().chain([len, width as u32, stride[0] as u32, stride[1] as u32].map(A::U)).collect();
+    let args = [a, b, q[0], q[1]].map(A::P).into_iter().chain([len, width as u32, stride[0], stride[1], stride[2]].map(A::U)).collect();
     (GEGLU_Q8P, [len.div_ceil(256), 1, 1], 256, args)
+}
+
+/// Layer `i`'s experts over the chunk of `n` tokens, as [`super::decode`]'s: the router and [`ROUTE_TOPK`] for
+/// every token, then every expert over the whole chunk, [`MOE_ADD`] keeping its output for the tokens that chose
+/// it, weighted, expert after expert (a token's sum follows the experts' numbers, where a decode step's follows its
+/// choice). A first form: it runs 16 times the experts' products a token needs.
+fn experts(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2]) -> Vec<Op> {
+    let ([e, k, width], h, eps, nt) = (cfg.experts.map(|v| v as u32), cfg.hidden, cfg.eps, n as u32);
+    let (at, x1) = (|name: &str| w.at(&format!("{i}.{name}")), super::decode::residual(cfg, c.x, i).1);
+    let [.., ymoe, yx, logits, idx, wts, q2s, q2z] = c.moe;
+    let (up, down) = (w.mat(&format!("{i}.experts.gate_up")), w.mat(&format!("{i}.experts.down")));
+    let mut ops = vec![norm([x1, 0, 0, 0, at("router_scale")], c.q, h, nt, [eps, 1.0])];
+    ops.extend(gemm(w.mat(&format!("{i}.router")), c.q, logits, nt, c));
+    ops.push((ROUTE_TOPK, [nt, 1, 1], 128, [logits, at("expert_scale"), idx, wts].map(A::P).into_iter().chain([A::U(e), A::U(k)]).collect()));
+    ops.push(norm([x1, 0, 0, 0, at("pre_feedforward_layernorm_2")], [q2s, q2z], h, nt, [eps, 1.0]));
+    let expert = |m: Mat, j: u32| {
+        let rows = m.rows / e;
+        let skip = u64::from(j) * u64::from(rows) * u64::from(m.cols);
+        Mat { w: [m.w[0] + skip / 2, m.w[1] + skip / 32], rows, cols: m.cols }
+    };
+    for j in 0..e {
+        ops.extend(gemm(expert(up, j), [q2s, q2z], c.y, nt, c));
+        ops.push(geglu([c.y, c.y + 4 * u64::from(width)], c.q, nt, width as usize, [2 * width, 2 * width, down.cols]));
+        ops.extend(gemm(expert(down, j), c.q, yx, nt, c));
+        let add = [ymoe, yx, idx, wts].map(A::P).into_iter().chain([j, k, h as u32, u32::from(j == 0)].map(A::U));
+        ops.push((MOE_ADD, [(h as u32).div_ceil(256), nt, 1], 256, add.collect()));
+    }
+    ops
 }
 
 /// The soft tokens of `run` (its first row in the chunk, its rows) over the chunk's embeddings in `x[0]`, from
@@ -133,7 +170,18 @@ fn mlp(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2], scalar: f32) ->
     let ((x0, x1), (ffn, pl)) = (super::decode::residual(cfg, c.x, i), (cfg.mlp(i), cfg.per_layer));
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
     let mut ops = gemm(w.mat(&format!("{i}.gate_up")), c.q, c.y, n, c);
-    ops.push(geglu([c.y, c.y + 4 * ffn as u64], c.q, n, ffn, [2 * ffn, 2 * ffn]));
+    ops.push(geglu([c.y, c.y + 4 * ffn as u64], c.q, n, ffn, [2 * ffn as u32, 2 * ffn as u32, w.mat(&format!("{i}.down")).cols]));
+    if cfg.moe() {
+        let [zero, t, sum, dense, ymoe, ..] = c.moe;
+        ops.extend(gemm(w.mat(&format!("{i}.down")), c.q, dense, n, c));
+        ops.extend(experts(cfg, w, c, [i, n as usize]));
+        ops.extend([
+            norm([zero, t, dense, at("post_feedforward_layernorm_1"), 0], [0, 0], h, n, [eps, 1.0]),
+            norm([t, sum, ymoe, at("post_feedforward_layernorm_2"), 0], [0, 0], h, n, [eps, 1.0]),
+            norm([x1, x0, sum, at("post_feedforward_layernorm"), next], c.q, h, n, [eps, scalar]),
+        ]);
+        return ops;
+    }
     ops.extend(gemm(w.mat(&format!("{i}.down")), c.q, c.y, n, c));
     if pl == 0 {
         ops.push(norm([x1, x0, c.y, at("post_feedforward_layernorm"), next], c.q, h, n, [eps, scalar]));
@@ -141,7 +189,7 @@ fn mlp(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2], scalar: f32) ->
     }
     ops.push(norm([x1, x0, c.y, at("post_feedforward_layernorm"), 0], c.q, h, n, [eps, 1.0]));
     ops.extend(gemm(w.mat(&format!("{i}.per_layer_gate")), c.q, c.y, n, c));
-    ops.push(geglu([c.y, c.per_layer[1] + 4 * (i * pl) as u64], c.q, n, pl, [pl, cfg.layers() * pl]));
+    ops.push(geglu([c.y, c.per_layer[1] + 4 * (i * pl) as u64], c.q, n, pl, [pl as u32, (cfg.layers() * pl) as u32, pl as u32]));
     ops.extend(gemm(w.mat(&format!("{i}.per_layer_proj")), c.q, c.y, n, c));
     ops.push(norm([x0, x1, c.y, at("post_per_layer_input_norm"), next], c.q, h, n, [eps, scalar]));
     ops

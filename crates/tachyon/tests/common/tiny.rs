@@ -1,7 +1,8 @@
 //! A tiny Gemma 4 checkpoint, generated: the real model's structure (sliding and global layers, shared keys and
 //! values, per-layer inputs) in E4B's shape or E2B's, or the larger models' ([`DENSE`]: no per-layer inputs, no
 //! shared caches, two query heads per key-value head in sliding layers, one key-value head whose values are its keys
-//! in global layers), at a size the CPU reference runs in seconds. Every matrix is on the Q4 grid (`n·2^-e` per
+//! in global layers), or with a mixture of experts beside each MLP as the 26B A4B has ([`MOE`]: 64 experts of 192, 4
+//! a token, beside an MLP of 320, both widths padded on conversion), at a size the CPU reference runs in seconds. Every matrix is on the Q4 grid (`n·2^-e` per
 //! group of 64, one weight at ±7), so converting it loses nothing.
 
 use std::fmt::Write as _;
@@ -21,12 +22,18 @@ pub struct Shape {
     pub kv: usize,
     pub wide: bool,
     pub dense: bool,
+    pub moe: bool,
 }
 
-pub const E4B: Shape = Shape { kv: 2, wide: false, dense: false };
-pub const E2B: Shape = Shape { kv: 1, wide: true, dense: false };
+pub const E4B: Shape = Shape { kv: 2, wide: false, dense: false, moe: false };
+pub const E2B: Shape = Shape { kv: 1, wide: true, dense: false, moe: false };
 /// The 31B's layout: four key-value heads in sliding layers (two query heads each), one in global layers.
-pub const DENSE: Shape = Shape { kv: 4, wide: false, dense: true };
+pub const DENSE: Shape = Shape { kv: 4, wide: false, dense: true, moe: false };
+/// [`DENSE`] with experts, as the 26B A4B.
+pub const MOE: Shape = Shape { kv: 4, wide: false, dense: true, moe: true };
+/// Experts, experts a token takes, an expert's width; the MLP's width beside them.
+pub const EXPERTS: [usize; 3] = [64, 4, 192];
+pub const MOE_FFN: usize = 320;
 
 impl Shape {
     /// Key-value heads of layer `i`.
@@ -41,7 +48,13 @@ impl Shape {
 
     /// Width of layer `i`'s MLP.
     pub fn ffn(self, i: usize) -> usize {
-        if self.wide && i >= 4 { 2 * FFN } else { FFN }
+        if self.moe {
+            MOE_FFN
+        } else if self.wide && i >= 4 {
+            2 * FFN
+        } else {
+            FFN
+        }
     }
 }
 
@@ -129,7 +142,24 @@ fn layer_tensors(out: &mut Tensors, rng: &mut Rng, l: &str, (i, shape): (usize, 
     for n in norms.into_iter().filter(|&n| !shape.dense || n != "post_per_layer_input_norm") {
         vector(out, rng, format!("{l}{n}.weight"), HIDDEN, [0.5, 1.5]);
     }
+    if shape.moe {
+        experts(out, rng, l);
+    }
     vector(out, rng, format!("{l}layer_scalar"), 1, [0.5, 1.0]);
+}
+
+/// A layer's experts, named as the 26B A4B's checkpoint names them: the router's projection, scale and per-expert
+/// scales, every expert's gate and up stacked, every expert's down, and their three norms.
+fn experts(out: &mut Tensors, rng: &mut Rng, l: &str) {
+    let [e, _, w] = EXPERTS;
+    matrix(out, rng, format!("{l}router.proj.weight"), [e, HIDDEN], 5);
+    vector(out, rng, format!("{l}router.scale"), HIDDEN, [0.5, 1.5]);
+    vector(out, rng, format!("{l}router.per_expert_scale"), e, [0.5, 1.5]);
+    matrix(out, rng, format!("{l}experts.gate_up_proj"), [e * 2 * w, HIDDEN], 5);
+    matrix(out, rng, format!("{l}experts.down_proj"), [e * HIDDEN, w], 5);
+    for n in ["pre_feedforward_layernorm_2", "post_feedforward_layernorm_1", "post_feedforward_layernorm_2"] {
+        vector(out, rng, format!("{l}{n}.weight"), HIDDEN, [0.5, 1.5]);
+    }
 }
 
 /// Writes the checkpoint (`config.json`, the toy `tokenizer.json`, `model.safetensors` in bfloat16) to a fresh
@@ -164,20 +194,25 @@ pub fn checkpoint(name: &str, seed: u64, shape: Shape) -> PathBuf {
 pub fn config(shape: Shape) -> String {
     let types: Vec<String> = GLOBAL.iter().map(|&g| format!("\"{}\"", if g { "full_attention" } else { "sliding_attention" })).collect();
     format!(
-        r#"{{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{{"hidden_size":{HIDDEN},"intermediate_size":{FFN},
+        r#"{{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{{"hidden_size":{HIDDEN},"intermediate_size":{},
         "num_attention_heads":8,"num_key_value_heads":{},"num_global_key_value_heads":{},"head_dim":256,"global_head_dim":512,
-        "hidden_size_per_layer_input":{},"vocab_size":{VOCAB},"vocab_size_per_layer_input":{VOCAB},"num_hidden_layers":{LAYERS},
+        "hidden_size_per_layer_input":{},"vocab_size":{VOCAB},"num_experts":{},"top_k_experts":{},"moe_intermediate_size":{},"vocab_size_per_layer_input":{VOCAB},"num_hidden_layers":{LAYERS},
         "layer_types":[{}],"sliding_window":8,"num_kv_shared_layers":{},"rms_norm_eps":1e-6,"final_logit_softcapping":30.0,
         "hidden_activation":"gelu_pytorch_tanh","tie_word_embeddings":true,"attention_k_eq_v":{},"use_double_wide_mlp":{},
-        "enable_moe_block":false,"model_type":"gemma4_text","rope_parameters":{{"sliding_attention":{{"rope_type":"default","rope_theta":10000.0}},
+        "enable_moe_block":{},"model_type":"gemma4_text","rope_parameters":{{"sliding_attention":{{"rope_type":"default","rope_theta":10000.0}},
         "full_attention":{{"rope_type":"proportional","partial_rotary_factor":0.25,"rope_theta":1000000.0}}}}}}}}"#,
+        shape.ffn(0),
         shape.kv,
         shape.kv(2),
         if shape.dense { 0 } else { 256 },
+        EXPERTS[0],
+        EXPERTS[1],
+        EXPERTS[2],
         types.join(","),
         if shape.dense { 0 } else { 2 },
         shape.dense,
-        shape.wide
+        shape.wide,
+        shape.moe
     )
 }
 
@@ -250,16 +285,53 @@ fn layer(
     let out = attend(&q, &cache[source][first..], d, group);
     let add = |x: &[f32], y: &[f32], n: &str| -> Vec<f32> { x.iter().zip(rms(y, Some(w(n)))).map(|(a, b)| a + b).collect() };
     let x = add(x, &mv(w("self_attn.o_proj.weight"), &out), "post_attention_layernorm.weight");
-    let h = rms(&x, Some(w("pre_feedforward_layernorm.weight")));
-    let (g, u) = (mv(w("mlp.gate_proj.weight"), &h), mv(w("mlp.up_proj.weight"), &h));
-    let a: Vec<f32> = g.iter().zip(&u).map(|(g, u)| gelu(*g) * u).collect();
-    let x = add(&x, &mv(w("mlp.down_proj.weight"), &a), "post_feedforward_layernorm.weight");
+    let x = feed_forward(t, i, &x, shape.moe);
     if pli.is_empty() {
         return x.iter().map(|v| v * w("layer_scalar")[0]).collect();
     }
     let a: Vec<f32> = mv(w("per_layer_input_gate.weight"), &x).iter().zip(pli).map(|(g, p)| gelu(*g) * p).collect();
     let x = add(&x, &mv(w("per_layer_projection.weight"), &a), "post_per_layer_input_norm.weight");
     x.iter().map(|v| v * w("layer_scalar")[0]).collect()
+}
+
+/// Layer `i`'s MLP and, with `moe`, the experts beside it, on `x`, as Hugging Face's `Gemma4TextDecoderLayer`: the residual
+/// plus `post_ff(post_ff_1(mlp) + post_ff_2(experts))`, the experts reading `pre_ff_2(x)`, routed from
+/// `rmsnorm(x) · scale / √hidden`.
+fn feed_forward(t: &std::collections::HashMap<String, Vec<f32>>, i: usize, x: &[f32], moe: bool) -> Vec<f32> {
+    let w = |n: &str| &t[&format!("layers.{i}.{n}")][..];
+    let add = |x: &[f32], y: &[f32], n: &str| -> Vec<f32> { x.iter().zip(rms(y, Some(w(n)))).map(|(a, b)| a + b).collect() };
+    let mlp = |gate: &[f32], up: &[f32], down: &[f32], h: &[f32]| {
+        let a: Vec<f32> = mv(gate, h).iter().zip(mv(up, h)).map(|(g, u)| gelu(*g) * u).collect();
+        mv(down, &a)
+    };
+    let dense = mlp(w("mlp.gate_proj.weight"), w("mlp.up_proj.weight"), w("mlp.down_proj.weight"), &rms(x, Some(w("pre_feedforward_layernorm.weight"))));
+    if !moe {
+        return add(x, &dense, "post_feedforward_layernorm.weight");
+    }
+    let [e, k, width] = EXPERTS;
+    let routed: Vec<f32> = rms(x, Some(w("router.scale"))).iter().map(|v| v / (HIDDEN as f32).sqrt()).collect();
+    let logits = mv(w("router.proj.weight"), &routed);
+    let top = logits.iter().fold(f32::MIN, |a, &b| a.max(b));
+    let p: Vec<f32> = logits.iter().map(|l| (l - top).exp()).collect();
+    let mut order: Vec<usize> = (0..e).collect();
+    order.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    let chosen = &order[..k];
+    let total: f32 = chosen.iter().map(|&j| p[j]).sum();
+    let h = rms(x, Some(w("pre_feedforward_layernorm_2.weight")));
+    let (gate_up, down) = (w("experts.gate_up_proj"), w("experts.down_proj"));
+    let mut sum = vec![0f32; HIDDEN];
+    for &j in chosen {
+        let rows = &gate_up[j * 2 * width * HIDDEN..(j + 1) * 2 * width * HIDDEN];
+        let out = mlp(&rows[..width * HIDDEN], &rows[width * HIDDEN..], &down[j * HIDDEN * width..(j + 1) * HIDDEN * width], &h);
+        let weight = p[j] / total * w("router.per_expert_scale")[j];
+        sum.iter_mut().zip(out).for_each(|(s, o)| *s += weight * o);
+    }
+    let both: Vec<f32> = rms(&dense, Some(w("post_feedforward_layernorm_1.weight")))
+        .iter()
+        .zip(rms(&sum, Some(w("post_feedforward_layernorm_2.weight"))))
+        .map(|(a, b)| a + b)
+        .collect();
+    add(x, &both, "post_feedforward_layernorm.weight")
 }
 
 /// Each query head of `q` attends over `cache` through its key-value head, shared by `group` heads, with scale 1.
