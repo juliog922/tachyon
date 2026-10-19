@@ -1,24 +1,37 @@
-//! Which product kernel each shape takes on this GPU: blocks of 64 tokens, of 128 (32 to a warp), or of 128 with 64
-//! to a warp, raced the first time a shape comes. Larger blocks and warps read fewer bytes per operation but leave
-//! multiprocessors idle on short batches; where they cross depends on the GPU (its multiprocessors, its clocks, its
-//! caches), so it is measured, not modelled. Used by the encoder and by Gemma 4's vision and audio towers.
+//! Which product kernel each shape takes on this GPU: blocks of 64 tokens × 64 rows, of 128 × 64, or of 128 × 128,
+//! raced the first time a shape comes. Larger blocks read fewer bytes per operation but leave multiprocessors idle
+//! on short batches; where they cross depends on the GPU (its multiprocessors, its clocks, its caches), so it is
+//! measured, not modelled. Used by the encoder and by Gemma 4's vision and audio towers.
 
 use crate::Result;
 use crate::cuda::{Event, Module, Stream, arg};
-use crate::ptx::{GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_WIDE, GEMM_F16, GEMM_F16_128, GEMM_F16_WIDE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_WIDE, SPIN};
+use crate::ptx::{GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_TALL, GEMM_F16, GEMM_F16_128, GEMM_F16_TALL, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_TALL, SPIN};
 
-/// The kernels of one product that race: tokens per block, kernel, threads.
-pub(crate) type Kernels = [(u32, &'static str, u32); 3];
+/// The kernels of one product that race: tokens and rows per block, kernel, threads.
+pub(crate) type Kernels = [(u32, u32, &'static str, u32); 3];
 /// The `f16` products.
-pub(crate) const F16: Kernels = [(64, GEMM_F16, 128), (128, GEMM_F16_128, 256), (128, GEMM_F16_WIDE, 128)];
+pub(crate) const F16: Kernels = [(64, 64, GEMM_F16, 128), (128, 64, GEMM_F16_128, 256), (128, 128, GEMM_F16_TALL, 512)];
 /// The 8-bit products.
-pub(crate) const Q8: Kernels = [(64, GEMM_Q8, 128), (128, GEMM_Q8_128, 256), (128, GEMM_Q8_WIDE, 128)];
+pub(crate) const Q8: Kernels = [(64, 64, GEMM_Q8, 128), (128, 64, GEMM_Q8_128, 256), (128, 128, GEMM_Q8_TALL, 512)];
 /// The clipped `f16` products of Gemma 4's towers.
-pub(crate) const CLIP: Kernels = [(64, GEMM_CLIP, 128), (128, GEMM_CLIP_128, 256), (128, GEMM_CLIP_WIDE, 128)];
+pub(crate) const CLIP: Kernels = [(64, 64, GEMM_CLIP, 128), (128, 64, GEMM_CLIP_128, 256), (128, 128, GEMM_CLIP_TALL, 512)];
 
-/// How a timeline names kernel `k` of a [`Kernels`]: its tokens per block, `w` for 64 tokens to a warp.
-pub(crate) fn label(kernels: &Kernels, k: usize) -> String {
-    format!("/{}{}", kernels[k].0, if kernels[k].1.ends_with("wide") { "w" } else { "" })
+/// Kernel `k` of `kernels` for `tokens` × `rows`, its grid and threads: blocks of 128 rows where `rows` is a multiple
+/// of 128, else the kernel of 128 tokens × 64 rows in their place.
+pub(crate) fn launch(kernels: &Kernels, k: usize, tokens: u32, rows: u32) -> (&'static str, u32, u32) {
+    let (t, r, kernel, threads) = kernels[fit(kernels, k, rows)];
+    (kernel, tokens.div_ceil(t) * (rows / r), threads)
+}
+
+/// Kernel `k`, or 1 where its blocks' rows do not divide `rows`.
+fn fit(kernels: &Kernels, k: usize, rows: u32) -> usize {
+    if rows % kernels[k].1 == 0 { k } else { 1 }
+}
+
+/// How a timeline names kernel `k` of a [`Kernels`] for `rows`: its block's tokens, and rows if not 64.
+pub(crate) fn label(kernels: &Kernels, k: usize, rows: u32) -> String {
+    let (t, r, ..) = kernels[fit(kernels, k, rows)];
+    if r == 64 { format!("/{t}") } else { format!("/{t}×{r}") }
 }
 use std::cell::{Cell, RefCell};
 

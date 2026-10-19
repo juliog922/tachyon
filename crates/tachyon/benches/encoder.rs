@@ -167,26 +167,32 @@ fn profile(name: &str, enc: &mut Encoder, peaks: [f64; 2], call: impl Fn(&mut En
 /// Each product kernel alone on the encoder's shapes, for one question's tokens and ten questions': its time and rate
 /// against `peaks` (`f16`, 8-bit): the `f16` kernels, then the Q8.
 fn products(suite: &mut Suite, gpu: &Gpu, peaks: [f64; 2]) {
-    use tachyon::ptx::{GEMM_F16, GEMM_F16_128, GEMM_F16_WIDE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_WIDE};
-    const KERNELS: [(&str, u32, u32); 6] =
-        [(GEMM_F16, 64, 128), (GEMM_F16_128, 128, 256), (GEMM_F16_WIDE, 128, 128), (GEMM_Q8, 64, 128), (GEMM_Q8_128, 128, 256), (GEMM_Q8_WIDE, 128, 128)];
+    use tachyon::ptx::{GEMM_F16, GEMM_F16_128, GEMM_F16_TALL, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_TALL};
+    const KERNELS: [(&str, u32, u32, u32); 6] = [
+        (GEMM_F16, 64, 64, 128),
+        (GEMM_F16_128, 128, 64, 256),
+        (GEMM_F16_TALL, 128, 128, 512),
+        (GEMM_Q8, 64, 64, 128),
+        (GEMM_Q8_128, 128, 64, 256),
+        (GEMM_Q8_TALL, 128, 128, 512),
+    ];
     println!("each product kernel alone (median of 20):");
     for (tokens, (cols, rows)) in [223u32, 2140].into_iter().flat_map(|t| [(768u32, 2304u32), (768, 768), (1152, 768)].map(|s| (t, s))) {
         let act = gpu.ctx.alloc(2 * (tokens as usize + 128) * cols as usize).unwrap();
         let (weights, out) = (gpu.ctx.alloc(2 * (rows * cols) as usize).unwrap(), gpu.ctx.alloc(4 * (tokens * rows) as usize).unwrap());
         let scales = gpu.ctx.alloc(4 * (tokens as usize + 128).max(rows as usize) * cols as usize / 64).unwrap();
-        let line = KERNELS.map(|(name, tile, threads)| {
+        let line = KERNELS.map(|(name, tile, height, threads)| {
             let (kernel, q8) = (gpu.module.function(name).unwrap(), name.contains("q8"));
             let (ptrs, sizes) = ([act.ptr(), weights.ptr(), 0, out.ptr()], [rows, cols, tokens, 0]);
             let extra = [scales.ptr(), scales.ptr()];
             let args: Vec<_> = ptrs.iter().map(arg).chain(sizes.iter().map(arg)).chain(extra.iter().filter(|_| q8).map(arg)).collect();
-            let blocks = tokens.div_ceil(tile) * rows / 64;
+            let blocks = tokens.div_ceil(tile) * rows / height;
             let launch = |s: &tachyon::cuda::Stream| {
                 // SAFETY: the kernel's arguments in order; `act` holds whole blocks of tokens, `out` every token's row.
                 unsafe { s.launch(&kernel, [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
             };
-            let wide = if name.contains("wide") { "w" } else { "" };
-            let label = format!("/{tile}{wide}{}", if q8 { " q8" } else { "" });
+            let tall = if height == 64 { String::new() } else { format!("×{height}") };
+            let label = format!("/{tile}{tall}{}", if q8 { " q8" } else { "" });
             let t = suite.run(&format!("gemm {tokens}×{cols}→{rows} {label}"), 20, || gpu.time(launch));
             let tf = 2.0 * f64::from(tokens * cols) * f64::from(rows) / t.as_secs_f64() / 1e12;
             suite.rate(tf, "TOPS");

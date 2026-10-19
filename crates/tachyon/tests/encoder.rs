@@ -248,14 +248,14 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
         .map(|(t, r)| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r])
         .collect();
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
-    let kernels = [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256), (tachyon::ptx::GEMM_F16_WIDE, 1, 128)];
+    let kernels = [(tachyon::ptx::GEMM_F16, 4, 128), (tachyon::ptx::GEMM_F16_128, 2, 256), (tachyon::ptx::GEMM_F16_TALL, 1, 512)];
     for (mode, (kernel, blocks, threads)) in (0..4u32).flat_map(|m| kernels.map(|k| (m, k))) {
         let y = gpu.upload(&base);
         // The values live until the launch: `arg` takes their addresses.
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds two tiles of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [2 * blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let got: Vec<f32> = if mode < 2 { gpu.floats(&y) } else { gpu.halves(&y).iter().map(|&h| tachyon::quant::f16_value(h)).collect() };
         for (i, &v) in want.iter().enumerate() {
             let expect = match mode {
@@ -272,7 +272,7 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
 }
 
 /// The `f16` product with the gated GELU and `SiLU` over interleaved rows (modes 4 and 5: `gelu(y[2j])·y[2j+1]` and
-/// `silu(…)·…`, `f16`, half as wide), in blocks of 64 and 128 tokens.
+/// `silu(…)·…`, `f16`, half as wide), in each shape of block.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_f16_product_gates() {
@@ -285,13 +285,13 @@ fn the_f16_product_gates() {
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
     for (mode, (kernel, blocks, threads)) in [4u32, 5]
         .into_iter()
-        .flat_map(|m| [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256), (tachyon::ptx::GEMM_F16_WIDE, 1, 128)].map(|k| (m, k)))
+        .flat_map(|m| [(tachyon::ptx::GEMM_F16, 4, 128), (tachyon::ptx::GEMM_F16_128, 2, 256), (tachyon::ptx::GEMM_F16_TALL, 1, 512)].map(|k| (m, k)))
     {
         let y = gpu.upload(&vec![0f32; tokens * rows]);
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds whole blocks of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [2 * blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let gated = gpu.halves(&y);
         for (t, r) in (0..tokens).flat_map(|t| (0..rows / 2).map(move |r| (t, 2 * r))) {
             let gate = if mode == 4 { gelu(dot(t, r)) } else { silu(dot(t, r)) };
@@ -301,7 +301,7 @@ fn the_f16_product_gates() {
     }
 }
 
-/// Launches product `kernel` (its name, blocks and threads) over `buffers` `[a, a's scales, w, w's scales, y]`
+/// Launches product `kernel` (its name, grid and threads) over `buffers` `[a, a's scales, w, w's scales, y]`
 /// (Q8E) with `sizes` `[rows, cols, tokens, mode]`, `rows` being 128: two tiles of rows.
 #[cfg(feature = "gpu")]
 fn q8_product(gpu: &common::Gpu, kernel: (&str, u32, u32), buffers: [u64; 5], sizes: [u32; 4]) {
@@ -309,12 +309,12 @@ fn q8_product(gpu: &common::Gpu, kernel: (&str, u32, u32), buffers: [u64; 5], si
     let (pointers, scales) = ([buffers[0], buffers[2], 0, buffers[4]], [buffers[1], buffers[3]]);
     let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).chain(scales.iter().map(arg)).collect();
     // SAFETY: the kernel's arguments in order; `a` and its scales hold whole blocks of tokens, `y` room for all.
-    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [2 * kernel.1, 1, 1], [kernel.2, 1, 1], 0, &args) }.unwrap();
+    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [kernel.1, 1, 1], [kernel.2, 1, 1], 0, &args) }.unwrap();
 }
 
 /// `f16` rows rounded to Q8E on the GPU exactly as on the CPU; then the 8-bit product in every mode (store, add,
-/// `f16`, ReLU, the gated GELU and `SiLU`) against the CPU's product of the rounded values, for 70 tokens, in blocks of 64 and
-/// 128 tokens.
+/// `f16`, ReLU, the gated GELU and `SiLU`) against the CPU's product of the rounded values, for 70 tokens, in each
+/// shape of block.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_q8_product_matches_the_cpu_in_every_mode() {
@@ -334,7 +334,7 @@ fn the_q8_product_matches_the_cpu_in_every_mode() {
     let dot = |t: usize, r: usize| (0..cols).map(|k| value(&aq, &sa, t * cols + k) * value(&wq, &sw, r * cols + k)).sum::<f64>() as f32;
     let (wb, swb, base) = (gpu.upload(&wq), gpu.upload(&sw), common::values(128 * rows, 10));
     for (mode, kernel) in
-        (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 2, 128), (tachyon::ptx::GEMM_Q8_128, 1, 256), (tachyon::ptx::GEMM_Q8_WIDE, 1, 128)].map(|k| (m, k)))
+        (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 4, 128), (tachyon::ptx::GEMM_Q8_128, 2, 256), (tachyon::ptx::GEMM_Q8_TALL, 1, 512)].map(|k| (m, k)))
     {
         let y = gpu.upload(&base);
         q8_product(&gpu, kernel, [qb.ptr(), sb.ptr(), wb.ptr(), swb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);

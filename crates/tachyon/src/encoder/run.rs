@@ -2,7 +2,7 @@
 //! [`crate::ptx::encoder`]; the hidden states, Granite's embeddings or Laya's option logits out.
 
 use super::laya::{Head, Kind};
-use super::race::{F16, Kernels, Products, Q8, label};
+use super::race::{F16, Kernels, Products, Q8, label, launch};
 use super::{Config, Settings};
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Module, Stream, arg};
 use crate::ptx::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16_TILE, NORM_F16, QUANT_F16, ROPE_F16, SPIN};
@@ -288,17 +288,17 @@ impl Encoder {
     fn gemm(&self, p: &Product, tokens: usize, mode: u32) -> Result<()> {
         let (args, [rows, cols], kernels) = self.operands(p, tokens, mode)?;
         let run = |k: usize| {
-            let (tile, kernel, threads) = kernels[k];
-            self.launch(kernel, [(tokens as u32).div_ceil(tile) * (rows / GEMM_F16_TILE), 1, 1], threads, &args)
+            let (kernel, grid, threads) = launch(&kernels, k, tokens as u32, rows);
+            self.launch(kernel, [grid, 1, 1], threads, &args)
         };
         let marks = self.marks.take();
         let k = self.products.pick(&self.stream, &self.module, [rows, cols, tokens as u32], &run);
         *self.marks.borrow_mut() = marks;
         let k = k?;
         run(k)?;
-        let (tile, q8) = (label(&kernels, k), if kernels == Q8 { " q8" } else { "" });
+        let (tile, q8) = (label(&kernels, k, rows), if kernels == Q8 { " q8" } else { "" });
         if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
-            last.0 = format!("gemm {tokens}×{cols}→{rows} /{tile}{q8}");
+            last.0 = format!("gemm {tokens}×{cols}→{rows} {tile}{q8}");
         }
         Ok(())
     }

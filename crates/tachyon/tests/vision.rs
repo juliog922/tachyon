@@ -34,7 +34,7 @@ fn gelu(x: f32) -> f32 {
 }
 
 /// The clipped product in modes 0 (`f32`), 2 (`f16`), 3 (`SiLU`), 4 (gated, GELU's tanh form) and 5 (a GLU) for 70
-/// tokens, in blocks of 64 and 128: inputs clamped to their bounds, each row's outputs to its own, tight enough
+/// tokens, in each shape of block: inputs clamped to their bounds, each row's outputs to its own, tight enough
 /// that both bite.
 #[test]
 fn the_clipped_product_clamps_its_input_and_each_rows_output() {
@@ -52,7 +52,7 @@ fn the_clipped_product_clamps_its_input_and_each_rows_output() {
     let (ab, wb, cb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&clip));
     for (mode, (kernel, blocks, threads)) in [0, 2, 3, 4, 5]
         .into_iter()
-        .flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256), (tachyon::ptx::GEMM_CLIP_WIDE, 2, 128)].map(|k| (m, k)))
+        .flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256), (tachyon::ptx::GEMM_CLIP_TALL, 1, 512)].map(|k| (m, k)))
     {
         let y = gpu.zeros(4 * tokens * rows);
         let sizes = [rows, cols, tokens, mode as usize].map(|v| (v as u32, false));

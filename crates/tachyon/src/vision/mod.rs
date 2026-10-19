@@ -10,7 +10,7 @@ pub(crate) mod convert;
 pub use convert::convert;
 
 use crate::cuda::{Context, DevBuf, HostBuf, Module, Stream, arg};
-use crate::encoder::race::{CLIP, Products};
+use crate::encoder::race::{CLIP, Products, launch};
 use crate::json::Json;
 use crate::media::{BUDGETS, Image, PATCH, POOL};
 use crate::ptx::{ADD_ROWS_F16, ATTEND_F16, HEADS_F16, POOL_F16, RMS_F16};
@@ -164,8 +164,8 @@ impl Vision {
         let (rows, cols, n) = (matrix.shape[0] as u32, matrix.shape[1] as u32, tokens as u32);
         let args = [A::P(a), A::P(self.at(w)), A::P(0), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(self.at(&format!("{w}.clip")))];
         let run = |k: usize| {
-            let (tile, kernel, threads) = CLIP[k];
-            self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+            let (kernel, grid, threads) = launch(&CLIP, k, n, rows);
+            self.launch(kernel, [grid, 1, 1], threads, &args)
         };
         run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)
     }

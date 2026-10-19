@@ -11,7 +11,7 @@ mod convert;
 pub use convert::convert;
 
 use crate::cuda::{Context, DevBuf, Module, Stream, arg};
-use crate::encoder::race::{CLIP, Products};
+use crate::encoder::race::{CLIP, Products, launch};
 use crate::json::Json;
 use crate::media::{self, MAX_SAMPLES, MEL_BINS, SAMPLE_RATE};
 use crate::ptx::{ATTEND_AUDIO, LCONV, RMS_F16, SUBSAMPLE};
@@ -144,8 +144,8 @@ impl Tower {
         let (bias, clip) = (self.at(&format!("{w}.bias")), self.at(&format!("{w}.clip")));
         let args = [A::P(a), A::P(self.at(w)), A::P(bias), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(clip)];
         let run = |k: usize| {
-            let (tile, kernel, threads) = CLIP[k];
-            self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
+            let (kernel, grid, threads) = launch(&CLIP, k, n, rows);
+            self.launch(kernel, [grid, 1, 1], threads, &args)
         };
         run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)
     }
