@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tachyon's IPC messages, as a Simple Binary Encoding (SBE 2.0) schema: feed it to any SBE code generator (C, C++,
+  Rust, Java, Go, C#, Python) for encoders and decoders. How the messages travel (the socket, the shared memory, the
+  ring and the futex) is in tachyon.h.
+
+  Every message is a messageHeader, then its fixed block, then its groups, then its variable-length data, all
+  little-endian, as SBE lays them out. Requests (ids 1 to 6) go in the request area of the shared memory, one at a
+  time; responses (ids 101 to 106) come back in the response ring, each answer ending with Done or Error.
+  Bytes bigger than a few kilobytes (images, audio, embeddings, probabilities) live in the data area and are named
+  by a blob: an offset from the data area's start and a length.
+
+  The daemon checks every length, offset and count against the shared memory; a request it cannot read is answered
+  with Error (BadRequest).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" package="tachyon" id="7" version="1" semanticVersion="1.0"
+                   byteOrder="littleEndian" description="Requests to tachyon serve and its answers">
+  <types>
+    <composite name="messageHeader" description="Before every message">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId" primitiveType="uint16"/>
+      <type name="schemaId" primitiveType="uint16"/>
+      <type name="version" primitiveType="uint16"/>
+    </composite>
+    <composite name="groupSizeEncoding" description="Before every group">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint16"/>
+    </composite>
+    <composite name="varStringEncoding" description="UTF-8 text: its length in bytes, then the bytes">
+      <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+    </composite>
+    <composite name="blob" description="Bytes in the data area of the shared memory">
+      <type name="offset" primitiveType="uint64" description="From the data area's start"/>
+      <type name="length" primitiveType="uint64"/>
+    </composite>
+    <enum name="Bool" encodingType="uint8">
+      <validValue name="False">0</validValue>
+      <validValue name="True">1</validValue>
+    </enum>
+    <enum name="Role" encodingType="uint8">
+      <validValue name="System">0</validValue>
+      <validValue name="User">1</validValue>
+      <validValue name="Model">2</validValue>
+    </enum>
+    <enum name="Media" encodingType="uint8" description="What an attachment's bytes hold">
+      <validValue name="Image" description="A JPEG, PNG, GIF, BMP or WebP file, as on disk">0</validValue>
+      <validValue name="Audio" description="A WAV file, as on disk">1</validValue>
+    </enum>
+    <enum name="Kind" encodingType="uint8" description="What a Laya question asks for">
+      <validValue name="Choice" description="One option of several">0</validValue>
+      <validValue name="Score" description="A level on an ordered scale">1</validValue>
+      <validValue name="Noul" description="Whether a statement holds: options false and true">2</validValue>
+    </enum>
+    <enum name="Tier" encodingType="uint8" description="Where a model is">
+      <validValue name="Vram">0</validValue>
+      <validValue name="Host">1</validValue>
+      <validValue name="Disk">2</validValue>
+    </enum>
+    <enum name="Code" encodingType="uint16" description="Why a request failed">
+      <validValue name="BadRequest" description="Not a message of this schema, or out of the shared memory">1</validValue>
+      <validValue name="NoModel" description="No model of that name is pulled or found">2</validValue>
+      <validValue name="Engine" description="The engine failed: the message says why">3</validValue>
+      <validValue name="Cancelled" description="Stopped by a cancel">4</validValue>
+      <validValue name="TooLarge" description="The output does not fit the blob it was given">5</validValue>
+    </enum>
+  </types>
+
+  <!-- Requests. `request` is the client's own number, echoed in every answer to it. -->
+
+  <sbe:message name="Chat" id="1" description="The model's answer to a conversation, streamed as Text, then Done">
+    <field name="request" id="1" type="uint64"/>
+    <field name="seed" id="2" type="uint64" description="Seed of the draws"/>
+    <field name="keepAliveMs" id="3" type="int64" description="How long the model stays in VRAM after: -1 its own setting, 0 moves it out at once"/>
+    <field name="maxTokens" id="4" type="uint32" description="0: until the model ends its turn or the context is full"/>
+    <field name="topK" id="5" type="uint32" description="0: no limit"/>
+    <field name="temperature" id="6" type="float" description="0: greedy"/>
+    <field name="topP" id="7" type="float" description="1: no limit"/>
+    <field name="minP" id="8" type="float" description="0: no limit"/>
+    <field name="penalty" id="9" type="float" description="Repetition penalty, 1: none"/>
+    <field name="think" id="10" type="Bool" description="Lets the model think first; the thinking is part of the text"/>
+    <group name="messages" id="11" dimensionType="groupSizeEncoding" description="The conversation so far">
+      <field name="role" id="12" type="Role"/>
+      <group name="attachments" id="13" dimensionType="groupSizeEncoding" description="Images shown before the text, audio played after it">
+        <field name="bytes" id="14" type="blob"/>
+        <field name="media" id="15" type="Media"/>
+      </group>
+      <data name="text" id="16" type="varStringEncoding"/>
+    </group>
+    <data name="model" id="17" type="varStringEncoding" description="A pulled model's name, or a directory"/>
+  </sbe:message>
+
+  <sbe:message name="Embed" id="2" description="Embeddings of texts, as f32 rows written to `out`, then Embedded">
+    <field name="request" id="1" type="uint64"/>
+    <field name="out" id="2" type="blob" description="Where the rows go: texts × dims × 4 bytes"/>
+    <field name="dims" id="3" type="uint32" description="Matryoshka truncation; 0: the model's full size"/>
+    <group name="texts" id="4" dimensionType="groupSizeEncoding">
+      <data name="text" id="5" type="varStringEncoding"/>
+    </group>
+    <data name="model" id="6" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="Decide" id="3" description="Laya's probabilities for each question's options, as f32 written to `out`, then Decided">
+    <field name="request" id="1" type="uint64"/>
+    <field name="out" id="2" type="blob" description="Where the probabilities go, question after question"/>
+    <field name="conversation" id="3" type="Bool" description="The state is a conversation"/>
+    <group name="questions" id="4" dimensionType="groupSizeEncoding">
+      <field name="kind" id="5" type="Kind"/>
+      <group name="options" id="6" dimensionType="groupSizeEncoding">
+        <data name="label" id="7" type="varStringEncoding"/>
+        <data name="description" id="8" type="varStringEncoding"/>
+      </group>
+      <data name="instructions" id="9" type="varStringEncoding"/>
+    </group>
+    <data name="model" id="10" type="varStringEncoding" description="laya picks laya-english or laya-multilingual by the state's language"/>
+    <data name="state" id="11" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="Load" id="4" description="Loads a model ahead of use, or changes how it is kept; then Done">
+    <field name="request" id="1" type="uint64"/>
+    <field name="keepAliveMs" id="2" type="int64" description="-1: the daemon's default; -2: never moves out"/>
+    <field name="context" id="3" type="uint32" description="Positions of context; 0: the default"/>
+    <field name="pin" id="4" type="Bool" description="Never moves out of VRAM, by keep-alive or to make room"/>
+    <data name="model" id="5" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="Unload" id="5" description="Drops a model from every tier; then Done">
+    <field name="request" id="1" type="uint64"/>
+    <data name="model" id="2" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="List" id="6" description="The loaded models; then Models">
+    <field name="request" id="1" type="uint64"/>
+  </sbe:message>
+
+  <!-- Answers, in the response ring. -->
+
+  <sbe:message name="Text" id="101" description="A piece of a Chat's answer, as it is decoded">
+    <field name="request" id="1" type="uint64"/>
+    <data name="text" id="2" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="Done" id="102" description="A request finished">
+    <field name="request" id="1" type="uint64"/>
+    <field name="prefillNs" id="2" type="uint64" description="Chat: reading the prompt, to the first token"/>
+    <field name="decodeNs" id="3" type="uint64" description="Chat: the tokens after the first"/>
+    <field name="promptTokens" id="4" type="uint32"/>
+    <field name="outputTokens" id="5" type="uint32"/>
+  </sbe:message>
+
+  <sbe:message name="Error" id="103" description="A request failed; nothing else follows for it">
+    <field name="request" id="1" type="uint64"/>
+    <field name="code" id="2" type="Code"/>
+    <data name="message" id="3" type="varStringEncoding"/>
+  </sbe:message>
+
+  <sbe:message name="Embedded" id="104" description="An Embed's rows are in its `out`">
+    <field name="request" id="1" type="uint64"/>
+    <field name="count" id="2" type="uint32"/>
+    <field name="dims" id="3" type="uint32"/>
+  </sbe:message>
+
+  <sbe:message name="Decided" id="105" description="A Decide's probabilities are in its `out`: each question's options in order">
+    <field name="request" id="1" type="uint64"/>
+    <group name="answers" id="2" dimensionType="groupSizeEncoding">
+      <field name="options" id="3" type="uint32"/>
+    </group>
+  </sbe:message>
+
+  <sbe:message name="Models" id="106" description="The loaded models">
+    <field name="request" id="1" type="uint64"/>
+    <group name="models" id="2" dimensionType="groupSizeEncoding">
+      <field name="vramBytes" id="3" type="uint64"/>
+      <field name="keepAliveMs" id="4" type="int64" description="Left before it moves out of VRAM; -1 never"/>
+      <field name="tier" id="5" type="Tier"/>
+      <data name="name" id="6" type="varStringEncoding"/>
+    </group>
+  </sbe:message>
+
+  <!-- On the socket, with the shared memory's file descriptor (see tachyon.h). -->
+
+  <sbe:message name="Welcome" id="200" description="The daemon's first and only message on the socket">
+    <field name="size" id="1" type="uint64" description="Bytes of the shared memory to map"/>
+  </sbe:message>
+</sbe:messageSchema>

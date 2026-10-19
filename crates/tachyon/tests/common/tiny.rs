@@ -103,7 +103,8 @@ pub fn tensors(seed: u64, shape: Shape) -> Vec<(String, Vec<usize>, Vec<f32>)> {
 pub fn checkpoint(name: &str, seed: u64, shape: Shape) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tachyon-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    // From this crate's tests, or tachyon-cli's (which include this file).
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tachyon/tests/fixtures");
     // The toy tokenizer, with Gemma 4's chat markers in place of three of its special tokens.
     let toy = std::fs::read_to_string(fixtures.join("toy.json")).unwrap();
     let toy = toy.replace("<start_of_turn>", "<|turn>").replace("<end_of_turn>", "<turn|>").replace("<pad>", "<|think|>");

@@ -88,6 +88,19 @@ impl Default for Load {
     }
 }
 
+/// A loaded model, as [`Engine::models`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    /// The name it was loaded as.
+    pub name: String,
+    /// Where it is.
+    pub tier: Tier,
+    /// The VRAM it takes there, in bytes; 0 for an encoder.
+    pub vram: usize,
+    /// How long it has left in VRAM; `None`: no end.
+    pub left: Option<Duration>,
+}
+
 /// Where a loaded model is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
@@ -245,6 +258,15 @@ impl Engine {
             Place::Host(_) => Tier::Host,
             Place::Disk => Tier::Disk,
         })
+    }
+
+    /// The loaded models and encoders: where each is, the VRAM it takes there, and how long it has left there
+    /// (`None`: no end, pinned or kept for good).
+    pub fn models(&self) -> Vec<Loaded> {
+        let now = Instant::now();
+        let left = |m: &Model| m.until.filter(|_| !m.load.pin).map(|t| t.saturating_duration_since(now));
+        let decoders = self.models.iter().map(|m| Loaded { name: m.name.clone(), tier: self.tier(&m.name).unwrap_or(Tier::Disk), vram: m.need, left: left(m) });
+        decoders.chain(self.encoders.iter().map(|e| Loaded { name: e.0.clone(), tier: Tier::Vram, vram: 0, left: None })).collect()
     }
 
     /// The tokenizer of model `name`, if it is loaded.

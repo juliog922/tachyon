@@ -61,6 +61,26 @@ while let Some(text) = answer.next_text()? {
 }
 ```
 
+### From other processes
+
+`tachyon serve` keeps one engine for every process of your user, its models in VRAM between requests: each stays
+as long as its keep-alive says (5 minutes by default, `--keep-alive=SECONDS`; a request can set its own, or pin a
+model), so the next request to it starts at once, and models move to the host tier and back as VRAM requires.
+
+There is no client library. A program in any language speaks to the daemon with the two files of `interface/`:
+`tachyon.xml`, the messages as a Simple Binary Encoding schema (feed it to any SBE generator, or read the fixed
+offsets by hand), and `tachyon.h`, the shared memory's layout and its rules. No TCP and no copies through the
+kernel: the socket ($TACHYON_SOCKET, else `$XDG_RUNTIME_DIR/tachyon.sock`) carries the handshake and one-byte
+doorbells only. Each client gets its own shared memory (`memfd`, passed over the socket): it writes a request there
+and rings; the answer streams back into a ring in the same memory, a futex waking the reader. Images, audio,
+embeddings and probabilities go through its data area, named by offset and length. Requests: Chat (streamed Text,
+then Done with timings), Embed, Decide (Laya), Load, Unload, List; one at a time per daemon, in the order they rang,
+a cancel stopping one between tokens. Only processes of the daemon's user are let in.
+
+```sh
+cargo run --release -p tachyon-cli -- serve --keep-alive=600
+```
+
 ## Layout
 
 ```
@@ -95,7 +115,10 @@ crates/tachyon-cli/      the `tachyon` command
   src/models.rs          the catalog and pull, list, rm, doctor
   src/net/               downloads with std only: SHA-256 (SHA-NI), HMAC/HKDF, AES-128-GCM (AES-NI), X25519,
                          P-256 and RSA verification, X.509 chains, a TLS 1.3 client, HTTP/1.1, the Hub
+  src/serve/             `tachyon serve`: the poll loop and the requests, the shared memory and ring, SBE
+  tests/serve.rs         a client written from interface/ alone, end to end on the GPU
   benches/download.rs    SHA-256, AES-GCM, downloads against curl, conversion
+interface/               the daemon's protocol: tachyon.xml (SBE messages) and tachyon.h (shared memory)
 bench/results/<machine>/ benchmark baselines, one directory per machine
 budget.txt               code-line budget of each module
 ci.sh                    every quality gate
@@ -165,6 +188,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 11 | Vision and audio inputs | |
 | 12 | Larger tiers: 12B, 31B, FP8, MoE | |
 | 13 | Speculative decoding | |
+| 14 | `tachyon serve`: other processes over shared memory, `interface/` | under validation |
 
 ## License
 

@@ -26,6 +26,9 @@ Commands:
   decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions); the model
                                `laya` picks laya-english for English text, else laya-multilingual
   embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
+  serve                        Serve every process of this user from one engine, models kept in VRAM between
+                               requests (interface/tachyon.h and tachyon.xml; --socket=PATH, --keep-alive=SECONDS,
+                               --data-mib=N: each client's data area, 64 by default)
   gpu                          List the GPUs the driver sees
   doctor                       Check the driver, GPUs, CPU, memory, certificates and the connection to Hugging Face
   convert <checkpoint> <model> Convert a Hugging Face checkpoint directory (Gemma 4, Laya, Granite) to a model
@@ -40,7 +43,7 @@ fn main() -> ExitCode {
     models_command(&words, keep).unwrap_or_else(|| command(&words, json))
 }
 
-/// Runs the model-management command of `words`, if it is one.
+/// Runs the model-management command of `words`, or `serve`, if it is one.
 fn models_command(words: &[&str], keep: bool) -> Option<ExitCode> {
     Some(match words {
         ["catalog"] => {
@@ -55,6 +58,7 @@ fn models_command(words: &[&str], keep: bool) -> Option<ExitCode> {
         }
         ["rm", name] => finished(models::rm(name)),
         ["doctor"] => ExitCode::from(u8::from(!models::doctor())),
+        ["serve", rest @ ..] => serve(rest),
         _ => return None,
     })
 }
@@ -81,6 +85,27 @@ fn command(words: &[&str], json: bool) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs the daemon with the options of `rest`.
+fn serve(rest: &[&str]) -> ExitCode {
+    let mut opts = tachyon_cli::serve::Options::default();
+    for w in rest {
+        let ok = match w.split_once('=') {
+            Some(("--socket", p)) => {
+                opts.socket = p.into();
+                true
+            }
+            Some(("--keep-alive", s)) => s.parse().map(|s| opts.keep_alive = std::time::Duration::from_secs(s)).is_ok(),
+            Some(("--data-mib", n)) => n.parse::<usize>().map(|n| opts.data = n << 20).is_ok(),
+            _ => false,
+        };
+        if !ok {
+            eprint!("error: unknown serve option '{w}'\n\n{HELP}");
+            return ExitCode::from(2);
+        }
+    }
+    done(tachyon_cli::serve::serve(&opts))
 }
 
 /// Embeds the texts of `rest` with `model`; a `--dims=N` among them cuts the vectors to `N` values.
