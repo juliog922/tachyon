@@ -1,6 +1,8 @@
 //! Prefill on tensor cores, against the measured integer `mma` peak: each Gemma 4 E4B projection as one
-//! [`GEMM_Q4`] over prompts of 256, 512 and 2048 tokens, and all of them weighted by how often a token runs each:
-//! the share of the peak a prompt's matrix products reach, and the tokens per second they allow.
+//! [`GEMM_Q4`] over prompts of 256, 512 and 2048 tokens, in slices of its columns added up by [`SUM_SLICES`] where
+//! prefill splits it (the products into its widest buffer, [`slices`] of them), and all of them weighted by how
+//! often a token runs each: the share of the peak a prompt's matrix products reach, and the tokens per second they
+//! allow.
 //!
 //! `cargo bench -p tachyon --features gpu --bench prefill`
 
@@ -10,24 +12,32 @@ use harness::Suite;
 use harness::gpu::{Gpu, SHAPES, Shape};
 use std::process::ExitCode;
 use tachyon::cuda::arg;
-use tachyon::ptx::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS};
+use tachyon::ptx::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, SUM_SLICES, slices};
 
-/// TOPS of one projection over `tokens` tokens.
-fn measure(gpu: &Gpu, suite: &mut Suite, s: &Shape, tokens: u32) -> f64 {
+/// TOPS of one projection over `tokens` tokens, and the slices it ran in.
+fn measure(gpu: &Gpu, suite: &mut Suite, s: &Shape, tokens: u32) -> (f64, u32) {
     let ((packed, scales), (rows, cols)) = (s.sizes(), (s.rows, s.cols));
-    let sizes = [packed, scales, (tokens * cols) as usize, (tokens * cols / 8) as usize, (tokens * rows * 4) as usize];
+    // Prefill writes the query-key-value products and the first per-layer projection elsewhere, in one slice.
+    let room = if s.name.starts_with('q') || s.name == "per-layer inputs" { 1 } else { SHAPES[6].rows / rows };
+    let k = slices(rows, cols, tokens, gpu.ctx.info().sms, room);
+    let sizes = [packed, scales, (tokens * cols) as usize, (tokens * cols / 8) as usize, (k * tokens * rows * 4) as usize];
     let bufs = sizes.map(|len| gpu.filled(len, 0x11));
-    let (gemm, ptrs) = (gpu.module.function(GEMM_Q4).unwrap(), bufs.each_ref().map(tachyon::cuda::DevBuf::ptr));
+    let (gemm, sum) = (gpu.module.function(GEMM_Q4).unwrap(), gpu.module.function(SUM_SLICES).unwrap());
+    let (ptrs, len) = (bufs.each_ref().map(tachyon::cuda::DevBuf::ptr), tokens * rows);
     let t = suite.run(&format!("{}: {rows}×{cols} × {tokens} tokens", s.name), 20, || {
         gpu.time(|st| {
             let args = [arg(&ptrs[0]), arg(&ptrs[1]), arg(&ptrs[2]), arg(&ptrs[3]), arg(&ptrs[4]), arg(&rows), arg(&cols), arg(&tokens)];
             // SAFETY: eight arguments of the kernel's types; every buffer has the size its layout gives.
-            unsafe { st.launch(&gemm, [tokens.div_ceil(GEMM_TOKENS), rows / GEMM_ROWS, 1], [128, 1, 1], 0, &args) }.unwrap();
+            unsafe { st.launch(&gemm, [tokens.div_ceil(GEMM_TOKENS), rows / GEMM_ROWS, k], [128, 1, 1], 0, &args) }.unwrap();
+            if k > 1 {
+                // SAFETY: three arguments of the kernel's types; `y` holds `k` slices of `len` floats.
+                unsafe { st.launch(&sum, [len.div_ceil(1024), 1, 1], [256, 1, 1], 0, &[arg(&ptrs[4]), arg(&len), arg(&k)]) }.unwrap();
+            }
         })
     });
     let tops = 2.0 * f64::from(rows) * f64::from(cols) * f64::from(tokens) / t.as_secs_f64() / 1e12;
     suite.rate(tops, "TOPS");
-    tops
+    (tops, k)
 }
 
 /// Every projection over `tokens` tokens (printed when `detail`), and their weighted rate.
@@ -35,11 +45,11 @@ fn report(gpu: &Gpu, suite: &mut Suite, peak: f64, tokens: u32, detail: bool) {
     let (mut ops, mut seconds) = (0.0, 0.0);
     // The LM head runs on the last token only, as a GEMV.
     for s in SHAPES.iter().filter(|s| s.name != "lm head") {
-        let tops = measure(gpu, suite, s, tokens);
+        let (tops, k) = measure(gpu, suite, s, tokens);
         let o = 2.0 * f64::from(s.rows) * f64::from(s.cols) * f64::from(s.per_token);
         (ops, seconds) = (ops + o, seconds + o / (tops * 1e12));
         if detail {
-            println!("  {:<24} {:>6}×{:<6} {tops:>6.1} TOPS  {:>3.0}% of the peak", s.name, s.rows, s.cols, 100.0 * tops / peak);
+            println!("  {:<24} {:>6}×{:<6} {tops:>6.1} TOPS  {:>3.0}% of the peak, {k} slice(s)", s.name, s.rows, s.cols, 100.0 * tops / peak);
         }
     }
     let rate = ops / seconds / 1e12;

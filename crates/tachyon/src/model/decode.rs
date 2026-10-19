@@ -482,7 +482,7 @@ fn scratch(ctx: &Context, stream: &Stream, cfg: &Config, settings: &Settings) ->
     stream.fill(&arena, 0)?;
     let (mut b, mut chunk, _) = layout(cfg, settings, arena.ptr());
     let word = tokens.device_ptr()?;
-    (b.control, b.token, chunk.ids) = (at.map(|at| ctl.ptr() + at as u64), [word + 4, word], ids.device_ptr()?);
+    (b.control, b.token, chunk.ids, chunk.sms) = (at.map(|at| ctl.ptr() + at as u64), [word + 4, word], ids.device_ptr()?, ctx.info().sms);
     Ok(([tokens, ids], ctl, arena, b, chunk))
 }
 

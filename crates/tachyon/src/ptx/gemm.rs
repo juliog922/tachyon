@@ -18,7 +18,9 @@
 //! share the weights in L2. Arguments: `w, ws` (Q4 `rows × cols`), Q8P in (`tokens × cols`), `y: *mut f32`
 //! (`tokens × rows`), `rows, cols, tokens: u32`. `rows` is a multiple of [`GEMM_ROWS`], `cols` of 128; the Q8P
 //! buffer holds whole tiles of [`GEMM_TOKENS`] rows (only `y` rows below `tokens` are written). Launch a grid of
-//! `(tokens.div_ceil(GEMM_TOKENS), rows / GEMM_ROWS)` blocks of 128 threads.
+//! `(tokens.div_ceil(GEMM_TOKENS), rows / GEMM_ROWS, slices)` blocks of 128 threads: with more than one slice
+//! ([`slices`]), block `z` sums its share of the columns into `y`'s slice `z` (`y` then holds `slices` of
+//! `tokens × rows`), and [`SUM_SLICES`] adds them up, in order, so the sums do not depend on timing.
 
 // Indices keep their one-letter names from the mma fragments: m, n tiles, e element, j half.
 #![allow(clippy::many_single_char_names)]
@@ -31,6 +33,20 @@ pub const GEMM_Q4: &str = "gemm_q4";
 pub const GEMM_TOKENS: u32 = 128;
 /// Rows per [`GEMM_Q4`] block.
 pub const GEMM_ROWS: u32 = 64;
+/// Name of the kernel that adds the slices of a split [`GEMM_Q4`]: `y[i] = Σ y[z·len + i]` over `z < slices`, four
+/// values per thread. Arguments: `y: *mut f32`, `len, slices: u32`; `len` a multiple of 4. Launch
+/// `len.div_ceil(1024)` blocks of 256 threads.
+pub const SUM_SLICES: &str = "sum_slices";
+
+/// The slices of the columns a [`GEMM_Q4`] of `rows × cols` over `tokens` takes on a GPU of `sms`
+/// multiprocessors, with room in `y` for `room` slices: as many as keep its blocks within the three per
+/// multiprocessor that run at once, eight at most, so short and narrow products fill the GPU. They follow the
+/// tokens, so a product's sums can differ in their last bits between batches of different lengths.
+#[must_use]
+pub fn slices(rows: u32, cols: u32, tokens: u32, sms: u32, room: u32) -> u32 {
+    let blocks = tokens.div_ceil(GEMM_TOKENS) * (rows / GEMM_ROWS);
+    (3 * sms / blocks.max(1)).min(room).min(cols / 128).clamp(1, 8)
+}
 /// Name of the kernel that runs `iters` rounds of 8 independent integer `mma` per warp and writes one word per
 /// thread to `out`. Arguments: `out: *mut u32`, `iters: u32`. Each `mma` is 8,192 operations.
 pub const MMA_PEAK: &str = "mma_peak";
@@ -126,6 +142,21 @@ const HEAD: &str = "
     add.u32 %fd, %fd, WSCALES;
     mov.u32 %z, 0x4B400000;
     shr.u32 %r13, %r5, 7;
+    mov.u32 %r11, %ctaid.z;
+    mov.u32 %r12, %nctaid.z;
+    mul.lo.u32 %r14, %r13, %r11;
+    div.u32 %r14, %r14, %r12;
+    mad.lo.u32 %r15, %r13, %r11, %r13;
+    div.u32 %r15, %r15, %r12;
+    sub.u32 %r13, %r15, %r14;
+    mul.wide.u32 %rd4, %r14, 128;
+    add.u64 %ca0, %ca0, %rd4;
+    mul.wide.u32 %rd4, %r14, 16;
+    add.u64 %cs, %cs, %rd4;
+    mul.wide.u32 %rd4, %r14, 64;
+    add.u64 %cw, %cw, %rd4;
+    mul.wide.u32 %rd4, %r14, 4;
+    add.u64 %cd, %cd, %rd4;
 ";
 
 /// Queues the copy of the group `off` groups past the turn's first into stage `buf`, under `guard`; the weight
@@ -172,9 +203,11 @@ fn group(s: &mut String, buf: usize) {
     }
 }
 
-/// Stores the warp's tiles: rows `R + 8n + 2t, +1` of tokens `T + 16m + g (+8)`, those below `tokens`.
+/// Stores the warp's tiles into the block's slice of `y`: rows `R + 8n + 2t, +1` of tokens `T + 16m + g (+8)`,
+/// those below `tokens`.
 fn store(s: &mut String) {
     s.push_str("    ld.param.u64 %rd0, [py];\n    cvta.to.global.u64 %rd0, %rd0;\n    mad.lo.u32 %r11, %r4, 2, %r10;\n    add.u32 %r9, %r8, %r3;\n");
+    s.push_str("    mov.u32 %r14, %ctaid.z;\n    mul.lo.u32 %r15, %r7, %r6;\n    mul.wide.u32 %rd4, %r15, %r14;\n    shl.b64 %rd4, %rd4, 2;\n    add.u64 %rd0, %rd0, %rd4;\n");
     for m in 0..8 {
         for j in 0..2 {
             let _ = writeln!(s, "    add.u32 %r12, %r9, {};\n    setp.lt.u32 %p, %r12, %r7;", 16 * m + 8 * j);
@@ -187,7 +220,7 @@ fn store(s: &mut String) {
     }
 }
 
-/// [`GEMM_Q4`].
+/// [`GEMM_Q4`], and [`SUM_SLICES`] after it.
 pub(super) fn gemm_q4() -> String {
     let mut s = String::from(
         ".visible .entry gemm_q4(.param .u64 pw, .param .u64 pws, .param .u64 pq, .param .u64 ps, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok)
@@ -196,7 +229,7 @@ pub(super) fn gemm_q4() -> String {
 {
     .reg .pred %p, %q, %lo, %qlo;
     .reg .b16 %hs;
-    .reg .b32 %r<14>, %a<8>, %b<8>, %w<2>, %i<4>, %z, %sm, %da, %ds, %dw, %dd, %fa, %fs, %fw, %fd;
+    .reg .b32 %r<16>, %a<8>, %b<8>, %w<2>, %i<4>, %z, %sm, %da, %ds, %dw, %dd, %fa, %fs, %fw, %fd;
     .reg .f32 %c<64>, %sx<2>, %sz<2>, %d<4>, %f;
     .reg .b64 %rd<6>, %ca<4>, %cs, %cw, %cd;
     .shared .align 16 .b8 smem[SIZE];",
@@ -221,7 +254,7 @@ pub(super) fn gemm_q4() -> String {
     s += "    add.u64 %cs, %cs, 16;\n    add.u64 %cw, %cw, 64;\n    add.u64 %cd, %cd, 4;\n";
     s += "    sub.u32 %r13, %r13, 1;\n    setp.ne.u32 %p, %r13, 0;\n    @%p bra TURN;\n";
     store(&mut s);
-    s + "    ret;\n}\n"
+    s + "    ret;\n}\n" + SUM
 }
 
 /// A peak kernel of [`PEAKS`]: 8 independent accumulator chains per warp, so the tensor cores never wait on a result.
@@ -248,3 +281,44 @@ pub(super) fn mma_peak((name, mma, acc): (&str, &str, usize)) -> String {
     s + "    ld.param.u64 %rd0, [pout];\n    cvta.to.global.u64 %rd0, %rd0;\n    mov.u32 %r2, %ctaid.x;\n    mad.lo.u32 %r2, %r2, 128, %r0;
     mul.wide.u32 %rd1, %r2, 4;\n    add.u64 %rd0, %rd0, %rd1;\n    st.global.u32 [%rd0], %k0;\n    ret;\n}\n"
 }
+
+/// [`SUM_SLICES`].
+const SUM: &str = "
+.visible .entry sum_slices(.param .u64 py, .param .u32 plen, .param .u32 pslices)
+{
+    .reg .pred %p;
+    .reg .b32 %r<4>;
+    .reg .f32 %a<4>, %b<4>;
+    .reg .b64 %rd<4>;
+    mov.u32 %r0, %ctaid.x;
+    mov.u32 %r1, %tid.x;
+    mad.lo.u32 %r0, %r0, 256, %r1;
+    shl.b32 %r0, %r0, 2;
+    ld.param.u32 %r2, [plen];
+    setp.ge.u32 %p, %r0, %r2;
+    @%p bra END;
+    ld.param.u32 %r3, [pslices];
+    ld.param.u64 %rd0, [py];
+    cvta.to.global.u64 %rd0, %rd0;
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64 %rd1, %rd0, %rd1;
+    ld.global.v4.f32 {%a0, %a1, %a2, %a3}, [%rd1];
+    mul.wide.u32 %rd2, %r2, 4;
+    mov.u64 %rd3, %rd1;
+NEXT:
+    sub.u32 %r3, %r3, 1;
+    setp.eq.u32 %p, %r3, 0;
+    @%p bra STORE;
+    add.u64 %rd3, %rd3, %rd2;
+    ld.global.v4.f32 {%b0, %b1, %b2, %b3}, [%rd3];
+    add.f32 %a0, %a0, %b0;
+    add.f32 %a1, %a1, %b1;
+    add.f32 %a2, %a2, %b2;
+    add.f32 %a3, %a3, %b3;
+    bra NEXT;
+STORE:
+    st.global.v4.f32 [%rd1], {%a0, %a1, %a2, %a3};
+END:
+    ret;
+}
+";

@@ -18,11 +18,13 @@ use super::Config;
 use super::decode::{A, Bufs, Mat, Op, Weights};
 use crate::ptx::{
     ATTEND_256P, ATTEND_512P, ATTEND_WARPS, EMBED_Q4, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS,
+    SUM_SLICES,
 };
 
 /// Device addresses of prefill's buffers, each for a chunk of tokens: the residual stream (two), Q8P values and
 /// scales, the query-key-value projections, the other products, the per-layer inputs (embedded, projected,
-/// combined), attention's scratch and counters, and the chunk's token IDs (pinned host memory).
+/// combined), attention's scratch and counters, the chunk's token IDs (pinned host memory), and the room in `y`
+/// (floats per token) and the GPU's multiprocessors, for the products' slices.
 pub(super) struct Chunk {
     pub(super) x: [u64; 2],
     pub(super) q: [u64; 2],
@@ -31,6 +33,8 @@ pub(super) struct Chunk {
     pub(super) per_layer: [u64; 3],
     pub(super) attend: [u64; 2],
     pub(super) ids: u64,
+    pub(super) room: u32,
+    pub(super) sms: u32,
 }
 
 /// Lays out prefill's buffers for `chunk` tokens with `take`, which returns the address of `len` new bytes.
@@ -39,15 +43,22 @@ pub(super) fn layout(cfg: &Config, chunk: usize, take: &mut impl FnMut(usize) ->
     let widest = cfg.hidden.max(cfg.mlp(cfg.layers() - 1)).max(cfg.heads * d).max(cfg.per_layer);
     let x = [take(f * cfg.hidden), take(f * cfg.hidden)];
     let q = [take(f / 4 * widest), take(f / 4 * widest / 8)];
-    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.mlp(cfg.layers() - 1)).max(cfg.hidden).max(pl)));
+    let room = (2 * cfg.mlp(cfg.layers() - 1)).max(cfg.hidden).max(pl);
+    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * room));
     let per_layer = [take(f * pl), take(f * pl), take(f * pl)];
-    Chunk { x, q, qkv, y, per_layer, attend: [take(f * cfg.heads / 4 * (8 + 4 * d)), take(f * cfg.heads / 4)], ids: 0 }
+    let attend = [take(f * cfg.heads / 4 * (8 + 4 * d)), take(f * cfg.heads / 4)];
+    Chunk { x, q, qkv, y, per_layer, attend, ids: 0, room: room as u32, sms: 0 }
 }
 
-/// `y = X·Mᵀ` over `n` tokens of Q8P input `q`.
-fn gemm(m: Mat, q: [u64; 2], y: u64, n: u32) -> Op {
+/// `y = X·Mᵀ` over `n` tokens of Q8P input `q`; into `c.y` in slices of the columns where they fill the GPU
+/// better (see [`crate::ptx::slices`]), added up after.
+fn gemm(m: Mat, q: [u64; 2], y: u64, n: u32, c: &Chunk) -> Vec<Op> {
+    let room = if y == c.y { c.room / m.rows } else { 1 };
+    let slices = crate::ptx::slices(m.rows, m.cols, n, c.sms, room);
     let args = vec![A::P(m.w[0]), A::P(m.w[1]), A::P(q[0]), A::P(q[1]), A::P(y), A::U(m.rows), A::U(m.cols), A::U(n)];
-    (GEMM_Q4, [n.div_ceil(GEMM_TOKENS), m.rows / GEMM_ROWS, 1], 128, args)
+    let len = n * m.rows;
+    let sum = (SUM_SLICES, [len.div_ceil(1024), 1, 1], 256, vec![A::P(y), A::U(len), A::U(slices)]);
+    std::iter::once((GEMM_Q4, [n.div_ceil(GEMM_TOKENS), m.rows / GEMM_ROWS, slices], 128, args)).chain((slices > 1).then_some(sum)).collect()
 }
 
 /// [`NORM_Q8P`] on `p = [h, h_out, y, w1, w2]` over `chunks` of `len`, `k = [eps, scale]`, Q8P to `q`.
@@ -80,10 +91,12 @@ pub(super) fn ops(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, (c, scalars): 
         embed(w.mat("embed"), c.x[0], super::decode::bf16((h as f32).sqrt())),
         embed(hw.mat("embed_per_layer"), ple, (pl as f32).sqrt()),
         norm([c.x[0], 0, 0, 0, 0], c.q, h, n, [eps, 1.0]),
-        gemm(w.mat("per_layer_proj"), c.q, proj, n),
+    ];
+    ops.extend(gemm(w.mat("per_layer_proj"), c.q, proj, n, c));
+    ops.extend([
         norm([ple, pli, proj, w.at("per_layer_norm"), 0], [0, 0], pl, n * l as u32, [eps * h as f32, std::f32::consts::FRAC_1_SQRT_2]),
         norm([c.x[0], 0, 0, 0, w.at("0.input_layernorm")], c.q, h, n, [eps, 1.0]),
-    ];
+    ]);
     for (i, &scalar) in scalars.iter().enumerate().take(l - cfg.shared) {
         ops.extend(attention(cfg, w, b, c, i, n));
         ops.extend(mlp(cfg, w, c, [i, n as usize], scalar));
@@ -101,13 +114,12 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, c: &Chunk, i: usize, n: u32) -
     let ptrs = [c.qkv, at("q_norm"), at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter();
     let args = ptrs.chain([cap, win, 0, cfg.group()].map(A::U)).chain([c.attend[0], c.attend[1], c.q[0], c.q[1]].map(A::P)).collect();
     let (x0, x1) = (c.x[i % 2], c.x[(i + 1) % 2]);
-    vec![
-        gemm(w.mat(&format!("{i}.qkv")), c.q, c.qkv, n),
-        (if d == 256 { KV_256 } else { KV_512 }, [kv, n, 1], 32, store),
-        (if d == 256 { ATTEND_256P } else { ATTEND_512P }, [cfg.heads as u32 / 4, 1, n], 32 * ATTEND_WARPS, args),
-        gemm(w.mat(&format!("{i}.o")), c.q, c.y, n),
-        norm([x0, x1, c.y, at("post_attention_layernorm"), at("pre_feedforward_layernorm")], c.q, cfg.hidden, n, [cfg.eps, 1.0]),
-    ]
+    let mut ops = gemm(w.mat(&format!("{i}.qkv")), c.q, c.qkv, n, c);
+    ops.push((if d == 256 { KV_256 } else { KV_512 }, [kv, n, 1], 32, store));
+    ops.push((if d == 256 { ATTEND_256P } else { ATTEND_512P }, [cfg.heads as u32 / 4, 1, n], 32 * ATTEND_WARPS, args));
+    ops.extend(gemm(w.mat(&format!("{i}.o")), c.q, c.y, n, c));
+    ops.push(norm([x0, x1, c.y, at("post_attention_layernorm"), at("pre_feedforward_layernorm")], c.q, cfg.hidden, n, [cfg.eps, 1.0]));
+    ops
 }
 
 /// Layer `i`'s MLP and per-layer input over the chunk of `n` tokens, as [`super::decode`]'s, times `scalar`.
@@ -116,14 +128,13 @@ fn mlp(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2], scalar: f32) ->
     let (h, eps, at) = (cfg.hidden, cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
     let (x0, x1, (ffn, pl)) = (c.x[i % 2], c.x[(i + 1) % 2], (cfg.mlp(i), cfg.per_layer));
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
-    vec![
-        gemm(w.mat(&format!("{i}.gate_up")), c.q, c.y, n),
-        geglu([c.y, c.y + 4 * ffn as u64], c.q, n, ffn, [2 * ffn, 2 * ffn]),
-        gemm(w.mat(&format!("{i}.down")), c.q, c.y, n),
-        norm([x1, x0, c.y, at("post_feedforward_layernorm"), 0], c.q, h, n, [eps, 1.0]),
-        gemm(w.mat(&format!("{i}.per_layer_gate")), c.q, c.y, n),
-        geglu([c.y, c.per_layer[1] + 4 * (i * pl) as u64], c.q, n, pl, [pl, cfg.layers() * pl]),
-        gemm(w.mat(&format!("{i}.per_layer_proj")), c.q, c.y, n),
-        norm([x0, x1, c.y, at("post_per_layer_input_norm"), next], c.q, h, n, [eps, scalar]),
-    ]
+    let mut ops = gemm(w.mat(&format!("{i}.gate_up")), c.q, c.y, n, c);
+    ops.push(geglu([c.y, c.y + 4 * ffn as u64], c.q, n, ffn, [2 * ffn, 2 * ffn]));
+    ops.extend(gemm(w.mat(&format!("{i}.down")), c.q, c.y, n, c));
+    ops.push(norm([x1, x0, c.y, at("post_feedforward_layernorm"), 0], c.q, h, n, [eps, 1.0]));
+    ops.extend(gemm(w.mat(&format!("{i}.per_layer_gate")), c.q, c.y, n, c));
+    ops.push(geglu([c.y, c.per_layer[1] + 4 * (i * pl) as u64], c.q, n, pl, [pl, cfg.layers() * pl]));
+    ops.extend(gemm(w.mat(&format!("{i}.per_layer_proj")), c.q, c.y, n, c));
+    ops.push(norm([x0, x1, c.y, at("post_per_layer_input_norm"), next], c.q, h, n, [eps, scalar]));
+    ops
 }

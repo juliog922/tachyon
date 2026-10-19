@@ -7,11 +7,14 @@ mod common;
 
 use common::{Gpu, values};
 use tachyon::cuda::arg;
-use tachyon::ptx::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, QUANT_Q8P};
+use tachyon::ptx::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, QUANT_Q8P, SUM_SLICES};
 use tachyon::quant::{Q4, f16_value, q4, q8p};
 
-/// `(rows, cols, tokens)`: one tile, part of a tile, several tiles of each kind, and the widest E4B input.
-const SHAPES: [(usize, usize, usize); 5] = [(64, 128, 1), (128, 2560, 200), (256, 256, 130), (64, 10240, 37), (192, 384, 128)];
+/// A product's rows, columns and tokens.
+type Shape = (usize, usize, usize);
+
+/// One tile, part of a tile, several tiles of each kind, and the widest E4B input.
+const SHAPES: [Shape; 5] = [(64, 128, 1), (128, 2560, 200), (256, 256, 130), (64, 10240, 37), (192, 384, 128)];
 
 /// `x` quantized to Q8P on the GPU, in buffers of whole token tiles of `cols`: the device buffers and the values
 /// and scales.
@@ -28,17 +31,21 @@ fn gpu_q8p(gpu: &Gpu, x: &[f32], cols: usize) -> (tachyon::cuda::DevBuf, tachyon
     (q, s, qv, sv)
 }
 
-/// `Y = X·Wᵀ` for the Q8P tokens in `q, s` on the GPU.
-fn gpu_gemm(gpu: &Gpu, w: &Q4, q8p: [&tachyon::cuda::DevBuf; 2], shape: (usize, usize, usize)) -> Vec<f32> {
+/// `Y = X·Wᵀ` for the Q8P tokens in `q, s` on the GPU, the columns in `slices` added up by [`SUM_SLICES`].
+fn gpu_gemm(gpu: &Gpu, w: &Q4, q8p: [&tachyon::cuda::DevBuf; 2], shape: Shape, slices: u32) -> Vec<f32> {
     let ((rows, cols, tokens), [q, s]) = (shape, q8p);
-    let (wd, wsd, y) = (gpu.upload(&w.packed), gpu.upload(&w.scales), gpu.zeros(tokens * rows * 4));
+    let (wd, wsd, y) = (gpu.upload(&w.packed), gpu.upload(&w.scales), gpu.zeros(slices as usize * tokens * rows * 4));
     let (pw, pws, pq, ps, py) = (wd.ptr(), wsd.ptr(), q.ptr(), s.ptr(), y.ptr());
     let (r, c, t) = (rows as u32, cols as u32, tokens as u32);
     let args = [arg(&pw), arg(&pws), arg(&pq), arg(&ps), arg(&py), arg(&r), arg(&c), arg(&t)];
     // SAFETY: eight arguments of the kernel's types; every buffer has the size its layout gives, the Q8P one for
     // whole tiles of tokens.
-    unsafe { gpu.stream.launch(&gpu.module.function(GEMM_Q4).unwrap(), [t.div_ceil(GEMM_TOKENS), r / GEMM_ROWS, 1], [128, 1, 1], 0, &args) }.unwrap();
-    gpu.floats(&y)
+    unsafe { gpu.stream.launch(&gpu.module.function(GEMM_Q4).unwrap(), [t.div_ceil(GEMM_TOKENS), r / GEMM_ROWS, slices], [128, 1, 1], 0, &args) }.unwrap();
+    let len = t * r;
+    // SAFETY: three arguments of the kernel's types; `y` holds `slices` of `len` floats.
+    unsafe { gpu.stream.launch(&gpu.module.function(SUM_SLICES).unwrap(), [len.div_ceil(1024), 1, 1], [256, 1, 1], 0, &[arg(&py), arg(&len), arg(&slices)]) }
+        .unwrap();
+    gpu.floats(&y)[..tokens * rows].to_vec()
 }
 
 /// What the kernel computes for one token, in `f64`, from its Q8P values `q` and block scales `s`: per row, Σ over
@@ -73,19 +80,21 @@ fn quant_q8p_matches_the_cpu_exactly() {
     assert_eq!(&s[..cs.len() * 2], cs.concat(), "Q8P scales differ");
 }
 
-/// Within the bound of [`reference`], far below the Q8P rounding of the activations themselves.
+/// Within the bound of [`reference`], far below the Q8P rounding of the activations themselves: whole, and with
+/// the columns in three slices (as many as there are, if fewer: uneven shares).
 #[test]
 fn gemm_matches_the_reference_on_every_shape() {
     let gpu = Gpu::new();
-    for (i, &(rows, cols, tokens)) in SHAPES.iter().enumerate() {
+    for (i, &(rows, cols, tokens), split) in SHAPES.iter().enumerate().flat_map(|(i, s)| [1, 3].map(|k| (i, s, k))) {
         let (wf, x) = (values(rows * cols, 21 + i as u64), values(tokens * cols, 77 + i as u64));
         let w = q4(&wf, cols);
         let (qd, sd, q, s) = gpu_q8p(&gpu, &x, cols);
-        let y = gpu_gemm(&gpu, &w, [&qd, &sd], (rows, cols, tokens));
+        let slices = split.min(cols as u32 / 128);
+        let y = gpu_gemm(&gpu, &w, [&qd, &sd], (rows, cols, tokens), slices);
         for (n, got) in y.chunks_exact(rows).enumerate() {
             let want = reference(&w, &q[n * cols..(n + 1) * cols], &s[n * cols / 32..(n + 1) * cols / 32], rows);
             for (r, (&g, (want, bound))) in got.iter().zip(want).enumerate() {
-                assert!((f64::from(g) - want).abs() <= bound, "{rows}×{cols}×{tokens}: token {n} row {r}: {g} vs {want}");
+                assert!((f64::from(g) - want).abs() <= bound, "{rows}×{cols}×{tokens} in {slices}: token {n} row {r}: {g} vs {want}");
             }
         }
     }
