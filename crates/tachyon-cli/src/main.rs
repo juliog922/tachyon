@@ -62,6 +62,7 @@ fn daemon_command(words: &[&str]) -> Option<ExitCode> {
             None => ExitCode::from(2),
         },
         ["unload", model] => said(up().and_then(|mut d| daemon::unload(&mut d, model))),
+        ["decide", _, request] if !std::path::Path::new(request).is_file() => said(Err(std::io::Error::other(format!("{request}: no such file")))),
         _ => return through(words, daemon::running()?),
     })
 }

@@ -538,7 +538,8 @@ fn granite_97m_on_the_gpu_matches_the_reference() {
 }
 
 /// Text in, vectors out: `Engine::embed` with both Granites on their 54 texts against the float32 references (cosine
-/// ≥ 0.9999), each framed as its tokenizer frames it, and cut to 256 values, still of unit length.
+/// ≥ 0.9999), each framed as its tokenizer frames it, and cut to 256 values, still of unit length; and the encoders'
+/// VRAM and keep-alive as the engine reports and applies them.
 #[cfg(all(feature = "gpu", feature = "models"))]
 #[test]
 fn the_engine_embeds_text() {
@@ -558,4 +559,10 @@ fn the_engine_embeds_text() {
             assert!(e.len() == 256 && (len - 1.0).abs() < 1e-5, "{name}: {} values of length {len}", e.len());
         }
     }
+    // Encoders are listed with their VRAM and follow their keep-alive: one kept for no time is gone at the next call.
+    assert!(engine.models().iter().all(|m| m.vram > 0 && m.left.is_some()), "{:?}", engine.models());
+    let name = "granite-embedding-97m-multilingual-r2";
+    engine.load(name, &converted(name), &Load { keep_alive: std::time::Duration::ZERO, ..Load::default() }).unwrap();
+    engine.expire().unwrap();
+    assert_eq!(engine.tier(name), None, "an encoder whose keep-alive ran out is unloaded");
 }

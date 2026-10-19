@@ -51,7 +51,7 @@ pub struct Engine {
     ctx: Context,
     models: Vec<Model>,
     /// Encoders, by name: Laya's decisions and Granite's embeddings, always in VRAM.
-    encoders: Vec<(String, Encoder)>,
+    encoders: Vec<Held>,
     /// The VRAM and host-tier limits, in bytes.
     limits: [usize; 2],
     prompt: Vec<u32>,
@@ -95,7 +95,7 @@ pub struct Loaded {
     pub name: String,
     /// Where it is.
     pub tier: Tier,
-    /// The VRAM it takes there, in bytes; 0 for an encoder.
+    /// The VRAM it takes there, in bytes.
     pub vram: usize,
     /// How long it has left in VRAM; `None`: no end.
     pub left: Option<Duration>,
@@ -154,6 +154,16 @@ impl Model {
     }
 }
 
+/// A loaded encoder: its name, the encoder, how long it stays after a use (`Duration::MAX`: until unloaded), whether
+/// it is pinned, and when its keep-alive ends.
+struct Held {
+    name: String,
+    enc: Encoder,
+    keep: Duration,
+    pin: bool,
+    until: Option<Instant>,
+}
+
 /// What [`Engine::chat`] answers, and how.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
@@ -187,13 +197,13 @@ impl Engine {
 
     /// Loads the model directory `dir` (see [`crate::model::convert`]) into VRAM as `name`, kept as `load` says,
     /// making room as needed; a model of that name is unloaded first. An encoder's directory (see
-    /// [`crate::encoder::convert`]) loads for [`Engine::decide`] or [`Engine::embed`] and stays in VRAM until
-    /// unloaded; `load` does not apply to it.
+    /// [`crate::encoder::convert`]) loads for [`Engine::decide`] or [`Engine::embed`], kept as `load`'s keep-alive and
+    /// pin say: once its keep-alive runs out it is unloaded (it has no host tier; it loads again in a moment).
     pub fn load(&mut self, name: &str, dir: &Path, load: &Load) -> Result<()> {
         self.unload(name);
         self.expire()?;
         if encoder::Config::from_json(&std::fs::read(dir.join("config.json"))?).is_ok() {
-            return self.load_encoder(name, dir);
+            return self.load_encoder(name, dir, load);
         }
         let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok"))?)?;
         let chat = Chat::open(&tok, dir)?.with_budget(load.budget);
@@ -211,11 +221,12 @@ impl Engine {
         loaded
     }
 
-    /// Loads the encoder in `dir` as `name`, moving decoders out to make room.
-    fn load_encoder(&mut self, name: &str, dir: &Path) -> Result<()> {
+    /// Loads the encoder in `dir` as `name`, kept as `load` says, moving decoders out to make room.
+    fn load_encoder(&mut self, name: &str, dir: &Path, load: &Load) -> Result<()> {
         self.room(encoder::footprint(dir, encoder::Settings::default())?, None)?;
         let enc = Encoder::open(&self.ctx, dir, &encoder::Settings::default())?;
-        self.encoders.push((name.into(), enc));
+        let until = Instant::now().checked_add(load.keep_alive);
+        self.encoders.push(Held { name: name.into(), enc, keep: load.keep_alive, pin: load.pin, until });
         Ok(())
     }
 
@@ -223,15 +234,17 @@ impl Engine {
     pub fn unload(&mut self, name: &str) -> bool {
         let before = self.models.len() + self.encoders.len();
         self.models.retain(|m| m.name != name);
-        self.encoders.retain(|e| e.0 != name);
+        self.encoders.retain(|e| e.name != name);
         // The VRAM goes back to the system, not only to this engine's pool.
         let _ = self.ctx.trim();
         self.models.len() + self.encoders.len() < before
     }
 
-    /// Encoder `name`.
+    /// Encoder `name`, its keep-alive started again.
     fn encoder(&mut self, name: &str) -> Result<&mut Encoder> {
-        self.encoders.iter_mut().find(|e| e.0 == name).map(|e| &mut e.1).ok_or_else(|| Error::NoModel(name.into()))
+        let held = self.encoders.iter_mut().find(|e| e.name == name).ok_or_else(|| Error::NoModel(name.into()))?;
+        held.until = Instant::now().checked_add(held.keep);
+        Ok(&mut held.enc)
     }
 
     /// Laya model `name`'s answers to `questions` about `state`: each option's probability (see
@@ -249,7 +262,7 @@ impl Engine {
 
     /// Where model `name` is, if it is loaded.
     pub fn tier(&self, name: &str) -> Option<Tier> {
-        if self.encoders.iter().any(|e| e.0 == name) {
+        if self.encoders.iter().any(|e| e.name == name) {
             return Some(Tier::Vram);
         }
         let m = self.models.iter().find(|m| m.name == name)?;
@@ -266,7 +279,13 @@ impl Engine {
         let now = Instant::now();
         let left = |m: &Model| m.until.filter(|_| !m.load.pin).map(|t| t.saturating_duration_since(now));
         let decoders = self.models.iter().map(|m| Loaded { name: m.name.clone(), tier: self.tier(&m.name).unwrap_or(Tier::Disk), vram: m.need, left: left(m) });
-        decoders.chain(self.encoders.iter().map(|e| Loaded { name: e.0.clone(), tier: Tier::Vram, vram: 0, left: None })).collect()
+        let encoders = self.encoders.iter().map(|e| Loaded {
+            name: e.name.clone(),
+            tier: Tier::Vram,
+            vram: e.enc.bytes(),
+            left: e.until.filter(|_| !e.pin).map(|t| t.saturating_duration_since(now)),
+        });
+        decoders.chain(encoders).collect()
     }
 
     /// The tokenizer of model `name`, if it is loaded.
@@ -286,6 +305,9 @@ impl Engine {
                 freed = true;
             }
         }
+        let before = self.encoders.len();
+        self.encoders.retain(|e| e.pin || e.until.is_none_or(|t| t > now));
+        freed |= self.encoders.len() < before;
         if freed { self.ctx.trim() } else { Ok(()) }
     }
 
@@ -402,7 +424,7 @@ impl Engine {
 
     /// VRAM the resident models take, encoders included.
     fn used(&self) -> usize {
-        let encoders: usize = self.encoders.iter().map(|e| e.1.bytes()).sum();
+        let encoders: usize = self.encoders.iter().map(|e| e.enc.bytes()).sum();
         let towers: usize = self.models.iter().map(|m| m.vision.as_ref().map_or(0, Vision::bytes) + m.audio.as_ref().map_or(0, Tower::bytes)).sum();
         encoders + towers + self.models.iter().filter(|m| matches!(m.at, Place::Vram(_))).map(|m| m.need).sum::<usize>()
     }

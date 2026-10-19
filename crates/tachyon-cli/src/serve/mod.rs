@@ -357,7 +357,7 @@ fn run(engine: &mut Engine, c: &mut Client, opts: &Options, (id, ask): (u64, Ask
                 load.settings.context = context;
                 load.settings.chunk = load.settings.chunk.min(context);
             }
-            engine.load(&model, &dir(&model)?, &load)?;
+            engine.load(&model, &dir(&model)?, &load).map_err(|e| Failed(Code::Engine, format!("{model}: {e}")))?;
             Ok(done(Fields::default().u64(0).u64(0).u32(0).u32(0)))
         }
         Ask::Unload(model) => {
@@ -395,7 +395,8 @@ fn dir(name: &str) -> Result<PathBuf, Failed> {
 /// Loads model `name` unless it is loaded, kept for `keep` or the daemon's default.
 fn ready(engine: &mut Engine, name: &str, opts: &Options, keep: Option<Duration>) -> Result<(), Failed> {
     if engine.tier(name).is_none() {
-        engine.load(name, &dir(name)?, &Load { keep_alive: keep.unwrap_or(opts.keep_alive), ..Load::default() })?;
+        let load = Load { keep_alive: keep.unwrap_or(opts.keep_alive), ..Load::default() };
+        engine.load(name, &dir(name)?, &load).map_err(|e| Failed(Code::Engine, format!("{name}: {e}")))?;
     }
     Ok(())
 }

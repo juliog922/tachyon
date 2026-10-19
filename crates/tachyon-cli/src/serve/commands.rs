@@ -181,7 +181,8 @@ pub fn embed(d: &mut Daemon, model: &str, texts: &[&str], dims: Option<usize>) -
 /// Answers the Laya request in file `request` with `model` (`laya` picks by the state's language), as one JSON
 /// object, as `tachyon decide` does in-process.
 pub fn decide(d: &mut Daemon, model: &str, request_file: &Path) -> io::Result<String> {
-    let r = Json::parse(&std::fs::read(request_file)?).map_err(|e| io::Error::other(e.to_string()))?;
+    let bytes = std::fs::read(request_file).map_err(|e| io::Error::other(format!("{}: {e}", request_file.display())))?;
+    let r = Json::parse(&bytes).map_err(|e| io::Error::other(format!("{}: {e}", request_file.display())))?;
     let state = r.get("state").ok_or_else(|| io::Error::other("request: no \"state\""))?;
     let asked = questions(&r).map_err(|e| io::Error::other(e.to_string()))?;
     let (id, room) = (d.id(), d.data_bytes() as u64);
