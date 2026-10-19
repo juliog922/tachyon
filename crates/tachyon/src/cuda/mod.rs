@@ -408,14 +408,19 @@ impl Stream {
         cu!(cuMemsetD8Async(dst.ptr, byte, dst.len, self.handle))
     }
 
-    /// Queues `f` on a grid of `grid` blocks of `block` threads with `shared` bytes of dynamic shared memory.
+    /// Queues `f` on a grid of `grid` blocks of `block` threads with `shared` bytes of dynamic shared memory, first
+    /// raising `f`'s limit where `shared` passes the 48 KiB every kernel may take.
     ///
     /// # Safety
     /// `args` must point at one value per kernel parameter, of the parameter's type (see [`arg`]),
     /// and every memory the kernel touches must stay alive until the stream is synchronized.
     pub unsafe fn launch(&self, f: &Function<'_>, grid: [u32; 3], block: [u32; 3], shared: u32, args: &[*mut c_void]) -> Result<()> {
+        const MAX_DYNAMIC_SHARED: c_int = 8;
         let [gx, gy, gz] = grid;
         let [bx, by, bz] = block;
+        if shared > 48 << 10 {
+            cu!(cuFuncSetAttribute(f.handle, MAX_DYNAMIC_SHARED, c_int::try_from(shared).unwrap_or(c_int::MAX)))?;
+        }
         cu!(cuLaunchKernel(f.handle, gx, gy, gz, bx, by, bz, shared, self.handle, args.as_ptr().cast_mut(), null_mut()))
     }
 

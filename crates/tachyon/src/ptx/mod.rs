@@ -41,18 +41,20 @@
 pub mod attend;
 pub mod audio;
 pub mod encoder;
+pub mod flash;
 pub mod gemm;
 pub mod gemv;
 pub mod sample;
 pub mod vision;
 
-pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
+pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, QUERY_256, QUERY_512, rope};
 pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
 pub use encoder::{
     ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_TALL, GEMM_F16, GEMM_F16_128,
     GEMM_F16_TALL, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_TALL, NORM_F16, QUANT_F16, ROPE_F16,
 };
 use encoder::{LARGE, Operands, SMALL, TALL};
+pub use flash::{FLASH_256, FLASH_512, shared};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H, SUM_SLICES, slices};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -93,9 +95,9 @@ pub fn module() -> String {
         gemv::gemv_q4(UNROLL, 32),
         gemv::gemv_q4(UNROLL, 8),
         gemm::gemm_q4(),
-        gemm::mma_peak(gemm::PEAKS[0]),
-        gemm::mma_peak(gemm::PEAKS[1]),
-        gemm::mma_peak(gemm::PEAKS[2]),
+        gemm::PEAKS.map(gemm::mma_peak).concat(),
+        attend::query(256) + &attend::query(512),
+        flash::flash(256) + &flash::flash(512),
         attend::attend(256, false),
         attend::attend(512, false),
         attend::attend(256, true),

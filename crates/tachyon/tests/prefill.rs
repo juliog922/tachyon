@@ -8,7 +8,9 @@ mod common;
 
 use common::{Gpu, attention, normalize, rotate, values};
 use tachyon::cuda::{DevBuf, arg};
-use tachyon::ptx::{ATTEND_256P, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8P, KV_256, NORM_Q8, NORM_Q8P, NORM_THREADS, rope};
+use tachyon::ptx::{
+    ATTEND_256P, ATTEND_WARPS, EMBED_Q4, FLASH_256, FLASH_512, GEGLU_Q8P, KV_256, KV_512, NORM_Q8, NORM_Q8P, NORM_THREADS, QUERY_256, QUERY_512, rope,
+};
 use tachyon::quant::{MAGIC, f16_bits, f16_value, q4};
 
 /// Q8P buffers for `len` values, and their contents.
@@ -109,18 +111,17 @@ fn embed_decodes_a_row_per_token() {
     }
 }
 
-/// Key-value heads in the attention test (each serves four query heads), new tokens, head size, ring, window, and
-/// the first new position.
+/// Key-value heads in the attention tests (each serves four query heads), and new tokens.
 const KV: usize = 2;
 const TOKENS: usize = 40;
-const D: usize = 256;
-const CAP: u32 = 1024;
-const WIN: u32 = 512;
-const P0: u32 = 600;
 
-/// What prefill attention reads: the tokens' projections, the norm weights, the RoPE frequencies, the caches as
-/// they were.
+/// What prefill attention reads: the head size, ring, window and first new position; the tokens' projections, the
+/// norm weights, the RoPE frequencies, the caches as they were.
 struct Chunk {
+    d: usize,
+    cap: u32,
+    win: u32,
+    p0: u32,
     qkv: Vec<f32>,
     qn: Vec<f32>,
     kn: Vec<f32>,
@@ -130,10 +131,13 @@ struct Chunk {
 }
 
 impl Chunk {
-    fn new() -> Chunk {
-        let weights = |seed| values(D, seed).iter().map(|x| 0.2 + 0.1 * x).collect();
-        let cache = |seed| values(KV * CAP as usize * D, seed).iter().map(|&x| f16_bits(0.3 * x)).collect();
-        Chunk { qkv: values(TOKENS * 6 * KV * D, 3), qn: weights(4), kn: weights(5), freq: rope(10_000.0, D, 1.0), k: cache(6), v: cache(7) }
+    /// A chunk at `p0` with heads of `d`, a ring of `cap` and a window of `win`: sliding layers' RoPE for 256, global
+    /// layers' (a quarter of the pairs turning) for 512.
+    fn new(d: usize, cap: u32, win: u32, p0: u32) -> Chunk {
+        let weights = |seed| values(d, seed).iter().map(|x| 0.2 + 0.1 * x).collect();
+        let cache = |seed| values(KV * cap as usize * d, seed).iter().map(|&x| f16_bits(0.3 * x)).collect();
+        let freq = if d == 256 { rope(10_000.0, d, 1.0) } else { rope(1_000_000.0, d, 0.25) };
+        Chunk { d, cap, win, p0, qkv: values(TOKENS * 6 * KV * d, 3), qn: weights(4), kn: weights(5), freq, k: cache(6), v: cache(7) }
     }
 
     /// [`KV_256`] then [`ATTEND_256P`] on the GPU: the Q8P output, and the counters after.
@@ -145,12 +149,13 @@ impl Chunk {
             gpu.upload(&self.freq),
             gpu.upload(&self.k),
             gpu.upload(&self.v),
-            gpu.upload(&[P0]),
+            gpu.upload(&[self.p0]),
         ];
         let [pqkv, pqn, pkn, pfreq, pk, pv, ppos] = bufs.each_ref().map(DevBuf::ptr);
-        let (work, counters, (q, s)) = (gpu.zeros(TOKENS * KV * (8 + 4 * D) * 4), gpu.zeros(TOKENS * KV * 4), out(gpu, TOKENS * 4 * KV * D));
+        let d = self.d;
+        let (work, counters, (q, s)) = (gpu.zeros(TOKENS * KV * (8 + 4 * d) * 4), gpu.zeros(TOKENS * KV * 4), out(gpu, TOKENS * 4 * KV * d));
         let (ptrs, (fresh, group), (cap, win)) =
-            ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], (0u32, 1u32), (CAP, WIN));
+            ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], (0u32, 1u32), (self.cap, self.win));
         let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&group)];
         let mut attend: Vec<_> = ptrs[..7].iter().map(arg).collect();
         attend.extend([arg(&cap), arg(&win), arg(&fresh), arg(&group)]);
@@ -166,15 +171,15 @@ impl Chunk {
 
     /// Head `i` of token `t`.
     fn head(&self, t: usize, i: usize) -> Vec<f64> {
-        self.qkv[(t * 6 * KV + i) * D..][..D].iter().map(|&v| f64::from(v)).collect()
+        self.qkv[(t * 6 * KV + i) * self.d..][..self.d].iter().map(|&v| f64::from(v)).collect()
     }
 
     /// Key and value of key-value head `g` at age `age` for token `t`: a new token's, normalized and rotated, or the
     /// cache's.
     fn kv(&self, t: usize, age: usize, g: usize) -> (Vec<f64>, Vec<f64>) {
-        let at = P0 as usize + t - age;
+        let (at, cap, d) = (self.p0 as usize + t - age, self.cap as usize, self.d);
         if age > t {
-            let old = |c: &[u16]| c[(g * CAP as usize + at % CAP as usize) * D..][..D].iter().map(|&h| f64::from(f16_value(h))).collect();
+            let old = |c: &[u16]| c[(g * cap + at % cap) * d..][..d].iter().map(|&h| f64::from(f16_value(h))).collect();
             return (old(&self.k), old(&self.v));
         }
         let (mut k, mut v) = (self.head(t - age, 4 * KV + g), self.head(t - age, 5 * KV + g));
@@ -188,9 +193,9 @@ impl Chunk {
     fn cpu(&self) -> Vec<f64> {
         let mut want = Vec::new();
         for t in 0..TOKENS {
-            let at = P0 as usize + t;
+            let at = self.p0 as usize + t;
             for g in 0..KV {
-                let kv: Vec<_> = (0..(at + 1).min(WIN as usize)).map(|age| self.kv(t, age, g)).collect();
+                let kv: Vec<_> = (0..(at + 1).min(self.win as usize)).map(|age| self.kv(t, age, g)).collect();
                 for h in 4 * g..4 * g + 4 {
                     let mut q = self.head(t, h);
                     normalize(&mut q, Some(&self.qn));
@@ -204,12 +209,56 @@ impl Chunk {
 }
 
 /// Prefill attention over a sliding window: [`KV_256`] stores the keys and values of `TOKENS` new tokens at
-/// positions `P0..`, then [`ATTEND_256P`], one block per token and key-value head, attends each over its own window of
+/// positions from 600, then [`ATTEND_256P`], one block per token and key-value head, attends each over its own window of
 /// a ring longer than the window (older positions from the cache as it was), with Q8P out.
 #[test]
 fn prefill_attention_stores_then_attends_causally() {
-    let (gpu, chunk) = (Gpu::new(), Chunk::new());
+    let (gpu, chunk) = (Gpu::new(), Chunk::new(256, 1024, 512, 600));
     let ((q, s, counters), want) = (chunk.gpu(&gpu), chunk.cpu());
     assert_q8p(&q, &s, &want, 1e-3 * want.iter().fold(0f64, |m, v| m.max(v.abs())));
     assert_eq!(counters, vec![0; TOKENS * KV], "the counters are left at zero");
+}
+
+/// Prefill attention on tensor cores: [`KV_256`] stores the keys and values, [`QUERY_256`] normalizes and rotates
+/// the queries to `f16`, and [`FLASH_256`] gives each token's heads over its window in `f32`, within a thousandth of
+/// the largest output (`f16` queries and probabilities); on the chunk above, a sliding window of a ring, and on
+/// heads of 512 with global attention ([`FLASH_512`], eight tokens a block), every earlier position seen.
+#[test]
+fn flash_attention_matches_the_reference() {
+    let gpu = Gpu::new();
+    for chunk in [Chunk::new(256, 1024, 512, 600), Chunk::new(512, 700, 700, 600)] {
+        let (want, got, d) = (chunk.cpu(), chunk.flash(&gpu), chunk.d);
+        let top = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!((f64::from(g) - w).abs() <= 1e-3 * top, "{d}: token {}, head {}, value {}: {g} against {w}", i / (4 * KV * d), i / d % (4 * KV), i % d);
+        }
+    }
+}
+
+impl Chunk {
+    /// The key-value store, the queries and the attention on tensor cores on the GPU: every token's heads, `f32`.
+    fn flash(&self, gpu: &Gpu) -> Vec<f32> {
+        let (d, wide) = (self.d, self.d == 512);
+        let shape = tachyon::ptx::flash::Shape::of(d);
+        let tiles = TOKENS.div_ceil(shape.tokens() as usize);
+        let bufs = [gpu.upload(&self.qkv), gpu.upload(&self.qn), gpu.upload(&self.kn), gpu.upload(&self.freq), gpu.upload(&self.k), gpu.upload(&self.v)];
+        let [pqkv, pqn, pkn, pfreq, pk, pv] = bufs.each_ref().map(DevBuf::ptr);
+        let (start, qh, y) = (gpu.upload(&[self.p0]), gpu.zeros(tiles * shape.tokens() as usize * 4 * KV * d * 2), gpu.zeros(TOKENS * 4 * KV * d * 4));
+        let (ppos, pqh, py) = (start.ptr(), qh.ptr(), y.ptr());
+        let (cap, win, group, row, n) = (self.cap, self.win, 1u32, (6 * KV * d) as u32, TOKENS as u32);
+        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&group)];
+        let query = [arg(&pqkv), arg(&pqn), arg(&pfreq), arg(&pqh), arg(&ppos), arg(&row)];
+        let flash = [arg(&pqh), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&win), arg(&group), arg(&n), arg(&py)];
+        let [kv, q, attend] = if wide { [KV_512, QUERY_512, FLASH_512] } else { [KV_256, QUERY_256, FLASH_256] };
+        let f = |name| gpu.module.function(name).unwrap();
+        // SAFETY: each launch passes its kernel's arguments in order and with their types; the buffers hold whole
+        // tiles of tokens.
+        unsafe {
+            gpu.stream.launch(&f(kv), [KV as u32, n, 1], [32, 1, 1], 0, &store).unwrap();
+            gpu.stream.launch(&f(q), [4 * KV as u32, n, 1], [32, 1, 1], 0, &query).unwrap();
+            let grid = [tiles as u32, KV as u32, 1];
+            gpu.stream.launch(&f(attend), grid, [shape.threads(), 1, 1], tachyon::ptx::shared(attend), &flash).unwrap();
+        }
+        gpu.floats(&y)
+    }
 }

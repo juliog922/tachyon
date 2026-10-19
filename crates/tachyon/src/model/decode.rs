@@ -525,7 +525,7 @@ fn launch(s: &Stream, m: &crate::cuda::Module, (name, grid, threads, args): &Op)
         .collect();
     // SAFETY: every op passes its kernel's arguments in order and with their types, as `crate::ptx` documents them,
     // and every buffer was laid out for the model by `layout`.
-    unsafe { s.launch(&m.function(name)?, *grid, [*threads, 1, 1], 0, &ptrs) }
+    unsafe { s.launch(&m.function(name)?, *grid, [*threads, 1, 1], crate::ptx::shared(name), &ptrs) }
 }
 
 /// `y = M·x`, reading the Q8 input `q`.

@@ -47,6 +47,13 @@ pub const ATTEND_512P: &str = "attend_512p";
 pub const KV_256: &str = "kv_256";
 /// See [`KV_256`].
 pub const KV_512: &str = "kv_512";
+/// Names of prefill's query kernels: query head `ctaid.x` of token `ctaid.y`, at position `*pos + ctaid.y`,
+/// normalized by `qn` and rotated as [`ATTEND_256`] does it, stored as `f16` in `out [tokens][H][D]` for
+/// [`super::FLASH_256`]. Arguments: `qkv, qn, freq, out, pos`, `row: u32` (floats per token of `qkv`). Launch a
+/// grid of `(H, tokens)` blocks of 32.
+pub const QUERY_256: &str = "query_256";
+/// See [`QUERY_256`].
+pub const QUERY_512: &str = "query_512";
 /// Warps per attention block.
 pub const ATTEND_WARPS: u32 = 8;
 /// Query heads per attention block, all of one key-value head.
@@ -518,5 +525,50 @@ pub(super) fn store(d: usize) -> String {
     );
     angles(&mut s, e);
     fresh(&mut s, d, e, "");
+    s + "    ret;\n}\n"
+}
+
+/// [`QUERY_256`] or [`QUERY_512`], for heads of `d`.
+pub(super) fn query(d: usize) -> String {
+    let e = d / 32;
+    let mut s = format!(
+        ".visible .entry query_{d}(.param .u64 pqkv, .param .u64 pqn, .param .u64 pfreq, .param .u64 pout, .param .u64 ppos, .param .u32 prow)
+{{
+    .reg .pred %p;
+    .reg .b32 %lane, %z, %h, %nh, %pos, %x, %pk<4>;
+    .reg .b16 %hk<2>;
+    .reg .f32 %k<{e}>, %c<{e}>, %sn<{e}>, %w<{e}>, %pf, %sgn, %f, %ft, %r;
+    .reg .b64 %a, %b, %o;
+    mov.u32 %lane, %tid.x;
+    mov.u32 %h, %ctaid.x;
+    mov.u32 %nh, %nctaid.x;
+    mov.u32 %z, %ctaid.y;
+    ld.param.u64 %a, [ppos];
+    cvta.to.global.u64 %a, %a;
+    ld.global.u32 %pos, [%a];
+    add.u32 %pos, %pos, %z;
+    ld.param.u32 %x, [prow];
+    mul.lo.u32 %x, %x, %z;
+    mad.lo.u32 %x, %h, {d}, %x;
+    mad.lo.u32 %x, %lane, {e}, %x;
+    mul.wide.u32 %o, %x, 4;
+    ld.param.u64 %a, [pqkv];
+    cvta.to.global.u64 %a, %a;
+    add.u64 %a, %a, %o;
+    ld.param.u64 %b, [pqn];
+    cvta.to.global.u64 %b, %b;
+    mul.wide.u32 %o, %lane, {};
+    add.u64 %b, %b, %o;
+",
+        4 * e
+    );
+    ld32(&mut s, "k", 0, "%a", 0, e);
+    ld32(&mut s, "w", 0, "%b", 0, e);
+    angles(&mut s, e);
+    norm(&mut s, "k", 0, e, true);
+    rotate(&mut s, "k", 0, e);
+    let _ = writeln!(s, "    mad.lo.u32 %x, %z, %nh, %h;\n    mul.lo.u32 %x, %x, {d};\n    mad.lo.u32 %x, %lane, {e}, %x;\n    mul.wide.u32 %o, %x, 2;");
+    s += "    ld.param.u64 %a, [pout];\n    cvta.to.global.u64 %a, %a;\n    add.u64 %a, %a, %o;\n";
+    st16(&mut s, "k", "%a", e, "");
     s + "    ret;\n}\n"
 }
