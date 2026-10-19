@@ -12,9 +12,9 @@
 375      crates/tachyon/src/wpk
 # sys: raised from 150 in step 2 (the io_uring ABI structs, and the page-cache residency probe).
 175      crates/tachyon/src/sys.rs
-# ptx (the model's kernels): raised from 1,800 to 1,925 for prefill attention on tensor cores (flash.rs, and the
-# queries' kernel in attend.rs).
-1925     crates/tachyon/src/ptx/mod.rs crates/tachyon/src/ptx/attend.rs crates/tachyon/src/ptx/gemm.rs crates/tachyon/src/ptx/gemv.rs crates/tachyon/src/ptx/sample.rs crates/tachyon/src/ptx/flash.rs
+# ptx (the model's kernels): raised from 1,800 to 1,900 for prefill attention on tensor cores (flash.rs, and the
+# queries' kernel in attend.rs), which replaced the per-token prefill attention.
+1900     crates/tachyon/src/ptx/mod.rs crates/tachyon/src/ptx/attend.rs crates/tachyon/src/ptx/gemm.rs crates/tachyon/src/ptx/gemv.rs crates/tachyon/src/ptx/sample.rs crates/tachyon/src/ptx/flash.rs
 300      crates/tachyon/src/quant.rs
 # token: raised from 500 in step 10f: byte-level BPE (GPT-2's scheme, three patterns matched by hand, ignore_merges,
 # the post-processor's frame) and the Unicode it needs (letters by case, marks, NFC), for Laya English and

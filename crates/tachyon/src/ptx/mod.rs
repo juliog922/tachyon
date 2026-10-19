@@ -47,7 +47,7 @@ pub mod gemv;
 pub mod sample;
 pub mod vision;
 
-pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, QUERY_256, QUERY_512, rope};
+pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, QUERY_256, QUERY_512, rope};
 pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
 pub use encoder::{
     ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_TALL, GEMM_F16, GEMM_F16_128,
@@ -98,10 +98,8 @@ pub fn module() -> String {
         gemm::PEAKS.map(gemm::mma_peak).concat(),
         attend::query(256) + &attend::query(512),
         flash::flash(256) + &flash::flash(512),
-        attend::attend(256, false),
-        attend::attend(512, false),
-        attend::attend(256, true),
-        attend::attend(512, true),
+        attend::attend(256),
+        attend::attend(512),
         attend::store(256),
         attend::store(512),
         SPIN_PTX.into(),

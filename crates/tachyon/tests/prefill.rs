@@ -8,9 +8,7 @@ mod common;
 
 use common::{Gpu, attention, normalize, rotate, values};
 use tachyon::cuda::{DevBuf, arg};
-use tachyon::ptx::{
-    ATTEND_256P, ATTEND_WARPS, EMBED_Q4, FLASH_256, FLASH_512, GEGLU_Q8P, KV_256, KV_512, NORM_Q8, NORM_Q8P, NORM_THREADS, QUERY_256, QUERY_512, rope,
-};
+use tachyon::ptx::{EMBED_Q4, FLASH_256, FLASH_512, GEGLU_Q8P, KV_256, KV_512, NORM_Q8, NORM_Q8P, NORM_THREADS, QUERY_256, QUERY_512, rope};
 use tachyon::quant::{MAGIC, f16_bits, f16_value, q4};
 
 /// Q8P buffers for `len` values, and their contents.
@@ -140,35 +138,6 @@ impl Chunk {
         Chunk { d, cap, win, p0, qkv: values(TOKENS * 6 * KV * d, 3), qn: weights(4), kn: weights(5), freq, k: cache(6), v: cache(7) }
     }
 
-    /// [`KV_256`] then [`ATTEND_256P`] on the GPU: the Q8P output, and the counters after.
-    fn gpu(&self, gpu: &Gpu) -> (Vec<u8>, Vec<f32>, Vec<u32>) {
-        let bufs = [
-            gpu.upload(&self.qkv),
-            gpu.upload(&self.qn),
-            gpu.upload(&self.kn),
-            gpu.upload(&self.freq),
-            gpu.upload(&self.k),
-            gpu.upload(&self.v),
-            gpu.upload(&[self.p0]),
-        ];
-        let [pqkv, pqn, pkn, pfreq, pk, pv, ppos] = bufs.each_ref().map(DevBuf::ptr);
-        let d = self.d;
-        let (work, counters, (q, s)) = (gpu.zeros(TOKENS * KV * (8 + 4 * d) * 4), gpu.zeros(TOKENS * KV * 4), out(gpu, TOKENS * 4 * KV * d));
-        let (ptrs, (fresh, group), (cap, win)) =
-            ([pqkv, pqn, pkn, pfreq, pk, pv, ppos, work.ptr(), counters.ptr(), q.ptr(), s.ptr()], (0u32, 1u32), (self.cap, self.win));
-        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&group)];
-        let mut attend: Vec<_> = ptrs[..7].iter().map(arg).collect();
-        attend.extend([arg(&cap), arg(&win), arg(&fresh), arg(&group)]);
-        attend.extend(ptrs[7..].iter().map(arg));
-        // SAFETY: each launch passes its kernel's arguments in order and with their types; every buffer is sized as
-        // the kernels' documentation gives for `TOKENS` tokens.
-        unsafe {
-            gpu.stream.launch(&gpu.module.function(KV_256).unwrap(), [KV as u32, TOKENS as u32, 1], [32, 1, 1], 0, &store).unwrap();
-            gpu.stream.launch(&gpu.module.function(ATTEND_256P).unwrap(), [KV as u32, 1, TOKENS as u32], [32 * ATTEND_WARPS, 1, 1], 0, &attend).unwrap();
-        }
-        (gpu.download(&q), gpu.floats(&s), gpu.words(&counters))
-    }
-
     /// Head `i` of token `t`.
     fn head(&self, t: usize, i: usize) -> Vec<f64> {
         self.qkv[(t * 6 * KV + i) * self.d..][..self.d].iter().map(|&v| f64::from(v)).collect()
@@ -206,17 +175,6 @@ impl Chunk {
         }
         want
     }
-}
-
-/// Prefill attention over a sliding window: [`KV_256`] stores the keys and values of `TOKENS` new tokens at
-/// positions from 600, then [`ATTEND_256P`], one block per token and key-value head, attends each over its own window of
-/// a ring longer than the window (older positions from the cache as it was), with Q8P out.
-#[test]
-fn prefill_attention_stores_then_attends_causally() {
-    let (gpu, chunk) = (Gpu::new(), Chunk::new(256, 1024, 512, 600));
-    let ((q, s, counters), want) = (chunk.gpu(&gpu), chunk.cpu());
-    assert_q8p(&q, &s, &want, 1e-3 * want.iter().fold(0f64, |m, v| m.max(v.abs())));
-    assert_eq!(counters, vec![0; TOKENS * KV], "the counters are left at zero");
 }
 
 /// Prefill attention on tensor cores: [`KV_256`] stores the keys and values, [`QUERY_256`] normalizes and rotates

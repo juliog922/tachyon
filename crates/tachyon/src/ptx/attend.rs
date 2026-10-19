@@ -20,10 +20,8 @@
 //! *const f32, k_cache, v_cache: *mut f16, pos: *const u32, cap, window, fresh, group: u32, partial: *mut f32,
 //! count: *mut u32`, Q8 out (`H × D` values).
 //!
-//! For prefill, [`ATTEND_256P`] and [`ATTEND_512P`] write Q8P instead, and a grid `z` of `tokens` takes token `z` at
-//! position `*pos + z` (its row of `qkv`, its own `partial` and `count`, its row of the output), with one block per
-//! four query heads (`S = 1`) and `fresh` 0: [`KV_256`] and [`KV_512`] first put every token's key and value
-//! in the cache, so each block reads its whole window from there. Launch a grid of `(H/4, S)` blocks of
+//! Prefill stores a chunk's keys and values with [`KV_256`] or [`KV_512`] and its queries with [`QUERY_256`] or
+//! [`QUERY_512`], and attends on tensor cores ([`super::flash`]). Launch a grid of `(H/4, S)` blocks of
 //! `32 · ATTEND_WARPS` threads, `S ≤ 256`: the positions in the cache are split evenly over the `S` blocks of each
 //! four heads, at least 24 per block (so a short context uses few blocks, and they have little to merge), and the
 //! block that finishes last merges the others' partial results. Blocks of [`ATTEND_256`] fit two per multiprocessor
@@ -31,17 +29,13 @@
 //! `H/4 · S · (8 + 4·D)` floats of scratch; `count` holds `H/4` counters, zero before the first launch and left at
 //! zero by every launch.
 
-use super::{Q8, q8, q8p, warp};
+use super::{Q8, q8, warp};
 use std::fmt::Write;
 
 /// Name of the attention kernel for heads of 256.
 pub const ATTEND_256: &str = "attend_256";
 /// Name of the attention kernel for heads of 512.
 pub const ATTEND_512: &str = "attend_512";
-/// Names of the prefill attention kernels, Q8P out.
-pub const ATTEND_256P: &str = "attend_256p";
-/// See [`ATTEND_256P`].
-pub const ATTEND_512P: &str = "attend_512p";
 /// Names of the prefill key-value stores: a grid of `(Hkv, tokens)` blocks of 32, arguments `qkv, kn, freq,
 /// k_cache, v_cache, pos, cap, group`.
 pub const KV_256: &str = "kv_256";
@@ -296,8 +290,6 @@ const SETUP: &str = "
     ld.param.u64 %a, [ppos];
     cvta.to.global.u64 %a, %a;
     ld.global.u32 %pos, [%a];
-    mov.u32 %z, %ctaid.z;
-    add.u32 %pos, %pos, %z;
     ld.param.u32 %cap, [pcap];
     ld.param.u32 %x, [pfresh];
     setp.ne.u32 %fresh, %x, 0;
@@ -320,21 +312,12 @@ const SETUP: &str = "
     div.u32 %active, %active, %span;
     ld.param.u64 %qkv, [pqkv];
     cvta.to.global.u64 %qkv, %qkv;
-    shl.b32 %x, %nkv, 2;
-    mad.lo.u32 %x, %nkr, 2, %x;
-    mul.lo.u32 %x, %x, ROW;
-    mul.wide.u32 %o, %x, %z;
-    add.u64 %qkv, %qkv, %o;
     ld.param.u64 %kc, [pkc];
     cvta.to.global.u64 %kc, %kc;
     ld.param.u64 %vc, [pvc];
     cvta.to.global.u64 %vc, %vc;
     ld.param.u64 %part, [ppart];
     cvta.to.global.u64 %part, %part;
-    mul.lo.u32 %x, %nkv, %nsp;
-    mul.lo.u32 %x, %x, PART;
-    mul.wide.u32 %o, %x, %z;
-    add.u64 %part, %part, %o;
     ld.param.u64 %qp, [pq];
     cvta.to.global.u64 %qp, %qp;
     ld.param.u64 %sp, [ps];
@@ -361,8 +344,7 @@ WRITTEN:
     @%p bra COUNTED;
     ld.param.u64 %b, [pcount];
     cvta.to.global.u64 %b, %b;
-    mad.lo.u32 %x, %z, %nkv, %g;
-    mul.wide.u32 %o, %x, 4;
+    mul.wide.u32 %o, %g, 4;
     add.u64 %b, %b, %o;
     fence.acq_rel.gpu;
     atom.global.add.u32 %old, [%b], 1;
@@ -381,7 +363,7 @@ COUNTED:
 
 /// The last block of key-value head `g`: weights per active block and head in shared memory, `w = e^(M − M*) / Σ
 /// e^(M − M*)·L`, then each output as `Σ w · ACC` with eight blocks' values in flight per thread.
-fn combine(s: &mut String, d: usize, prefill: bool) {
+fn combine(s: &mut String, d: usize) {
     let (stride, outs) = (8 + 4 * d, 4 * d / 256);
     let _ = writeln!(s, "    mul.lo.u32 %x, %g, %nsp;\n    mul.lo.u32 %x, %x, {stride};\n    mul.wide.u32 %o, %x, 4;\n    add.u64 %part, %part, %o;");
     let _ = writeln!(s, "    setp.lt.u32 %p, %th, %active;\n    mul.lo.u32 %x, %th, {stride};\n    mul.wide.u32 %o, %x, 4;\n    add.u64 %a, %part, %o;");
@@ -410,14 +392,9 @@ fn combine(s: &mut String, d: usize, prefill: bool) {
     }
     let _ = writeln!(s, "    add.u64 %b, %b, {};\n    add.u32 %x, %x, 128;\n    add.u32 %s, %s, 8;\n    bra SUMS;\nSUMMED:", 32 * stride);
     for k in 0..outs {
-        let _ = writeln!(
-            s,
-            "    mad.lo.u32 %gi, %z, %nkv, %g;\n    mul.lo.u32 %gi, %gi, {};\n    add.u32 %gi, %gi, %th;\n    add.u32 %gi, %gi, {};",
-            4 * d,
-            256 * k
-        );
+        let _ = writeln!(s, "    mul.lo.u32 %gi, %g, {};\n    add.u32 %gi, %gi, %th;\n    add.u32 %gi, %gi, {};", 4 * d, 256 * k);
         *s += "    mov.u32 %rw, red;\n    mad.lo.u32 %rw, %warp, 4, %rw;\n";
-        *s += &if prefill { q8p(&format!("%acc{k}"), "%gi", "") } else { q8(&format!("%acc{k}"), "%gi") };
+        *s += &q8(&format!("%acc{k}"), "%gi");
     }
     *s += "EXIT:\n    ret;\n}\n";
 }
@@ -438,10 +415,10 @@ fn across(s: &mut String, op: &str, reg: &str, init: &str) {
 }
 
 /// The attention kernel for heads of `d`.
-pub(super) fn attend(d: usize, prefill: bool) -> String {
+pub(super) fn attend(d: usize) -> String {
     let e = d / 32;
     let mut s = format!(
-        ".visible .entry attend_{d}{}(.param .u64 pqkv, .param .u64 pqn, .param .u64 pkn, .param .u64 pfreq, .param .u64 pkc, .param .u64 pvc,
+        ".visible .entry attend_{d}(.param .u64 pqkv, .param .u64 pqn, .param .u64 pkn, .param .u64 pfreq, .param .u64 pkc, .param .u64 pvc,
     .param .u64 ppos, .param .u32 pcap, .param .u32 pwin, .param .u32 pfresh, .param .u32 pgroup, .param .u64 ppart, .param .u64 pcount, .param .u64 pq, .param .u64 ps)
 {}{{
     .shared .align 16 .f32 sm[32];
@@ -449,13 +426,12 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
     .shared .align 4 .u32 flag;
     .shared .align 8 .f32 red[32];
     .reg .pred %p, %ps, %fresh, %dofresh, %last, %lane0, %own, %pc<{}>;
-    .reg .b32 %th, %lane, %warp, %z, %y, %g, %grp, %kvh, %nkr, %spl, %nkv, %nsp, %pos, %cap, %span, %n, %cur, %skip, %start, %end, %active, %t, %x, %j, %s, %h, %old, %gi, %rw;
+    .reg .b32 %th, %lane, %warp, %y, %g, %grp, %kvh, %nkr, %spl, %nkv, %nsp, %pos, %cap, %span, %n, %cur, %skip, %start, %end, %active, %t, %x, %j, %s, %h, %old, %gi, %rw;
     .reg .b32 %pk<4>, %rk<{}>, %rv<{}>;
     .reg .b16 %hk<2>;
     .reg .f32 %q<{}>, %acc<{}>, %k<{e}>, %v<{e}>, %c<{e}>, %sn<{e}>, %w<{e}>, %m<4>, %l<4>, %cr<4>, %M<4>;
     .reg .f32 %pf, %sgn, %sc, %f, %ft, %mn, %r, %num, %den, %ls, %as;
     .reg .b64 %qkv, %kc, %vc, %part, %a, %b, %o;{Q8}{}",
-        if prefill { "p" } else { "" },
         // Two blocks per multiprocessor for the smaller heads: register use capped at 128.
         if d == 256 { ".maxntid 256, 1, 1\n.minnctapersm 2\n" } else { "" },
         4 * (4 * d + 4),
@@ -464,7 +440,7 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
         chunk(d) * e / 2,
         4 * e,
         4 * e,
-        SETUP.replace("ROW", &(4 * d).to_string()).replace("PART", &(4 * (8 + 4 * d)).to_string())
+        SETUP
     );
     angles(&mut s, e);
     queries(&mut s, d, e);
@@ -479,7 +455,7 @@ pub(super) fn attend(d: usize, prefill: bool) -> String {
         let _ = writeln!(sums, "    st.global.v4.f32 [%b+{}], {{%acc{r}, %acc{}, %acc{}, %acc{}}};", 32 + 4 * (h * d + j), r + 1, r + 2, r + 3);
     }
     s += &fill(PARTIAL).replace("STORE\n", &sums);
-    combine(&mut s, d, prefill);
+    combine(&mut s, d);
     s
 }
 
