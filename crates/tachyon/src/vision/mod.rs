@@ -153,7 +153,7 @@ impl Vision {
             .collect();
         // SAFETY: every call passes the kernel's arguments in order and with their types, as `crate::ptx` documents
         // them, on buffers laid out for the patches this tower was opened for.
-        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }
+        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], crate::ptx::shared(name), &ptrs) }
     }
 
     /// `y = clip(clip(a) · wᵀ)` (`io` is `[a, y]`, `shape` is `(tokens, mode)`) for `tokens` rows of `a`, stored as `mode` says (see [`crate::ptx::GEMM_CLIP`]), by

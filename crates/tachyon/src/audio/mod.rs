@@ -132,7 +132,7 @@ impl Tower {
             .collect();
         // SAFETY: every call passes the kernel's arguments in order and with their types, as `crate::ptx` documents
         // them, on buffers laid out for 30 s of audio.
-        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }
+        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], crate::ptx::shared(name), &ptrs) }
     }
 
     /// `y = clip(clip(a) · wᵀ) (+ bias)` (`io` is `[a, y]`, `shape` is `(tokens, mode)`), as

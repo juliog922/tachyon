@@ -4,8 +4,9 @@
 #
 # limit  paths
 # cuda: raised from 350 in step 1 (38 driver signatures, one safe method each), and to 460 in step 8 (the device
-# memory pool: five driver functions, pooled allocation and trimming).
-460      crates/tachyon/src/cuda
+# memory pool: five driver functions, pooled allocation and trimming), and to 470 in step 10h (kernels' shared memory
+# past 48 KiB: one driver function).
+470      crates/tachyon/src/cuda
 450      crates/tachyon/src/lib.rs crates/tachyon/src/error.rs crates/tachyon/src/json.rs
 # wpk: raised from 300 in step 2 (format, checked index, writer, CRC32C, verify, a loader with three paths, page-cache choice).
 375      crates/tachyon/src/wpk

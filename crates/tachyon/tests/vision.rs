@@ -60,7 +60,7 @@ fn the_clipped_product_clamps_its_input_and_each_rows_output() {
         // The clip pointer comes last, after the four sizes.
         let floats: Vec<_> = pointers[..4].iter().map(arg).chain(sizes.iter().map(|s| arg(&s.0))).chain([arg(&pointers[4])]).collect();
         // SAFETY: the kernel's arguments in order; `a` holds whole blocks of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), grid.0, [grid.1, 1, 1], 0, &floats) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), grid.0, [grid.1, 1, 1], tachyon::ptx::shared(kernel), &floats) }.unwrap();
         let (f32s, f16s) = (gpu.floats(&y), gpu.halves(&y));
         for (t, r) in (0..tokens).flat_map(|t| (0..rows).map(move |r| (t, r))) {
             let (got, want) = match mode {
