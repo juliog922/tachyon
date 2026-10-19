@@ -51,10 +51,10 @@ pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, 
 pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
 pub use encoder::{
     ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_TALL, GEMM_F16, GEMM_F16_128,
-    GEMM_F16_TALL, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_TALL, NORM_F16, QUANT_F16, ROPE_F16,
+    GEMM_F16_TALL, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_128K, GEMM_Q8_K, GEMM_Q8_TALL, NORM_F16, QUANT_F16, ROPE_F16,
 };
-use encoder::{LARGE, Operands, SMALL, TALL};
-pub use flash::{FLASH_256, FLASH_512, shared};
+use encoder::{LARGE, LARGE_WIDE, Operands, SMALL, SMALL_WIDE, TALL};
+pub use flash::{FLASH_256, FLASH_512};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H, SUM_SLICES, slices};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -79,6 +79,13 @@ pub const EMBED_Q4: &str = "embed_q4";
 /// Name of the kernel that holds the GPU for `ns: u64` nanoseconds (one thread), so that work queued behind it then
 /// runs back to back: for profiling.
 pub const SPIN: &str = "spin";
+/// The bytes of dynamic shared memory kernel `name` takes past its own: 0 for all but a few that need more than
+/// 48 KiB ([`FLASH_256`], [`FLASH_512`], [`GEMM_Q8_128K`]).
+#[must_use]
+pub fn shared(name: &str) -> u32 {
+    flash::shared(name).max(encoder::shared(name))
+}
+
 /// Threads per block of [`NORM_Q8`].
 pub const NORM_THREADS: u32 = 256;
 
@@ -109,9 +116,9 @@ pub fn module() -> String {
         encoder::gemm_f16(GEMM_CLIP, SMALL, Operands::Clip),
         encoder::gemm_f16(GEMM_CLIP_128, LARGE, Operands::Clip),
         encoder::gemm_f16(GEMM_CLIP_TALL, TALL, Operands::Clip),
-        encoder::gemm_f16(GEMM_Q8, SMALL, Operands::Q8),
-        encoder::gemm_f16(GEMM_Q8_128, LARGE, Operands::Q8),
-        encoder::gemm_f16(GEMM_Q8_TALL, TALL, Operands::Q8),
+        [(GEMM_Q8, SMALL), (GEMM_Q8_128, LARGE), (GEMM_Q8_TALL, TALL), (GEMM_Q8_K, SMALL_WIDE), (GEMM_Q8_128K, LARGE_WIDE)]
+            .map(|(name, tile)| encoder::gemm_f16(name, tile, Operands::Q8))
+            .concat(),
         encoder::quant_f16(),
         encoder::norm_f16(),
         encoder::rows(EMBED_F16, true, false),

@@ -309,7 +309,7 @@ fn q8_product(gpu: &common::Gpu, kernel: (&str, u32, u32), buffers: [u64; 5], si
     let (pointers, scales) = ([buffers[0], buffers[2], 0, buffers[4]], [buffers[1], buffers[3]]);
     let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).chain(scales.iter().map(arg)).collect();
     // SAFETY: the kernel's arguments in order; `a` and its scales hold whole blocks of tokens, `y` room for all.
-    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [kernel.1, 1, 1], [kernel.2, 1, 1], 0, &args) }.unwrap();
+    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [kernel.1, 1, 1], [kernel.2, 1, 1], tachyon::ptx::shared(kernel.0), &args) }.unwrap();
 }
 
 /// `f16` rows rounded to Q8E on the GPU exactly as on the CPU; then the 8-bit product in every mode (store, add,
@@ -321,7 +321,7 @@ fn the_q8_product_matches_the_cpu_in_every_mode() {
     use tachyon::cuda::arg;
     use tachyon::quant::{f16_value, q8e};
     let gpu = common::Gpu::new();
-    let (rows, cols, tokens) = (128, 192, 70);
+    let (rows, cols, tokens) = (128, 384, 70);
     let ((a16, a), w) = (halves(&common::values(128 * cols, 8)), common::values(rows * cols, 9));
     let ((aq, sa), (wq, sw)) = (q8e(&a), q8e(&w));
     let (ab, qb, sb) = (gpu.upload(&a16), gpu.zeros(128 * cols), gpu.zeros(128 * cols / 16));
@@ -333,9 +333,10 @@ fn the_q8_product_matches_the_cpu_in_every_mode() {
     let value = |q: &[i8], s: &[f32], i: usize| f64::from(q[i]) * f64::from(s[i / 64]);
     let dot = |t: usize, r: usize| (0..cols).map(|k| value(&aq, &sa, t * cols + k) * value(&wq, &sw, r * cols + k)).sum::<f64>() as f32;
     let (wb, swb, base) = (gpu.upload(&wq), gpu.upload(&sw), common::values(128 * rows, 10));
-    for (mode, kernel) in
-        (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 4, 128), (tachyon::ptx::GEMM_Q8_128, 2, 256), (tachyon::ptx::GEMM_Q8_TALL, 1, 512)].map(|k| (m, k)))
-    {
+    for (mode, kernel) in (0..6u32).flat_map(|m| {
+        use tachyon::ptx::{GEMM_Q8, GEMM_Q8_128, GEMM_Q8_128K, GEMM_Q8_K, GEMM_Q8_TALL};
+        [(GEMM_Q8, 4, 128), (GEMM_Q8_128, 2, 256), (GEMM_Q8_TALL, 1, 512), (GEMM_Q8_K, 4, 128), (GEMM_Q8_128K, 2, 256)].map(|k| (m, k))
+    }) {
         let y = gpu.upload(&base);
         q8_product(&gpu, kernel, [qb.ptr(), sb.ptr(), wb.ptr(), swb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let (f32s, f16s) = (gpu.floats(&y), gpu.halves(&y));

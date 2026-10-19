@@ -256,7 +256,7 @@ impl Encoder {
             .collect();
         // SAFETY: every call passes the kernel's arguments in order and with their types, as `crate::ptx::encoder`
         // documents them, on buffers laid out for the capacity this encoder was opened with.
-        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }?;
+        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], crate::ptx::shared(name), &ptrs) }?;
         if let Some(marks) = self.marks.borrow_mut().as_mut() {
             let event = self.stream.context().event(true)?;
             self.stream.record(&event)?;
@@ -288,15 +288,15 @@ impl Encoder {
     fn gemm(&self, p: &Product, tokens: usize, mode: u32) -> Result<()> {
         let (args, [rows, cols], kernels) = self.operands(p, tokens, mode)?;
         let run = |k: usize| {
-            let (kernel, grid, threads) = launch(&kernels, k, tokens as u32, rows);
+            let (kernel, grid, threads) = launch(kernels, k, tokens as u32, [rows, cols]);
             self.launch(kernel, [grid, 1, 1], threads, &args)
         };
         let marks = self.marks.take();
-        let k = self.products.pick(&self.stream, &self.module, [rows, cols, tokens as u32], &run);
+        let k = self.products.pick(&self.stream, &self.module, [rows, cols, tokens as u32], (kernels.len(), &run));
         *self.marks.borrow_mut() = marks;
         let k = k?;
         run(k)?;
-        let (tile, q8) = (label(&kernels, k, rows), if kernels == Q8 { " q8" } else { "" });
+        let (tile, q8) = (label(kernels, k, [rows, cols]), if kernels == Q8 { " q8" } else { "" });
         if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
             last.0 = format!("gemm {tokens}×{cols}→{rows} {tile}{q8}");
         }
