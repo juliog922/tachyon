@@ -114,12 +114,21 @@ pub fn embed(dir: &Path, texts: &[&str], dims: Option<usize>) -> tachyon::Result
     Ok(vectors.iter().map(|v| format!("[{}]", v.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n"))
 }
 
-/// Converts the checkpoint in `src` to a model directory `dst`: an encoder (Laya, Granite Embedding) or Gemma 4.
+/// Converts the checkpoint in `src` to a model directory `dst`: an encoder (Laya, Granite Embedding) or Gemma 4. The
+/// model is written beside `dst` as `<dst>.part` and renamed once whole, replacing an older `dst`: a conversion
+/// stopped halfway leaves no model that looks whole.
 pub fn convert(src: &Path, dst: &Path) -> tachyon::Result<()> {
     let config = std::fs::read(src.join("config.json")).unwrap_or_default();
+    let mut part = dst.as_os_str().to_owned();
+    part.push(".part");
+    let part = Path::new(&part);
+    // A part left by a conversion that stopped, or an older model, may or may not be there.
+    _ = std::fs::remove_dir_all(part);
     if src.join("rl_agent_config.json").exists() || tachyon::encoder::Config::from_json(&config).is_ok() {
-        tachyon::encoder::convert(src, dst)
+        tachyon::encoder::convert(src, part)?;
     } else {
-        tachyon::model::convert(src, dst)
+        tachyon::model::convert(src, part)?;
     }
+    _ = std::fs::remove_dir_all(dst);
+    Ok(std::fs::rename(part, dst)?)
 }

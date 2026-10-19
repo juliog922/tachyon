@@ -33,6 +33,8 @@ const IN_FLIGHT: usize = 32;
 pub struct Hub {
     base: String,
     config: Arc<ClientConfig>,
+    /// `Authorization: Bearer …` from `HF_TOKEN`, sent to the Hub only (not to the CDN its downloads redirect to).
+    auth: Option<String>,
     /// Connections a download opens at once (1 to 64).
     pub connections: usize,
 }
@@ -55,21 +57,34 @@ impl Default for Hub {
 }
 
 impl Hub {
-    /// Hugging Face, or the mirror `TACHYON_HUB` names, trusting the system's certificates.
+    /// Hugging Face, or the mirror `TACHYON_HUB` names, trusting the system's certificates; with the access token in
+    /// `HF_TOKEN`, if set, for gated repositories and higher rate limits.
     pub fn new() -> Hub {
-        Hub::at(&std::env::var("TACHYON_HUB").unwrap_or_else(|_| "https://huggingface.co".into()), ClientConfig::system())
+        let hub = Hub::at(&std::env::var("TACHYON_HUB").unwrap_or_else(|_| "https://huggingface.co".into()), ClientConfig::system());
+        hub.with_token(std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()).as_deref())
+    }
+
+    /// This Hub, sending `token` to it.
+    #[must_use]
+    pub fn with_token(self, token: Option<&str>) -> Hub {
+        Hub { auth: token.map(|t| format!("Bearer {}", t.trim())), ..self }
+    }
+
+    /// The headers every request to the Hub carries.
+    fn headers(&self) -> Vec<(&str, &str)> {
+        self.auth.as_deref().map(|a| ("Authorization", a)).into_iter().collect()
     }
 
     /// The Hub at `base` (a URL without a trailing `/`), trusting what `config` does, downloading over
     /// `TACHYON_CONNECTIONS` connections (8 by default).
     pub fn at(base: &str, config: ClientConfig) -> Hub {
         let connections = std::env::var("TACHYON_CONNECTIONS").ok().and_then(|n| n.parse().ok()).unwrap_or(CONNECTIONS);
-        Hub { base: base.trim_end_matches('/').into(), config: Arc::new(config), connections }
+        Hub { base: base.trim_end_matches('/').into(), config: Arc::new(config), auth: None, connections }
     }
 
     /// The files of `repo`'s `main` branch, in its folders too.
     pub fn files(&self, repo: &str) -> io::Result<Vec<Entry>> {
-        let body = get(&format!("{}/api/models/{repo}/tree/main?recursive=true", self.base), &[], &self.config)?;
+        let body = get(&format!("{}/api/models/{repo}/tree/main?recursive=true", self.base), &self.headers(), &self.config)?;
         let json = Json::parse(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("the Hub's file list: {e}")))?;
         Ok(json.arr().unwrap_or_default().iter().filter(|f| f.get("type").and_then(Json::str) == Some("file")).filter_map(entry).collect())
     }
@@ -85,8 +100,8 @@ impl Hub {
         }
         let url = Url::parse(&format!("{}/{repo}/resolve/main/{}", self.base, file.path)).ok_or_else(|| io::Error::other("the Hub's address is not a URL"))?;
         match file.sha256 {
-            None => small(&url, file, &target, &self.config),
-            Some(sha) => Chunked::start(&url, file.size, &target, &self.config)?.run(sha, self.connections, progress),
+            None => small(&url, file, &target, (&self.config, self.auth.as_deref())),
+            Some(sha) => Chunked::start(&url, file.size, &target, (&self.config, self.auth.as_deref()))?.run(sha, self.connections, progress),
         }
     }
 }
@@ -112,9 +127,10 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
 pub type Progress<'a> = &'a (dyn Fn(u64, u64) + Sync);
 
 /// A file outside LFS: one request, checked by size, written whole.
-fn small(url: &Url, file: &Entry, target: &Path, config: &Arc<ClientConfig>) -> io::Result<()> {
+fn small(url: &Url, file: &Entry, target: &Path, (config, auth): (&Arc<ClientConfig>, Option<&str>)) -> io::Result<()> {
     let mut body = Vec::with_capacity(usize::try_from(file.size).unwrap_or(0));
-    let (response, _) = fetch(&mut None, url, &[], config, &mut |b| {
+    let headers: Vec<_> = auth.map(|a| ("Authorization", a)).into_iter().collect();
+    let (response, _) = fetch(&mut None, url, &headers, config, &mut |b| {
         body.extend_from_slice(b);
         Ok(())
     })?;
@@ -138,11 +154,12 @@ struct Chunked {
     signal: (Mutex<()>, Condvar),
     target: std::path::PathBuf,
     config: Arc<ClientConfig>,
+    auth: Option<String>,
 }
 
 impl Chunked {
     /// Opens (or reopens) the part and state files of `target`, to be fetched from `url`.
-    fn start(url: &Url, size: u64, target: &Path, config: &Arc<ClientConfig>) -> io::Result<Chunked> {
+    fn start(url: &Url, size: u64, target: &Path, (config, auth): (&Arc<ClientConfig>, Option<&str>)) -> io::Result<Chunked> {
         let open = |ext| OpenOptions::new().read(true).write(true).create(true).truncate(false).open(sibling(target, ext));
         let (part, state) = (open("part")?, open("part.chunks")?);
         let chunks = size.div_ceil(CHUNK) as usize;
@@ -167,6 +184,7 @@ impl Chunked {
             signal,
             target: target.into(),
             config: config.clone(),
+            auth: auth.map(String::from),
         })
     }
 
@@ -248,7 +266,10 @@ impl Chunked {
         let range = format!("bytes={start}-{}", end - 1);
         let url = self.url.lock().expect("no thread panics holding it").clone().unwrap_or_else(|| self.first.clone());
         let (mut at, mut chunk) = (start, from);
-        let (response, last) = fetch(conn, &url, &[("Range", &range)], &self.config, &mut |b| {
+        let mut headers = vec![("Range", range.as_str())];
+        // The token goes to the Hub, never to the CDN a connection stays on after the first redirect.
+        headers.extend(self.auth.as_deref().filter(|_| url.host == self.first.host).map(|a| ("Authorization", a)));
+        let (response, last) = fetch(conn, &url, &headers, &self.config, &mut |b| {
             self.part.write_all_at(b, at)?;
             at += b.len() as u64;
             while chunk < to && at >= span(chunk, self.size).0 + span(chunk, self.size).1 {
@@ -406,6 +427,26 @@ mod tests {
 
     fn hub(port: u16) -> Hub {
         Hub::at(&format!("http://127.0.0.1:{port}"), ClientConfig { anchors: Vec::new(), random: crate::net::crypto::random, now: || 0 })
+    }
+
+    /// `HF_TOKEN`'s bearer token goes with a request to the Hub.
+    #[test]
+    fn the_token_goes_to_the_hub() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut b = [0; 1024];
+                let n = sock.read(&mut b).unwrap();
+                head.extend_from_slice(&b[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]").unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        assert!(hub(port).with_token(Some("hf_secret")).files("r").unwrap().is_empty());
+        assert!(server.join().unwrap().lines().any(|l| l == "Authorization: Bearer hf_secret"));
     }
 
     /// A file of two and a half chunks downloads in ranges and checks, over a connection per chunk and over one; a

@@ -224,7 +224,8 @@ fn invalid(why: &str) -> io::Error {
 }
 
 /// Fetches `url` with `GET` and `headers`, following redirects, on `conn` when it serves the final host (a new
-/// connection replaces it otherwise); the body goes to `sink`. Returns the final response and its URL.
+/// connection replaces it otherwise); the body goes to `sink`. Returns the final response and its URL. An
+/// `Authorization` header goes to `url`'s host only: a redirect elsewhere (the Hub's CDN) does not carry it.
 pub fn fetch(
     conn: &mut Option<Connection>,
     url: &Url,
@@ -232,13 +233,14 @@ pub fn fetch(
     config: &Arc<ClientConfig>,
     sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<(Response, Url)> {
-    let mut url = url.clone();
+    let (mut url, origin) = (url.clone(), url.host.clone());
     for _ in 0..=MAX_REDIRECTS {
         let c = match conn {
             Some(c) if c.serves(&url) => c,
             _ => conn.insert(Connection::open(&url, config)?),
         };
-        let response = c.get(&url.path, headers, sink)?;
+        let sent: Vec<(&str, &str)> = headers.iter().copied().filter(|(k, _)| url.host == origin || !k.eq_ignore_ascii_case("authorization")).collect();
+        let response = c.get(&url.path, &sent, sink)?;
         if !is_redirect(response.status) {
             return Ok((response, url));
         }
