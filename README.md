@@ -65,7 +65,16 @@ while let Some(text) = answer.next_text()? {
 
 `tachyon serve` keeps one engine for every process of your user, its models in VRAM between requests: each stays
 as long as its keep-alive says (5 minutes by default, `--keep-alive=SECONDS`; a request can set its own, or pin a
-model), so the next request to it starts at once, and models move to the host tier and back as VRAM requires.
+model), so the next request to it starts at once; then it is freed, VRAM and RAM, and read from disk when asked
+for again.
+
+Models share a VRAM limit (`--vram-mib`, by default 70% of the GPU's), image and audio towers and encoders
+included; a tower loads with a model's first image or clip and stays while the model does, so further requests
+take no more. When a model does not fit beside the others, the least recently used ones that are not pinned move
+to the host tier, pinned RAM (`--host-mib`, by default half the RAM), and come back at PCIe speed; past that, to
+disk. Requests run one at a time, so models over the limit together take turns, each switch a copy. A model that
+does not fit even alone fails with an error naming what it needs: no layer runs off the GPU. `env.example` lists
+every setting as an environment variable.
 
 There is no client library. A program in any language speaks to the daemon with the two files of `interface/`:
 `tachyon.xml`, the messages as a Simple Binary Encoding schema (feed it to any SBE generator, or read the fixed
@@ -78,7 +87,7 @@ then Done with timings), Embed, Decide (Laya), Load, Unload, List; one at a time
 a cancel stopping one between tokens. Only processes of the daemon's user are let in.
 
 The command line drives it too: `tachyon up` starts it in the background (its log in
-`~/.local/state/tachyon/serve.log`), `tachyon ps` lists its models (where, VRAM, time left), `tachyon load` and
+`~/.local/state/tachyon/serve.log`), `tachyon ps` lists its models (where, VRAM, time left in memory), `tachyon load` and
 `tachyon unload` place them, and `tachyon down` stops it. While it is up, `run`, `transcribe`, `embed` and `decide`
 go through it, so a model loads once and answers the next command from VRAM.
 

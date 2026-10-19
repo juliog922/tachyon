@@ -123,9 +123,9 @@ fn models_move_between_tiers_and_answer_the_same() {
     let full = engine.load("d", &dir, &keep).err();
     assert_eq!(full, Some(tachyon::Error::OutOfMemory { need, free: need / 2 }), "two pinned models leave no room");
     assert_eq!(engine.tier("d"), None, "a model that does not fit is not loaded");
-    // With no host tier, models leave VRAM for disk: at once after an answer kept zero, or once a keep-alive runs
-    // out; and come back answering the same.
-    let mut engine = Engine::new(0, Limits { vram: None, host: Some(0) }).unwrap();
+    // A model whose keep-alive runs out goes to disk, though the host tier has room: at once after an answer kept
+    // zero, or once its keep-alive runs out; and comes back answering the same.
+    let mut engine = Engine::new(0, Limits { vram: None, host: None }).unwrap();
     engine.load("a", &dir, &keep).unwrap();
     assert_eq!(answer(&mut engine, ("a", Some(Duration::ZERO)), &messages, 8), want);
     assert_eq!(engine.tier("a"), disk, "kept zero");
@@ -135,6 +135,30 @@ fn models_move_between_tiers_and_answer_the_same() {
     engine.expire().unwrap();
     assert_eq!(tiers(&engine, ["a", "m"]), [disk, vram], "a's keep-alive ran out; m's never does");
     assert!(engine.unload("m") && !engine.unload("m") && engine.tier("m").is_none());
+    std::fs::remove_dir_all(src).unwrap();
+}
+
+#[test]
+fn a_parked_model_is_freed_when_its_keep_alive_runs_out() {
+    let src = common::tiny::checkpoint("parked", 3, common::tiny::E4B);
+    let dir = src.join("out");
+    tachyon::model::convert(&src, &dir).unwrap();
+    let settings = Settings { context: 64, chunk: 8 };
+    let need = tachyon::model::footprint(&dir, &settings).unwrap();
+    let keep = Load { settings, keep_alive: Duration::MAX, ..Load::default() };
+    let messages = [Message::new(Role::User, "hello there")];
+    let (vram, host, disk) = (Some(Tier::Vram), Some(Tier::Host), Some(Tier::Disk));
+    // Room for one: p moves to the host tier for q, then its keep-alive runs out there, freeing its pinned memory.
+    let mut engine = Engine::new(0, Limits { vram: Some(need + need / 2), host: None }).unwrap();
+    engine.load("p", &dir, &keep).unwrap();
+    answer(&mut engine, ("p", Some(Duration::from_millis(50))), &messages, 1);
+    engine.load("q", &dir, &keep).unwrap();
+    assert_eq!(tiers(&engine, ["p", "q"]), [host, vram], "p made room for q");
+    std::thread::sleep(Duration::from_millis(60));
+    engine.expire().unwrap();
+    assert_eq!(tiers(&engine, ["p", "q"]), [disk, vram], "p's keep-alive ran out on the host tier");
+    let listed = engine.models();
+    assert_eq!(listed.iter().map(|l| l.vram).collect::<Vec<_>>(), [0, need], "only q takes VRAM");
     std::fs::remove_dir_all(src).unwrap();
 }
 

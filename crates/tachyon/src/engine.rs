@@ -7,9 +7,10 @@
 //! nothing. Dropping the stream cancels the answer at the cost of that one queued step.
 //!
 //! Models stay in VRAM while they fit [`Limits::vram`] (by default 70% of the GPU's, so caches and workspace never
-//! force an eviction) and their keep-alive lasts. A model that must make room, the least recently used first, or
-//! whose keep-alive has run out is parked in the host-RAM tier (its weights in pinned memory, back in VRAM at full
-//! PCIe speed) while that fits [`Limits::host`]. A model back from the tier keeps that copy, so it parks again
+//! force an eviction) and their keep-alive lasts. A model that must make room, the least recently used first, is
+//! parked in the host-RAM tier (its weights in pinned memory, back in VRAM at full PCIe speed) while that fits
+//! [`Limits::host`]. A model whose keep-alive has run out, in VRAM or parked, goes to disk: it takes no memory, keeps
+//! its name and settings, and the next call reads it again. A model back from the tier keeps that copy, so it parks again
 //! without copying or allocating; to make room, the least recently used copies are freed, sending parked models
 //! to disk. A pinned model
 //! never leaves VRAM, and neither does the one answering: its stream borrows the engine. With no thread, keep-alives
@@ -95,9 +96,9 @@ pub struct Loaded {
     pub name: String,
     /// Where it is.
     pub tier: Tier,
-    /// The VRAM it takes there, in bytes.
+    /// The VRAM it takes, in bytes, its towers included: 0 out of VRAM.
     pub vram: usize,
-    /// How long it has left in VRAM; `None`: no end.
+    /// How long it has left in memory, VRAM or the host tier; `None`: no end.
     pub left: Option<Duration>,
 }
 
@@ -278,7 +279,12 @@ impl Engine {
     pub fn models(&self) -> Vec<Loaded> {
         let now = Instant::now();
         let left = |m: &Model| m.until.filter(|_| !m.load.pin).map(|t| t.saturating_duration_since(now));
-        let decoders = self.models.iter().map(|m| Loaded { name: m.name.clone(), tier: self.tier(&m.name).unwrap_or(Tier::Disk), vram: m.need, left: left(m) });
+        let vram = |m: &Model| match m.at {
+            Place::Vram(_) => m.need + m.vision.as_ref().map_or(0, Vision::bytes) + m.audio.as_ref().map_or(0, Tower::bytes),
+            _ => 0,
+        };
+        let decoders =
+            self.models.iter().map(|m| Loaded { name: m.name.clone(), tier: self.tier(&m.name).unwrap_or(Tier::Disk), vram: vram(m), left: left(m) });
         let encoders = self.encoders.iter().map(|e| Loaded {
             name: e.name.clone(),
             tier: Tier::Vram,
@@ -293,15 +299,18 @@ impl Engine {
         self.models.iter().find(|m| m.name == name).map(|m| &m.tok)
     }
 
-    /// Moves out of VRAM every model whose keep-alive has run out, but pinned ones, and gives their VRAM back to the
-    /// system. Every call does it first. A model moved out to make room keeps its VRAM in the pool for the next.
+    /// Sends to disk every model whose keep-alive has run out, in VRAM or parked, but pinned ones, drops such
+    /// encoders, and gives their VRAM back to the system. Every call does it first. A model moved out to make room
+    /// keeps its VRAM in the pool for the next.
     pub fn expire(&mut self) -> Result<()> {
         let now = Instant::now();
         let mut freed = false;
-        for i in 0..self.models.len() {
-            let m = &self.models[i];
-            if matches!(m.at, Place::Vram(_)) && !m.load.pin && m.until.is_some_and(|t| t <= now) {
-                self.evict(i)?;
+        for m in &mut self.models {
+            if !matches!(m.at, Place::Disk) && !m.load.pin && m.until.is_some_and(|t| t <= now) {
+                if let Place::Vram(dec) = &mut m.at {
+                    dec.stop()?;
+                }
+                (m.vision, m.audio, m.at) = (None, None, Place::Disk);
                 freed = true;
             }
         }
@@ -345,28 +354,32 @@ impl Engine {
         Ok(soft)
     }
 
-    /// Model `i`'s vision tower, brought into VRAM if it is not there.
+    /// Model `i`'s vision tower, brought into VRAM if it is not there, under the limit like a model.
     fn vision(&mut self, i: usize) -> Result<&mut Vision> {
-        let m = &mut self.models[i];
+        let m = &self.models[i];
         if m.vision.is_none() {
             if !m.dir.join("vision.wpk").exists() || m.chat.image_token().is_none() {
                 return Err(Error::Unsupported(format!("no vision tower in {}: images", m.dir.display())));
             }
-            m.vision = Some(Vision::open(&self.ctx, &m.dir, m.load.budget)?);
+            let tower = Vision::open(&self.ctx, &m.dir, m.load.budget)?;
+            self.room(tower.bytes(), Some(i))?;
+            self.models[i].vision = Some(tower);
         }
-        Ok(m.vision.as_mut().unwrap_or_else(|| unreachable!("opened above")))
+        Ok(self.models[i].vision.as_mut().unwrap_or_else(|| unreachable!("opened above")))
     }
 
-    /// Model `i`'s audio tower, brought into VRAM if it is not there.
+    /// Model `i`'s audio tower, brought into VRAM if it is not there, under the limit like a model.
     fn hearing(&mut self, i: usize) -> Result<&mut Tower> {
-        let m = &mut self.models[i];
+        let m = &self.models[i];
         if m.audio.is_none() {
             if !m.dir.join("audio.wpk").exists() || m.chat.audio_token().is_none() {
                 return Err(Error::Unsupported(format!("no audio tower in {}: audio", m.dir.display())));
             }
-            m.audio = Some(Tower::open(&self.ctx, &m.dir)?);
+            let tower = Tower::open(&self.ctx, &m.dir)?;
+            self.room(tower.bytes(), Some(i))?;
+            self.models[i].audio = Some(tower);
         }
-        Ok(m.audio.as_mut().unwrap_or_else(|| unreachable!("opened above")))
+        Ok(self.models[i].audio.as_mut().unwrap_or_else(|| unreachable!("opened above")))
     }
 
     /// Brings model `i` into VRAM, moving out the least recently used models that may go until it fits.

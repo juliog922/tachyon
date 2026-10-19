@@ -34,11 +34,52 @@ pub struct Options {
     pub keep_alive: Duration,
     /// Bytes of each client's data area.
     pub data: usize,
+    /// VRAM for the models, in bytes; `None`: 70% of the GPU's.
+    pub vram: Option<usize>,
+    /// Pinned host memory for the models moved out of VRAM to make room, in bytes; `None`: half the RAM.
+    pub host: Option<usize>,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { socket: socket(), keep_alive: Duration::from_secs(300), data: 64 << 20 }
+        Options { socket: socket(), keep_alive: Duration::from_secs(300), data: 64 << 20, vram: None, host: None }
+    }
+}
+
+/// The settings [`Options::set`] takes from the environment, as `TACHYON_KEEP_ALIVE` and so on.
+const FROM_ENV: [&str; 4] = ["keep-alive", "data-mib", "vram-mib", "host-mib"];
+
+impl Options {
+    /// The defaults, changed by `$TACHYON_KEEP_ALIVE` (seconds), `$TACHYON_DATA_MIB`, `$TACHYON_VRAM_MIB` and
+    /// `$TACHYON_HOST_MIB` (`env.example` lists every setting); an unreadable value is an error naming it.
+    pub fn from_env() -> Result<Options, String> {
+        let mut opts = Options::default();
+        for key in FROM_ENV {
+            let var = format!("TACHYON_{}", key.to_uppercase().replace('-', "_"));
+            if let Ok(value) = std::env::var(&var)
+                && !opts.set(key, &value)
+            {
+                return Err(format!("{var}={value}: not a number"));
+            }
+        }
+        Ok(opts)
+    }
+
+    /// Sets option `key` (`socket`, `keep-alive` in seconds, `data-mib`, `vram-mib`, `host-mib`) to `value`;
+    /// false if there is no such option or `value` does not read.
+    pub fn set(&mut self, key: &str, value: &str) -> bool {
+        let mib = |v: &str| v.parse::<usize>().ok().and_then(|n| n.checked_mul(1 << 20));
+        match key {
+            "socket" => {
+                self.socket = value.into();
+                true
+            }
+            "keep-alive" => value.parse().map(|s| self.keep_alive = Duration::from_secs(s)).is_ok(),
+            "data-mib" => mib(value).map(|n| self.data = n).is_some(),
+            "vram-mib" => mib(value).map(|n| self.vram = Some(n)).is_some(),
+            "host-mib" => mib(value).map(|n| self.host = Some(n)).is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -75,7 +116,7 @@ static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 /// the engine's models freed.
 pub fn serve(opts: &Options) -> tachyon::Result<()> {
     let listener = listen(&opts.socket)?;
-    let mut engine = Engine::new(0, Limits::default())?;
+    let mut engine = Engine::new(0, Limits { vram: opts.vram, host: opts.host })?;
     let (mut clients, mut queue): (Vec<Option<Client>>, VecDeque<usize>) = (Vec::new(), VecDeque::new());
     eprintln!("tachyon serve: listening on {}", opts.socket.display());
     loop {

@@ -28,10 +28,12 @@ Commands:
   embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
   serve                        Serve every process of this user from one engine, models kept in VRAM between
                                requests (interface/tachyon.h and tachyon.xml; --socket=PATH, --keep-alive=SECONDS,
-                               --data-mib=N: each client's data area, 64 by default)
+                               --data-mib=N: each client's data area, 64 by default; --vram-mib=N: VRAM for
+                               models, 70% of the GPU's by default; --host-mib=N: RAM for models moved out of
+                               VRAM, half the RAM by default; env.example lists the environment variables)
   up [serve's options]         Start `tachyon serve` in the background (its log in ~/.local/state/tachyon)
   down                         Stop it: its models freed
-  ps                           List its models: where they are, their VRAM, their time left in VRAM
+  ps                           List its models: where they are, their VRAM, their time left in memory
   load <model>                 Load a model into it ahead of use (--keep-alive=SECONDS or never, --pin,
                                --context=N); while it is up, run, transcribe, embed and decide go through it
   unload <model>               Drop a model from it
@@ -177,18 +179,15 @@ fn serve(rest: &[&str]) -> ExitCode {
 
 /// The daemon's options in `rest`, or `None` (reported) for one it does not take.
 fn options(rest: &[&str]) -> Option<tachyon_cli::serve::Options> {
-    let mut opts = tachyon_cli::serve::Options::default();
+    let mut opts = match tachyon_cli::serve::Options::from_env() {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return None;
+        }
+    };
     for w in rest {
-        let ok = match w.split_once('=') {
-            Some(("--socket", p)) => {
-                opts.socket = p.into();
-                true
-            }
-            Some(("--keep-alive", s)) => s.parse().map(|s| opts.keep_alive = std::time::Duration::from_secs(s)).is_ok(),
-            Some(("--data-mib", n)) => n.parse::<usize>().map(|n| opts.data = n << 20).is_ok(),
-            _ => false,
-        };
-        if !ok {
+        if !w.strip_prefix("--").and_then(|w| w.split_once('=')).is_some_and(|(k, v)| opts.set(k, v)) {
             eprint!("error: unknown serve option '{w}'\n\n{HELP}");
             return None;
         }

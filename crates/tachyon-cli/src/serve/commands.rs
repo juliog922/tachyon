@@ -48,8 +48,10 @@ fn spawn(opts: &Options, log: &Path) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
     std::fs::create_dir_all(log.parent().unwrap_or(Path::new(".")))?;
     let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
-    let args =
-        [format!("--socket={}", opts.socket.display()), format!("--keep-alive={}", opts.keep_alive.as_secs()), format!("--data-mib={}", opts.data >> 20)];
+    let mut args =
+        vec![format!("--socket={}", opts.socket.display()), format!("--keep-alive={}", opts.keep_alive.as_secs()), format!("--data-mib={}", opts.data >> 20)];
+    args.extend(opts.vram.map(|b| format!("--vram-mib={}", b >> 20)));
+    args.extend(opts.host.map(|b| format!("--host-mib={}", b >> 20)));
     let mut serve = std::process::Command::new(std::env::current_exe()?);
     serve.arg("serve").args(args).stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out).process_group(0).spawn()
 }
@@ -66,7 +68,7 @@ pub fn down(path: &Path) -> io::Result<String> {
     Ok("tachyon serve: down".into())
 }
 
-/// The daemon's models: name, where, VRAM, time left in VRAM.
+/// The daemon's models: name, where, VRAM, time left in memory.
 pub fn ps(d: &mut Daemon) -> io::Result<String> {
     let id = d.id();
     let last = d.call(&request(6, id, Fields::default()), &mut |_| {})?;
@@ -83,9 +85,15 @@ pub fn ps(d: &mut Daemon) -> io::Result<String> {
 fn row(r: &mut Reader<'_>, len: usize) -> Result<String, Bad> {
     let e = r.entry(len)?;
     let (vram, left, tier) = (e.u64(0)?, e.u64(8)? as i64, e.u8(16)?);
+    let on_disk = tier == 2;
     let tier = ["vram", "host", "disk"].get(usize::from(tier)).unwrap_or(&"?");
-    let left = if left < 0 { "pinned".into() } else { format!("{:.0} s", left as f64 / 1e3) };
-    Ok(format!("{:<32} {tier:<5} {:>7.2} GB  {left}\n", r.text()?, vram as f64 / 1e9))
+    let left = match left {
+        _ if on_disk => "-".into(),
+        ..0 => "pinned".into(),
+        ms => format!("{:.0} s", ms as f64 / 1e3),
+    };
+    let vram = if vram == 0 { "-".into() } else { format!("{:.2} GB", vram as f64 / 1e9) };
+    Ok(format!("{:<32} {tier:<5} {vram:>9}  {left}\n", r.text()?))
 }
 
 /// A malformed answer.

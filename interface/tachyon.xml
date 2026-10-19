@@ -71,7 +71,7 @@
   <sbe:message name="Chat" id="1" description="The model's answer to a conversation, streamed as Text, then Done">
     <field name="request" id="1" type="uint64"/>
     <field name="seed" id="2" type="uint64" description="Seed of the draws"/>
-    <field name="keepAliveMs" id="3" type="int64" description="How long the model stays in VRAM after: -1 its own setting, 0 moves it out at once"/>
+    <field name="keepAliveMs" id="3" type="int64" description="How long the model stays in memory after: -1 its own setting, 0 frees it at once"/>
     <field name="maxTokens" id="4" type="uint32" description="0: until the model ends its turn or the context is full"/>
     <field name="topK" id="5" type="uint32" description="0: no limit"/>
     <field name="temperature" id="6" type="float" description="0: greedy"/>
@@ -174,8 +174,8 @@
   <sbe:message name="Models" id="106" description="The loaded models">
     <field name="request" id="1" type="uint64"/>
     <group name="models" id="2" dimensionType="groupSizeEncoding">
-      <field name="vramBytes" id="3" type="uint64"/>
-      <field name="keepAliveMs" id="4" type="int64" description="Left before it moves out of VRAM; -1 never"/>
+      <field name="vramBytes" id="3" type="uint64" description="VRAM it takes, its towers included; 0 out of VRAM"/>
+      <field name="keepAliveMs" id="4" type="int64" description="Left before it is freed to disk; -1 never"/>
       <field name="tier" id="5" type="Tier"/>
       <data name="name" id="6" type="varStringEncoding"/>
     </group>

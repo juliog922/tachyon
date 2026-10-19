@@ -52,4 +52,5 @@
 # serve: step 14, `tachyon serve`: one engine for every process of the user, reached through interface/ (a Unix
 # socket for the handshake and the doorbells, a memfd shared memory with a response ring and a futex, SBE messages).
 # Raised to 1000 in step 14b: the command line's side of the protocol (client.rs) and its commands (commands.rs).
-1000     crates/tachyon-cli/src/serve
+# Raised to 1050 in step 14c: the daemon's settings from the environment, and its VRAM and host limits.
+1050     crates/tachyon-cli/src/serve

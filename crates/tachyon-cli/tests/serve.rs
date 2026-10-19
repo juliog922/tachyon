@@ -179,7 +179,7 @@ fn daemon(name: &str) -> (String, std::path::PathBuf) {
     let src = tiny::checkpoint(name, 3, tiny::E4B);
     tachyon::model::convert(&src, &src.join("out")).unwrap();
     let socket = src.join("tachyon.sock");
-    let opts = tachyon_cli::serve::Options { socket: socket.clone(), keep_alive: Duration::from_secs(60), data: 1 << 20 };
+    let opts = tachyon_cli::serve::Options { socket: socket.clone(), keep_alive: Duration::from_secs(60), data: 1 << 20, vram: None, host: None };
     std::thread::spawn(move || tachyon_cli::serve::serve(&opts).unwrap());
     while !socket.exists() {
         std::thread::sleep(Duration::from_millis(10));
@@ -273,4 +273,15 @@ fn the_command_line_drives_the_daemon() {
     assert_eq!(commands::down(&socket).unwrap(), "tachyon serve: down");
     assert!(!socket.exists() && Daemon::connect(&socket).is_err(), "the socket is gone");
     std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn settings_come_from_flags_and_the_environment() {
+    let mut o = tachyon_cli::serve::Options::default();
+    assert!(o.set("vram-mib", "4300") && o.vram == Some(4300 << 20));
+    assert!(o.set("keep-alive", "60") && o.keep_alive == Duration::from_secs(60));
+    assert!(!o.set("keep-alive", "soon") && !o.set("vram", "1"), "unreadable or unknown");
+    let up = std::process::Command::new(env!("CARGO_BIN_EXE_tachyon")).arg("up").env("TACHYON_VRAM_MIB", "lots").output().unwrap();
+    assert_eq!(up.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&up.stderr).contains("TACHYON_VRAM_MIB=lots: not a number"), "{up:?}");
 }
