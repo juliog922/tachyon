@@ -81,7 +81,7 @@ pub fn serve(opts: &Options) -> tachyon::Result<()> {
         if fds[0].revents & POLLIN != 0 {
             accept(&listener, opts, &mut clients);
         }
-        for i in (0..clients.len()).filter(|&i| fds[i + 1].revents != 0) {
+        for i in (0..fds.len() - 1).filter(|&i| fds[i + 1].revents != 0) {
             ring(&mut clients[i], i, &mut queue);
         }
         while let Some(i) = queue.pop_front() {
