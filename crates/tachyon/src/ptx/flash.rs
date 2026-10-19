@@ -318,13 +318,16 @@ const LOG2E: &str = "0f3FB8AA3B";
 const LOG2E_NEG: &str = "0fBFB8AA3B";
 const NEG_INF: &str = "0fFF800000";
 
-/// The flash kernel for heads of `d`, `per` query heads a block.
+/// The dynamic shared memory every flash kernel uses, declared once in the module: `ptxas` refuses a second
+/// declaration.
+pub(super) const FSMEM: &str = ".extern .shared .align 16 .b8 fsmem[];\n";
+
+/// The flash kernel for heads of `d`, `per` query heads a block; it needs [`FSMEM`] declared before it.
 pub(super) fn flash(d: usize, per: u32) -> String {
     let sh = Shape::of(d, per);
     let (k_at, v_at, _) = sh.layout();
     let mut s = format!(
-        ".extern .shared .align 16 .b8 fsmem[];
-.visible .entry {}(.param .u64 pq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap, .param .u32 pwin,
+        ".visible .entry {}(.param .u64 pq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap, .param .u32 pwin,
     .param .u32 pgroup, .param .u32 ptok, .param .u64 py)
     .maxntid {}, 1, 1
 {{

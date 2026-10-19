@@ -105,7 +105,7 @@ pub fn module() -> String {
         gemm::gemm_q4(),
         gemm::PEAKS.map(gemm::mma_peak).concat(),
         attend::query(256) + &attend::query(512),
-        flash::flash(256, 4) + &flash::flash(512, 4) + &flash::flash(256, 2),
+        flash::FSMEM.to_string() + &flash::flash(256, 4) + &flash::flash(512, 4) + &flash::flash(256, 2),
         attend::attend(256, 4) + &attend::attend(512, 4) + &attend::attend(256, 2),
         attend::store(256) + &attend::store(512),
         SPIN_PTX.into(),
