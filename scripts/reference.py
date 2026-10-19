@@ -12,6 +12,8 @@ Needs torch, transformers and accelerate. The model spreads over the GPUs it see
 
 import json
 import sys
+import time
+import warnings
 
 import torch
 from transformers import AutoModelForImageTextToText, AutoTokenizer
@@ -54,6 +56,9 @@ PROMPTS = [
 
 
 def main(src):
+    # PyTorch warns when it cannot reach the driver's management library (NVML); CUDA itself works.
+    warnings.filterwarnings("ignore", message="Can't initialize NVML")
+    start = time.time()
     tok = AutoTokenizer.from_pretrained(src)
     model = AutoModelForImageTextToText.from_pretrained(src, dtype=torch.bfloat16, device_map="auto").eval()
     for text in PROMPTS:
@@ -65,6 +70,8 @@ def main(src):
         answer = out.sequences[0, len(prompt):].tolist()
         top = [torch.topk(l[0].float(), 2).values.tolist() for l in out.logits]
         print(json.dumps({"text": text, "prompt": prompt, "answer": answer, "gap": [round(a - b, 3) for a, b in top]}, ensure_ascii=False))
+        done = PROMPTS.index(text) + 1
+        print(f"{done}/{len(PROMPTS)} prompts, {time.time() - start:.0f} s", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

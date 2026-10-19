@@ -114,6 +114,29 @@ pub fn embed(dir: &Path, texts: &[&str], dims: Option<usize>) -> tachyon::Result
     Ok(vectors.iter().map(|v| format!("[{}]", v.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n"))
 }
 
+/// Runs `convert` while a line on standard error reports, every two seconds, how much of the checkpoint in `src`
+/// it has read, how fast, and how long it has left.
+fn with_progress(src: &Path, convert: impl FnOnce() -> tachyon::Result<()>) -> tachyon::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let entries = std::fs::read_dir(src)?.filter_map(Result::ok);
+    let total: u64 = entries.filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    let (done, start, from) = (AtomicBool::new(false), std::time::Instant::now(), tachyon::quant::READ.load(Ordering::Relaxed));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_secs(2));
+                let (read, secs) = ((tachyon::quant::READ.load(Ordering::Relaxed) - from) as f64, start.elapsed().as_secs_f64());
+                let left = (total as f64 - read).max(0.0) / (read / secs).max(1.0);
+                eprint!("\rconverting: {:.1} of {:.1} GB, {:.0} MB/s, {left:.0} s left   ", read / 1e9, total as f64 / 1e9, read / secs / 1e6);
+            }
+            eprintln!("\rconverted {:.1} GB in {:.0} s{:30}", total as f64 / 1e9, start.elapsed().as_secs_f64(), "");
+        });
+        let result = convert();
+        done.store(true, Ordering::Relaxed);
+        result
+    })
+}
+
 /// Converts the checkpoint in `src` to a model directory `dst`: an encoder (Laya, Granite Embedding) or Gemma 4. The
 /// model is written beside `dst` as `<dst>.part` and renamed once whole, replacing an older `dst`: a conversion
 /// stopped halfway leaves no model that looks whole.
@@ -124,11 +147,8 @@ pub fn convert(src: &Path, dst: &Path) -> tachyon::Result<()> {
     let part = Path::new(&part);
     // A part left by a conversion that stopped, or an older model, may or may not be there.
     _ = std::fs::remove_dir_all(part);
-    if src.join("rl_agent_config.json").exists() || tachyon::encoder::Config::from_json(&config).is_ok() {
-        tachyon::encoder::convert(src, part)?;
-    } else {
-        tachyon::model::convert(src, part)?;
-    }
+    let encoder = src.join("rl_agent_config.json").exists() || tachyon::encoder::Config::from_json(&config).is_ok();
+    with_progress(src, || if encoder { tachyon::encoder::convert(src, part) } else { tachyon::model::convert(src, part) })?;
     _ = std::fs::remove_dir_all(dst);
     Ok(std::fs::rename(part, dst)?)
 }

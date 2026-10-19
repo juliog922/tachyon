@@ -41,8 +41,9 @@
 # media: step 11, std-only decoders (PNG with inflate, baseline JPEG), PIL's resize, WAV, resampling, mel: spec step 11
 # decisions. Planned at 700, raised to 1100 in 11a: matching PIL and libjpeg-turbo bit for bit took 890 lines for images.
 1100     crates/tachyon/src/media
-# cli: raised from 500 in step 10f: three more models in the catalog; to 560 in step 12a: Gemma 4 12B.
-560      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs crates/tachyon-cli/src/encoders.rs
+# cli: raised from 500 in step 10f: three more models in the catalog; to 560 in step 12a: Gemma 4 12B; to 580 in
+# step 12b: a conversion's progress.
+580      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs crates/tachyon-cli/src/encoders.rs
 # net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
 950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs
 1050     crates/tachyon-cli/src/net/tls.rs crates/tachyon-cli/src/net/x509.rs

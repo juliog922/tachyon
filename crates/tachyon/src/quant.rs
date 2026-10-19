@@ -157,6 +157,9 @@ pub fn f16_value(h: u16) -> f32 {
     }
 }
 
+/// Bytes of tensor data [`Safetensors::rows`] has read in this process, for a conversion's progress.
+pub static READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A model's `.safetensors` files: each a little-endian header length, a JSON header naming every tensor's type,
 /// shape and byte range, then the data. Tensors are read on demand, so a checkpoint larger than memory converts.
 pub struct Safetensors {
@@ -207,6 +210,7 @@ impl Safetensors {
         let (size, cols) = (dtype.size() as usize, self.dims(name)?.1);
         let mut raw = vec![0; rows.len() * cols * size];
         self.files[*file].read_exact_at(&mut raw, start + (rows.start * cols * size) as u64)?;
+        READ.fetch_add(raw.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(match dtype {
             Dtype::F32 => raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
             Dtype::F16 => raw.chunks_exact(2).map(|b| f16_value(u16::from_le_bytes([b[0], b[1]]))).collect(),
