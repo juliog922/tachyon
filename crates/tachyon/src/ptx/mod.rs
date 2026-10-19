@@ -56,8 +56,7 @@ pub use encoder::{
 use encoder::{LARGE, Operands, SMALL, TALL};
 pub use flash::{FLASH_256, FLASH_512, shared};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H, SUM_SLICES, slices};
-use gemv::Tail;
-pub use gemv::{GEMV_Q4, GEMV_Q4_GEGLU, GEMV_Q4_NARROW, GEMV_Q4_NARROW_NORM, GEMV_Q4_NORM, GEMV_ROWS, NORM_ROWS, UNROLL};
+pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
 pub use vision::{HEADS_F16, POOL_F16, RMS_F16};
 
@@ -93,8 +92,8 @@ pub fn module() -> String {
         norm(false),
         norm(true),
         EMBED.into(),
-        gemv::gemv_q4(UNROLL, 32, Tail::None) + &gemv::gemv_q4(UNROLL, 8, Tail::None),
-        [(32, Tail::Geglu), (32, Tail::Norm), (8, Tail::Norm)].map(|(lanes, tail)| gemv::gemv_q4(UNROLL, lanes, tail)).concat(),
+        gemv::gemv_q4(UNROLL, 32),
+        gemv::gemv_q4(UNROLL, 8),
         gemm::gemm_q4(),
         gemm::PEAKS.map(gemm::mma_peak).concat(),
         attend::query(256) + &attend::query(512),

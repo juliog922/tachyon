@@ -27,8 +27,8 @@ use super::prefill::Chunk;
 use crate::Result;
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Stream, arg};
 use crate::ptx::{
-    ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_GEGLU, GEMV_Q4_NARROW, GEMV_Q4_NARROW_NORM, GEMV_Q4_NORM, GEMV_ROWS, NORM_Q8,
-    NORM_THREADS, SAMPLE, SAMPLE_THREADS, SPIN, Sampling, rope,
+    ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE, SAMPLE_THREADS, SPIN,
+    Sampling, rope,
 };
 use crate::wpk::{ALIGN, Loader, Wpk};
 use std::os::unix::fs::FileExt;
@@ -158,8 +158,7 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
     let (x, q) = ([take(f * cfg.hidden), take(f * cfg.hidden)], [take(widest), take(widest / 4)]);
     let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.mlp(l - 1)).max(cfg.hidden).max(pl)));
     let (ple, pli, proj, logits, work) = (take(f * pl), take(f * pl), take(f * pl), take(f * cfg.vocab), take(f * cfg.vocab));
-    // Counters: attention's, then the sampler's and the products' tails' (see `gemv_then`).
-    let (partial, count) = ([take(f * cfg.heads / 4 * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * cfg.heads / 4), take(2 * f)]);
+    let (partial, count) = ([take(f * cfg.heads / 4 * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * cfg.heads / 4), take(f)]);
     let caches: Vec<[u64; 2]> = (0..l)
         .map(|i| {
             let len = 2 * kv * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
@@ -535,22 +534,6 @@ fn gemv(m: Mat, q: [u64; 2], y: u64) -> Op {
     if m.cols <= 256 { (GEMV_Q4_NARROW, [m.rows.div_ceil(16), 1, 1], 128, args) } else { (GEMV_Q4, [m.rows.div_ceil(GEMV_ROWS), 1, 1], 32 * GEMV_ROWS, args) }
 }
 
-/// `y = M·x` as [`gemv`], then in its last block either [`NORM_Q8`]'s step on `then = [h, h_out, w1, w2]` with
-/// `k = [eps, scale]`, its Q8 out to `q` ([`GEMV_Q4_NORM`]), or, `then = [b]`, Q8 of `gelu(y) · b` to `q`
-/// ([`GEMV_Q4_GEGLU`]). The tails count their blocks on the word after the sampler's counter.
-fn gemv_then(m: Mat, q: [u64; 2], y: u64, b: &Bufs, (then, k): (&[u64], [f32; 2])) -> Op {
-    let (mut op, norm) = (gemv(m, q, y), then.len() == 4);
-    (op.0, op.1[0]) = match (op.0, norm) {
-        (GEMV_Q4, true) => (GEMV_Q4_NORM, op.1[0]),
-        (_, true) => (GEMV_Q4_NARROW_NORM, op.1[0]),
-        // The gate has no narrow form: its rows take the wide kernel whatever their length.
-        (_, false) => (GEMV_Q4_GEGLU, m.rows.div_ceil(GEMV_ROWS)),
-    };
-    op.3.extend([b.count[1] + 4].iter().chain(then).chain(&q).map(|&p| A::P(p)));
-    op.3.extend(k.into_iter().filter(|_| norm).map(A::F));
-    op
-}
-
 /// [`NORM_Q8`] on `p = [h, h_out, y, w1, w2]` over `shape = [len, chunks]` with `k = [eps, scale]`:
 /// `h_out = (h + w1 ⊙ rmsnorm(y)) · scale`, then Q8 of `w2 ⊙ rmsnorm(h_out)`.
 fn norm(p: [u64; 5], q: [u64; 2], shape: [usize; 2], k: [f32; 2]) -> Op {
@@ -605,22 +588,26 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, i: usize, sms: u32) -> Vec<Op>
     vec![
         gemv(w.mat(&format!("{i}.qkv")), b.q, b.qkv),
         (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [blocks, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
-        gemv_then(w.mat(&format!("{i}.o")), b.q, b.y, b, (&[x0, x1, n("post_attention_layernorm"), n("pre_feedforward_layernorm")], [cfg.eps, 1.0])),
+        gemv(w.mat(&format!("{i}.o")), b.q, b.y),
+        norm([x0, x1, b.y, n("post_attention_layernorm"), n("pre_feedforward_layernorm")], b.q, [cfg.hidden, 1], [cfg.eps, 1.0]),
     ]
 }
 
 /// Layer `i`'s MLP and per-layer input, from the residual stream in `x[(i + 1) % 2]` back to it, times `scalar`,
 /// with the next layer's normalized input (or the final norm's) in `q`.
 fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
-    let (eps, n) = (cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
+    let (h, eps, n) = (cfg.hidden, cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
     let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
     vec![
         gemv(w.mat(&format!("{i}.gate_up")), b.q, b.y),
         geglu(b.y, b.y + 4 * cfg.mlp(i) as u64, b.q, cfg.mlp(i)),
-        gemv_then(w.mat(&format!("{i}.down")), b.q, b.y, b, (&[x1, x0, n("post_feedforward_layernorm"), 0], [eps, 1.0])),
-        gemv_then(w.mat(&format!("{i}.per_layer_gate")), b.q, b.y, b, (&[b.pli + 4 * (i * cfg.per_layer) as u64], [0.0; 2])),
-        gemv_then(w.mat(&format!("{i}.per_layer_proj")), b.q, b.y, b, (&[x0, x1, n("post_per_layer_input_norm"), next], [eps, scalar])),
+        gemv(w.mat(&format!("{i}.down")), b.q, b.y),
+        norm([x1, x0, b.y, n("post_feedforward_layernorm"), 0], b.q, [h, 1], [eps, 1.0]),
+        gemv(w.mat(&format!("{i}.per_layer_gate")), b.q, b.y),
+        geglu(b.y, b.pli + 4 * (i * cfg.per_layer) as u64, b.q, cfg.per_layer),
+        gemv(w.mat(&format!("{i}.per_layer_proj")), b.q, b.y),
+        norm([x0, x1, b.y, n("post_per_layer_input_norm"), next], b.q, [h, 1], [eps, scalar]),
     ]
 }
 
