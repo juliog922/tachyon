@@ -164,10 +164,10 @@ impl Vision {
         let (rows, cols, n) = (matrix.shape[0] as u32, matrix.shape[1] as u32, tokens as u32);
         let args = [A::P(a), A::P(self.at(w)), A::P(0), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(self.at(&format!("{w}.clip")))];
         let run = |k: usize| {
-            let (kernel, grid, threads) = launch(CLIP, k, n, [rows, cols]);
+            let (kernel, grid, threads) = launch(&CLIP, k, n, rows);
             self.launch(kernel, [grid, 1, 1], threads, &args)
         };
-        run(self.products.pick(&self.stream, &self.module, [rows, cols, n], (CLIP.len(), &run))?)
+        run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)
     }
 
     /// [`RMS_F16`] over `rows` rows, `io` being `[x, y, w1, w2, a]`: `x += w1 ⊙ rms(y)` unless `y` is 0, then `a = w2 ⊙ rms(x)` unless `a` is 0.

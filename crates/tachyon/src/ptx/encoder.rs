@@ -51,11 +51,6 @@ pub const GEMM_CLIP_TALL: &str = "gemm_clip_tall";
 pub const GEMM_Q8_TALL: &str = "gemm_q8_tall";
 /// Name of the 8-bit matrix product in blocks of 128 tokens.
 pub const GEMM_Q8_128: &str = "gemm_q8_128";
-/// Name of [`GEMM_Q8`] taking 128 of `k` (two groups) a turn; `cols` a multiple of 128.
-pub const GEMM_Q8_K: &str = "gemm_q8_k";
-/// Name of [`GEMM_Q8_128`] taking 128 of `k` a turn, in [`crate::ptx::shared`] bytes of dynamic shared memory; `cols` a
-/// multiple of 128.
-pub const GEMM_Q8_128K: &str = "gemm_q8_128k";
 /// Name of the kernel that rounds `f16` rows to Q8, for [`GEMM_Q8`].
 pub const QUANT_F16: &str = "quant_f16";
 /// Name of the `f16` matrix product in blocks of 128 tokens, 256 threads.
@@ -90,20 +85,12 @@ pub(super) fn f(v: f32) -> String {
     format!("0f{:08X}", v.to_bits())
 }
 
-/// Bytes of a shared row of a `k` slice of `tile` (64 or 128 bytes), padded so `ldmatrix` is free of bank conflicts.
-const fn row(tile: Tile) -> usize {
-    tile.width + 16
-}
-
-/// One stage of a product's block `tile`: its rows of activations, then its rows of weights; for Q8, then per group
-/// of 64 of `k` the activations' scales and the weights'.
+/// Bytes of a shared row of 32 `f16` (a `k` slice), padded so `ldmatrix` is free of bank conflicts.
+const ROW: usize = 80;
+/// One stage of a product's block `tile`: its rows of activations, then its rows of weights; for Q8, then the
+/// activations' scales and the weights'.
 const fn stage(tile: Tile, q8: bool) -> usize {
-    (tile.tokens + tile.rows) * row(tile) + if q8 { group(tile) * tile.width / 64 } else { 0 }
-}
-
-/// Bytes of one group's scales in a stage of `tile`.
-const fn group(tile: Tile) -> usize {
-    4 * (tile.tokens + tile.rows)
+    (tile.tokens + tile.rows) * ROW + if q8 { 4 * (tile.tokens + tile.rows) } else { 0 }
 }
 
 /// What a product multiplies: `f16`, `f16` clipped to bounds, or Q8.
@@ -118,26 +105,16 @@ pub(super) enum Operands {
 const GROUP: usize = 8;
 
 /// Blocks of 64 tokens × 64 rows (128 threads), of 128 × 64 (256 threads), and of 128 × 128 (512 threads), which
-/// read a third fewer bytes per operation from L2 and memory than 128 × 64; all taking 64 bytes of `k` a turn. And
-/// for Q8, 64 × 64 and 128 × 64 taking 128 bytes (two groups) a turn: half the barriers and the copies' bookkeeping
-/// per operation, two stages (the larger past 48 KiB, in dynamic shared memory).
-pub(super) const SMALL: Tile = Tile { tokens: 64, rows: 64, width: 64 };
-pub(super) const LARGE: Tile = Tile { tokens: 128, rows: 64, width: 64 };
-pub(super) const TALL: Tile = Tile { tokens: 128, rows: 128, width: 64 };
-pub(super) const SMALL_WIDE: Tile = Tile { tokens: 64, rows: 64, width: 128 };
-pub(super) const LARGE_WIDE: Tile = Tile { tokens: 128, rows: 64, width: 128 };
+/// read a third fewer bytes per operation from L2 and memory than 128 × 64.
+pub(super) const SMALL: Tile = Tile { tokens: 64, rows: 64 };
+pub(super) const LARGE: Tile = Tile { tokens: 128, rows: 64 };
+pub(super) const TALL: Tile = Tile { tokens: 128, rows: 128 };
 
-/// A product kernel's block: the tokens and the rows it takes, 32 × 32 to a warp, and the bytes of `k` of a turn.
+/// A product kernel's block: the tokens and the rows it takes, 32 × 32 to a warp.
 #[derive(Clone, Copy)]
 pub(super) struct Tile {
     pub tokens: usize,
     pub rows: usize,
-    pub width: usize,
-}
-
-/// The bytes of dynamic shared memory product kernel `name` takes: those of [`GEMM_Q8_128K`], 0 for the others.
-pub(super) fn shared(name: &str) -> u32 {
-    if name == GEMM_Q8_128K { (stages(LARGE_WIDE, true) * stage(LARGE_WIDE, true)) as u32 } else { 0 }
 }
 
 /// A block's warps, and the rows a pass of its copies covers (four threads to a row).
@@ -157,19 +134,19 @@ fn copy(s: &mut String, tile: Tile, (buf, off): (usize, usize), q8: bool) {
     let (base, pass) = (buf * stage(tile, q8), block(tile).1);
     let mut parts = Vec::new();
     for (dst, n, src) in [("%sa", tile.tokens, "%ga"), ("%sw", tile.rows, "%gw")] {
-        parts.extend((0..n / pass).map(|p| (dst, p * pass * row(tile), format!("{src}{p}"))));
+        parts.extend((0..n / pass).map(|p| (dst, p * pass * ROW, format!("{src}{p}"))));
     }
-    // Four threads to a row, 16 bytes each, once per 64 bytes of the turn.
-    for ((dst, at, src), h) in parts.iter().flat_map(|part| (0..tile.width / 64).map(move |h| (part, 64 * h))) {
-        let _ = writeln!(s, "    @%q cp.async.cg.shared.global [{dst}+{}], [{src}+{}], 16;", base + at + h, off + h);
+    for (dst, at, src) in parts {
+        let _ = writeln!(s, "    @%q cp.async.cg.shared.global [{dst}+{}], [{src}+{off}], 16;", base + at);
     }
     if q8 {
         s.push_str("    and.pred %qa, %q, %ta;\n    and.pred %qw, %q, %tw;\n");
-        for g in 0..tile.width / 64 {
-            let (at, from) = (base + g * group(tile), off / 16 + 4 * g);
-            let _ =
-                writeln!(s, "    @%qa cp.async.ca.shared.global [%ss+{at}], [%gs+{from}], 4;\n    @%qw cp.async.ca.shared.global [%sd+{at}], [%gd+{from}], 4;");
-        }
+        let _ = writeln!(
+            s,
+            "    @%qa cp.async.ca.shared.global [%ss+{base}], [%gs+{}], 4;\n    @%qw cp.async.ca.shared.global [%sd+{base}], [%gd+{}], 4;",
+            off / 16,
+            off / 16
+        );
     }
     s.push_str("    cp.async.commit_group;\n");
 }
@@ -188,7 +165,7 @@ fn products(s: &mut String, tile: Tile, buf: usize, clip: bool) {
                 a + 1,
                 a + 2,
                 a + 3,
-                base + mi * 16 * row(tile) + 32 * ks
+                base + mi * 16 * ROW + 32 * ks
             );
             (a..a + 4).filter(|_| clip).for_each(|r| _ = writeln!(s, "    max.f16x2 %a{r}, %a{r}, %lo;\n    min.f16x2 %a{r}, %a{r}, %hi;"));
         }
@@ -200,7 +177,7 @@ fn products(s: &mut String, tile: Tile, buf: usize, clip: bool) {
                 b + 1,
                 b + 2,
                 b + 3,
-                base + pair * 16 * row(tile) + 32 * ks
+                base + pair * 16 * ROW + 32 * ks
             );
         }
         for mi in 0..2 {
@@ -339,12 +316,7 @@ const Q8_HEAD: &str = "    shr.u32 %ng, %r4, 6;
 /// here) and an integer `mma` per pair of tiles, two chained per group of 64 from `%mz`, so a chain's sum `i`
 /// reads as the float `MAGIC + i`; then [`scale_q8`].
 fn products_q8(s: &mut String, tile: Tile, buf: usize) {
-    (0..tile.width / 64).for_each(|g| group_q8(s, tile, buf * stage(tile, true), g));
-}
-
-/// The products of group `half` of the stage at `base`: an integer chain per output, then [`scale_q8`].
-fn group_q8(s: &mut String, tile: Tile, base: usize, half: usize) {
-    let (rw, at) = (row(tile), 64 * half);
+    let base = buf * stage(tile, true);
     for ks in 0..2 {
         for mi in 0..2 {
             let a = 4 * mi;
@@ -354,7 +326,7 @@ fn group_q8(s: &mut String, tile: Tile, base: usize, half: usize) {
                 a + 1,
                 a + 2,
                 a + 3,
-                base + mi * 16 * rw + at + 32 * ks
+                base + mi * 16 * ROW + 32 * ks
             );
         }
         for pair in 0..2 {
@@ -365,7 +337,7 @@ fn group_q8(s: &mut String, tile: Tile, base: usize, half: usize) {
                 b + 1,
                 b + 2,
                 b + 3,
-                base + pair * 16 * rw + at + 32 * ks
+                base + pair * 16 * ROW + 32 * ks
             );
         }
         for mi in 0..2 {
@@ -386,7 +358,7 @@ fn group_q8(s: &mut String, tile: Tile, base: usize, half: usize) {
             }
         }
     }
-    scale_q8(s, base + half * group(tile));
+    scale_q8(s, base);
 }
 
 /// The Q8 products' integer sums of the stage at `base` scaled into the `f32` sums: per output `fma(i, s, −MAGIC·s)`
@@ -520,7 +492,7 @@ fn gemm_store(s: &mut String, clip: bool) {
 }
 
 /// A product of blocks of `tile` ([`GEMM_F16`], [`GEMM_CLIP`] or [`GEMM_Q8`] and their `_128` and `_TALL` forms) as
-/// `ops` says: [`stages`] of `tile.width` bytes of `k` (32 `f16` or 64 Q8 values a group of 64), the next slices' copies in
+/// `ops` says: [`stages`] of 64 bytes of `k` (32 `f16` or 64 Q8 values, one group), the next slices' copies in
 /// flight while one multiplies, and one barrier per slice: the one that lets a slice in, after which the stage
 /// multiplied before it is free to refill. Each warp takes 32 tokens × 32 rows.
 pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
@@ -529,21 +501,21 @@ pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
     let n = stages(tile, q8);
     for p in 0..n - 1 {
         let _ = writeln!(s, "    setp.gt.u32 %q, %turns, {p};");
-        copy(&mut s, tile, (p, tile.width * p), q8);
+        copy(&mut s, tile, (p, 64 * p), q8);
     }
     s += "TURN:\n";
     for buf in 0..n {
         let _ = writeln!(s, "    cp.async.wait_group {};\n    bar.sync 0;\n    setp.gt.u32 %q, %turns, {};", n - 2, n - 1);
-        copy(&mut s, tile, ((buf + n - 1) % n, tile.width * (n - 1)), q8);
+        copy(&mut s, tile, ((buf + n - 1) % n, 64 * (n - 1)), q8);
         if q8 {
             products_q8(&mut s, tile, buf);
-            let _ = writeln!(s, "    add.u64 %gs, %gs, {0};\n    add.u64 %gd, %gd, {0};", tile.width / 16);
+            s += "    add.u64 %gs, %gs, 4;\n    add.u64 %gd, %gd, 4;\n";
         } else {
             products(&mut s, tile, buf, clip);
         }
         let (a, w) = (tile.tokens / block(tile).1, tile.rows / block(tile).1);
         for p in (0..a).map(|p| format!("%ga{p}")).chain((0..w).map(|p| format!("%gw{p}"))) {
-            let _ = writeln!(s, "    add.u64 {p}, {p}, {};", tile.width);
+            let _ = writeln!(s, "    add.u64 {p}, {p}, 64;");
         }
         s += "    sub.u32 %turns, %turns, 1;\n    setp.eq.u32 %p, %turns, 0;\n    @%p bra STORE;\n";
     }
@@ -552,12 +524,12 @@ pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
     s + "    ret;\n}\n"
 }
 
-/// The declaration of a product kernel (see [`gemm_f16`]): its parameters, registers and shared memory, dynamic past
-/// 48 KiB and so declared outside the kernel (again for each: PTX allows it).
-fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
-    let (q8, bytes) = (ops == Operands::Q8, stages(tile, ops == Operands::Q8) * stage(tile, ops == Operands::Q8));
-    format!(
-        "{}.visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
+/// The entry of a product kernel (see [`gemm_f16`]), its registers and shared memory, its pointers and fragments'
+/// addresses, and its sums zeroed.
+fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
+    let q8 = ops == Operands::Q8;
+    let mut s = format!(
+        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
     .maxntid {}, 1, 1
 {{
     .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
@@ -565,8 +537,7 @@ fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
     .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
     .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
     .reg .b64 %rd<10>, %ga<2>, %gw<2>;{}
-    {}",
-        if bytes > 48 << 10 { ".extern .shared .align 16 .b8 dsmem[];\n" } else { "" },
+    .shared .align 16 .b8 smem[{}];",
         match ops {
             Operands::F16 => "",
             Operands::Clip => ", .param .u64 pclip",
@@ -574,18 +545,12 @@ fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
         },
         32 * block(tile).0,
         if q8 { Q8_REGS } else { "" },
-        if bytes > 48 << 10 { String::new() } else { format!(".shared .align 16 .b8 smem[{bytes}];") }
-    )
-}
-
-/// The entry of a product kernel (see [`gemm_f16`]), its pointers and fragments' addresses, and its sums zeroed.
-fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
-    let (q8, mut s) = (ops == Operands::Q8, gemm_entry(name, tile, ops));
-    let bytes = stages(tile, q8) * stage(tile, q8);
+        stages(tile, q8) * stage(tile, q8)
+    );
     let (tokens, pass) = (tile.tokens, block(tile).1);
     let numbers = [
-        ("HALF", tokens * row(tile)),
-        ("ROW", row(tile)),
+        ("HALF", tokens * ROW),
+        ("ROW", ROW),
         ("TSHIFT", tokens.trailing_zeros() as usize),
         ("TMASK", tokens - 1),
         ("GROUP", GROUP),
@@ -595,10 +560,9 @@ fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
         ("PSTRIDE", if q8 { pass } else { 2 * pass }),
         ("CSHIFT", if q8 { 4 } else { 3 }),
         ("ESHIFT", usize::from(!q8)),
-        ("TURNSHIFT", if q8 { tile.width.trailing_zeros() as usize } else { 5 }),
+        ("TURNSHIFT", if q8 { 6 } else { 5 }),
     ];
-    let head = if bytes > 48 << 10 { GEMM_HEAD.replace("%sm, smem", "%sm, dsmem") } else { GEMM_HEAD.to_string() };
-    s += &numbers.iter().fold(head, |h, (key, v)| h.replace(key, &v.to_string()));
+    s += &numbers.iter().fold(GEMM_HEAD.to_string(), |h, (key, v)| h.replace(key, &v.to_string()));
     // The other passes' copy sources, a pass of rows apart.
     (1..tokens / pass).for_each(|p| _ = writeln!(s, "    add.u64 %ga{p}, %ga{}, %rd3;", p - 1));
     (1..tile.rows / pass).for_each(|p| _ = writeln!(s, "    add.u64 %gw{p}, %gw{}, %rd3;", p - 1));
