@@ -35,13 +35,15 @@ impl Linear {
     }
 }
 
-/// Writes `vision.wpk` into `dst` if `st` has a vision tower.
+/// Writes `vision.wpk` into `dst` if `st` has a vision tower this engine runs.
 pub fn convert(st: &Safetensors, dst: &Path) -> Result<()> {
     if !st.has(&format!("{P}patch_embedder.input_proj.weight")) {
         return Ok(());
     }
+    // The larger models' towers standardize their soft tokens (`std_bias`, `std_scale`): not yet (step 12d), so
+    // those models convert for text only.
     if st.has(&format!("{P}std_bias")) {
-        return Err(Error::Unsupported("a vision tower that standardizes its soft tokens".into()));
+        return Ok(());
     }
     let mut w = Writer::create(dst.join("vision.wpk"))?;
     linear(&mut w, st, "patch", &[format!("{P}patch_embedder.input_proj")], false)?;

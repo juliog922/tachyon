@@ -1,7 +1,8 @@
 //! A tiny Gemma 4 checkpoint, generated: the real model's structure (sliding and global layers, shared keys and
-//! values, per-layer inputs) in E4B's shape or E2B's, at a size the CPU reference and the PTX interpreter run in
-//! seconds. Every matrix is
-//! on the Q4 grid (`n·2^-e` per group of 64, one weight at ±7), so converting it loses nothing.
+//! values, per-layer inputs) in E4B's shape or E2B's, or the larger models' ([`DENSE`]: no per-layer inputs, no
+//! shared caches, two query heads per key-value head in sliding layers, one key-value head whose values are its keys
+//! in global layers), at a size the CPU reference runs in seconds. Every matrix is on the Q4 grid (`n·2^-e` per
+//! group of 64, one weight at ±7), so converting it loses nothing.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,18 +14,31 @@ pub const VOCAB: usize = 4000;
 /// Layers 2 and 5 are global; 4 and 5 reuse the caches of 3 and 2.
 pub const GLOBAL: [bool; LAYERS] = [false, false, true, false, false, true];
 
-/// Where Gemma 4's small models differ: key-value heads (of 8 query heads), and whether the shared layers' MLPs
-/// are twice as wide.
+/// Where Gemma 4's models differ: key-value heads (of 8 query heads) in sliding layers, whether the shared layers'
+/// MLPs are twice as wide, and whether the model is laid out as the larger ones (see the module's documentation).
 #[derive(Clone, Copy)]
 pub struct Shape {
     pub kv: usize,
     pub wide: bool,
+    pub dense: bool,
 }
 
-pub const E4B: Shape = Shape { kv: 2, wide: false };
-pub const E2B: Shape = Shape { kv: 1, wide: true };
+pub const E4B: Shape = Shape { kv: 2, wide: false, dense: false };
+pub const E2B: Shape = Shape { kv: 1, wide: true, dense: false };
+/// The 31B's layout: four key-value heads in sliding layers (two query heads each), one in global layers.
+pub const DENSE: Shape = Shape { kv: 4, wide: false, dense: true };
 
 impl Shape {
+    /// Key-value heads of layer `i`.
+    pub fn kv(self, i: usize) -> usize {
+        if self.dense && GLOBAL[i] { 1 } else { self.kv }
+    }
+
+    /// The layer whose keys and values layer `i` attends over.
+    pub fn source(self, i: usize) -> usize {
+        if self.dense { i } else { [0, 1, 2, 3, 3, 2][i] }
+    }
+
     /// Width of layer `i`'s MLP.
     pub fn ffn(self, i: usize) -> usize {
         if self.wide && i >= 4 { 2 * FFN } else { FFN }
@@ -54,48 +68,68 @@ pub fn bf16(v: f32) -> f32 {
     f32::from_bits((b + 0x7fff + (b >> 16 & 1)) & 0xffff_0000)
 }
 
+/// A checkpoint's tensors as they are made: name, shape, values.
+type Tensors = Vec<(String, Vec<usize>, Vec<f32>)>;
+
+/// A matrix on the Q4 grid: per group of 64, `n·2^-e` (`e` this or one more), one weight at ±7.
+fn matrix(out: &mut Tensors, rng: &mut Rng, name: String, [rows, cols]: [usize; 2], e: i32) {
+    let mut w = Vec::with_capacity(rows * cols);
+    for _ in 0..rows * cols / 64 {
+        let d = 2f32.powi(-e - (rng.next() % 2) as i32);
+        w.push(if rng.next() % 2 == 0 { 7.0 * d } else { -7.0 * d });
+        w.extend((1..64).map(|_| ((rng.next() % 15) as f32 - 7.0) * d));
+    }
+    out.push((name, vec![rows, cols], w));
+}
+
+/// A vector of bfloat16 values in `[lo, hi)`.
+fn vector(out: &mut Tensors, rng: &mut Rng, name: String, len: usize, [lo, hi]: [f32; 2]) {
+    out.push((name, vec![len], (0..len).map(|_| bf16(rng.range(lo, hi))).collect()));
+}
+
 /// The tensors of the checkpoint, in order: name, shape, values.
-pub fn tensors(seed: u64, shape: Shape) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+pub fn tensors(seed: u64, shape: Shape) -> Tensors {
     let mut rng = Rng(seed);
     let mut out = Vec::new();
-    let matrix = |out: &mut Vec<_>, rng: &mut Rng, name: String, rows: usize, cols: usize, e: i32| {
-        let mut w = Vec::with_capacity(rows * cols);
-        for _ in 0..rows * cols / 64 {
-            let d = 2f32.powi(-e - (rng.next() % 2) as i32);
-            w.push(if rng.next() % 2 == 0 { 7.0 * d } else { -7.0 * d });
-            w.extend((1..64).map(|_| ((rng.next() % 15) as f32 - 7.0) * d));
-        }
-        out.push((name, vec![rows, cols], w));
-    };
-    let vector = |out: &mut Vec<_>, rng: &mut Rng, name: String, len: usize, lo: f32, hi: f32| {
-        out.push((name, vec![len], (0..len).map(|_| bf16(rng.range(lo, hi))).collect()));
-    };
     let p = "model.language_model.";
-    matrix(&mut out, &mut rng, format!("{p}embed_tokens.weight"), VOCAB, HIDDEN, 5);
-    matrix(&mut out, &mut rng, format!("{p}embed_tokens_per_layer.weight"), VOCAB, LAYERS * 256, 5);
-    matrix(&mut out, &mut rng, format!("{p}per_layer_model_projection.weight"), LAYERS * 256, HIDDEN, 6);
-    vector(&mut out, &mut rng, format!("{p}per_layer_projection_norm.weight"), 256, 0.5, 1.5);
-    vector(&mut out, &mut rng, format!("{p}norm.weight"), HIDDEN, 0.5, 1.5);
-    for (i, &global) in GLOBAL.iter().enumerate() {
-        let (l, d) = (format!("{p}layers.{i}."), if global { 512 } else { 256 });
-        let (kv, ffn) = (shape.kv * d, shape.ffn(i));
-        for (n, rows, cols) in [("self_attn.q_proj", 8 * d, HIDDEN), ("self_attn.k_proj", kv, HIDDEN), ("self_attn.v_proj", kv, HIDDEN)] {
-            matrix(&mut out, &mut rng, format!("{l}{n}.weight"), rows, cols, 5);
-        }
-        matrix(&mut out, &mut rng, format!("{l}self_attn.o_proj.weight"), HIDDEN, 8 * d, 6);
-        for (n, rows, cols) in [("mlp.gate_proj", ffn, HIDDEN), ("mlp.up_proj", ffn, HIDDEN), ("mlp.down_proj", HIDDEN, ffn)] {
-            matrix(&mut out, &mut rng, format!("{l}{n}.weight"), rows, cols, 5);
-        }
-        matrix(&mut out, &mut rng, format!("{l}per_layer_input_gate.weight"), 256, HIDDEN, 5);
-        matrix(&mut out, &mut rng, format!("{l}per_layer_projection.weight"), HIDDEN, 256, 5);
-        vector(&mut out, &mut rng, format!("{l}self_attn.q_norm.weight"), d, 0.15, 0.35);
-        vector(&mut out, &mut rng, format!("{l}self_attn.k_norm.weight"), d, 0.15, 0.35);
-        for n in ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm"] {
-            vector(&mut out, &mut rng, format!("{l}{n}.weight"), HIDDEN, 0.5, 1.5);
-        }
-        vector(&mut out, &mut rng, format!("{l}layer_scalar"), 1, 0.5, 1.0);
+    matrix(&mut out, &mut rng, format!("{p}embed_tokens.weight"), [VOCAB, HIDDEN], 5);
+    if !shape.dense {
+        matrix(&mut out, &mut rng, format!("{p}embed_tokens_per_layer.weight"), [VOCAB, LAYERS * 256], 5);
+        matrix(&mut out, &mut rng, format!("{p}per_layer_model_projection.weight"), [LAYERS * 256, HIDDEN], 6);
+        vector(&mut out, &mut rng, format!("{p}per_layer_projection_norm.weight"), 256, [0.5, 1.5]);
+    }
+    vector(&mut out, &mut rng, format!("{p}norm.weight"), HIDDEN, [0.5, 1.5]);
+    for i in 0..LAYERS {
+        layer_tensors(&mut out, &mut rng, &format!("{p}layers.{i}."), (i, shape));
     }
     out
+}
+
+/// Layer `i`'s tensors, named from `l`.
+fn layer_tensors(out: &mut Tensors, rng: &mut Rng, l: &str, (i, shape): (usize, Shape)) {
+    let d = if GLOBAL[i] { 512 } else { 256 };
+    let (kv, ffn) = (shape.kv(i) * d, shape.ffn(i));
+    // The larger models' global layers have no value projection: their values are their keys.
+    let values = !(shape.dense && GLOBAL[i]);
+    let projections = [("self_attn.q_proj", 8 * d, HIDDEN), ("self_attn.k_proj", kv, HIDDEN), ("self_attn.v_proj", kv, HIDDEN)];
+    for (n, rows, cols) in projections.into_iter().filter(|p| values || p.0 != "self_attn.v_proj") {
+        matrix(out, rng, format!("{l}{n}.weight"), [rows, cols], 5);
+    }
+    matrix(out, rng, format!("{l}self_attn.o_proj.weight"), [HIDDEN, 8 * d], 6);
+    for (n, rows, cols) in [("mlp.gate_proj", ffn, HIDDEN), ("mlp.up_proj", ffn, HIDDEN), ("mlp.down_proj", HIDDEN, ffn)] {
+        matrix(out, rng, format!("{l}{n}.weight"), [rows, cols], 5);
+    }
+    if !shape.dense {
+        matrix(out, rng, format!("{l}per_layer_input_gate.weight"), [256, HIDDEN], 5);
+        matrix(out, rng, format!("{l}per_layer_projection.weight"), [HIDDEN, 256], 5);
+    }
+    vector(out, rng, format!("{l}self_attn.q_norm.weight"), d, [0.15, 0.35]);
+    vector(out, rng, format!("{l}self_attn.k_norm.weight"), d, [0.15, 0.35]);
+    let norms = ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm"];
+    for n in norms.into_iter().filter(|&n| !shape.dense || n != "post_per_layer_input_norm") {
+        vector(out, rng, format!("{l}{n}.weight"), HIDDEN, [0.5, 1.5]);
+    }
+    vector(out, rng, format!("{l}layer_scalar"), 1, [0.5, 1.0]);
 }
 
 /// Writes the checkpoint (`config.json`, the toy `tokenizer.json`, `model.safetensors` in bfloat16) to a fresh
@@ -131,14 +165,18 @@ pub fn config(shape: Shape) -> String {
     let types: Vec<String> = GLOBAL.iter().map(|&g| format!("\"{}\"", if g { "full_attention" } else { "sliding_attention" })).collect();
     format!(
         r#"{{"architectures":["Gemma4ForConditionalGeneration"],"text_config":{{"hidden_size":{HIDDEN},"intermediate_size":{FFN},
-        "num_attention_heads":8,"num_key_value_heads":{},"head_dim":256,"global_head_dim":512,"hidden_size_per_layer_input":256,
-        "vocab_size":{VOCAB},"vocab_size_per_layer_input":{VOCAB},"num_hidden_layers":{LAYERS},"layer_types":[{}],"sliding_window":8,
-        "num_kv_shared_layers":2,"rms_norm_eps":1e-6,"final_logit_softcapping":30.0,"hidden_activation":"gelu_pytorch_tanh",
-        "tie_word_embeddings":true,"attention_k_eq_v":false,"use_double_wide_mlp":{},"enable_moe_block":false,
-        "model_type":"gemma4_text","rope_parameters":{{"sliding_attention":{{"rope_type":"default","rope_theta":10000.0}},
+        "num_attention_heads":8,"num_key_value_heads":{},"num_global_key_value_heads":{},"head_dim":256,"global_head_dim":512,
+        "hidden_size_per_layer_input":{},"vocab_size":{VOCAB},"vocab_size_per_layer_input":{VOCAB},"num_hidden_layers":{LAYERS},
+        "layer_types":[{}],"sliding_window":8,"num_kv_shared_layers":{},"rms_norm_eps":1e-6,"final_logit_softcapping":30.0,
+        "hidden_activation":"gelu_pytorch_tanh","tie_word_embeddings":true,"attention_k_eq_v":{},"use_double_wide_mlp":{},
+        "enable_moe_block":false,"model_type":"gemma4_text","rope_parameters":{{"sliding_attention":{{"rope_type":"default","rope_theta":10000.0}},
         "full_attention":{{"rope_type":"proportional","partial_rotary_factor":0.25,"rope_theta":1000000.0}}}}}}}}"#,
         shape.kv,
+        shape.kv(2),
+        if shape.dense { 0 } else { 256 },
         types.join(","),
+        if shape.dense { 0 } else { 2 },
+        shape.dense,
         shape.wide
     )
 }
@@ -155,6 +193,12 @@ pub fn reference(seed: u64, shape: Shape, tokens: &[u32]) -> Vec<Vec<f32>> {
         .map(|(pos, &tok)| {
             let row = |name: &str, i: usize, n: usize| t[name][i * n..(i + 1) * n].to_vec();
             let mut x: Vec<f32> = row("embed_tokens.weight", tok as usize, HIDDEN).iter().map(|v| v * 16.0).collect();
+            if shape.dense {
+                for i in 0..LAYERS {
+                    x = layer(&t, &mut cache, [i, pos], shape, (&x, &[]));
+                }
+                return mv(&t["embed_tokens.weight"], &rms(&x, Some(&t["norm.weight"])));
+            }
             let ple = row("embed_tokens_per_layer.weight", tok as usize, LAYERS * 256);
             let proj: Vec<f32> = mv(&t["per_layer_model_projection.weight"], &x).iter().map(|v| v / (HIDDEN as f32).sqrt()).collect();
             let pli: Vec<f32> = proj
@@ -169,21 +213,22 @@ pub fn reference(seed: u64, shape: Shape, tokens: &[u32]) -> Vec<Vec<f32>> {
                 })
                 .collect();
             for i in 0..LAYERS {
-                x = layer(&t, &mut cache, [i, pos, 8 / shape.kv], &x, &pli[i * 256..(i + 1) * 256]);
+                x = layer(&t, &mut cache, [i, pos], shape, (&x, &pli[i * 256..(i + 1) * 256]));
             }
             mv(&t["embed_tokens.weight"], &rms(&x, Some(&t["norm.weight"])))
         })
         .collect()
 }
 
-/// Layer `i` at `pos`, its query heads `group` to a key-value head.
+/// Layer `i` at `pos` on `x`, `pli` its per-layer input (empty for [`DENSE`]).
 fn layer(
     t: &std::collections::HashMap<String, Vec<f32>>,
     cache: &mut [Vec<(Vec<f32>, Vec<f32>)>],
-    [i, pos, group]: [usize; 3],
-    x: &[f32],
-    pli: &[f32],
+    [i, pos]: [usize; 2],
+    shape: Shape,
+    (x, pli): (&[f32], &[f32]),
 ) -> Vec<f32> {
+    let group = 8 / shape.kv(i);
     let w = |n: &str| &t[&format!("layers.{i}.{n}")][..];
     let d = if GLOBAL[i] { 512 } else { 256 };
     let freq: Vec<f32> =
@@ -194,9 +239,10 @@ fn layer(
         let n = rms(head, Some(w("self_attn.q_norm.weight")));
         head.copy_from_slice(&rotate(&n, pos, &freq));
     }
-    let source = [0, 1, 2, 3, 3, 2][i];
+    let source = shape.source(i);
     if source == i {
-        let (k, v) = (mv(w("self_attn.k_proj.weight"), &h), mv(w("self_attn.v_proj.weight"), &h));
+        let k = mv(w("self_attn.k_proj.weight"), &h);
+        let v = if t.contains_key(&format!("layers.{i}.self_attn.v_proj.weight")) { mv(w("self_attn.v_proj.weight"), &h) } else { k.clone() };
         let k: Vec<f32> = k.chunks(d).flat_map(|c| rotate(&rms(c, Some(w("self_attn.k_norm.weight"))), pos, &freq)).collect();
         cache[i].push((k, v.chunks(d).flat_map(|c| rms(c, None)).collect()));
     }
@@ -208,6 +254,9 @@ fn layer(
     let (g, u) = (mv(w("mlp.gate_proj.weight"), &h), mv(w("mlp.up_proj.weight"), &h));
     let a: Vec<f32> = g.iter().zip(&u).map(|(g, u)| gelu(*g) * u).collect();
     let x = add(&x, &mv(w("mlp.down_proj.weight"), &a), "post_feedforward_layernorm.weight");
+    if pli.is_empty() {
+        return x.iter().map(|v| v * w("layer_scalar")[0]).collect();
+    }
     let a: Vec<f32> = mv(w("per_layer_input_gate.weight"), &x).iter().zip(pli).map(|(g, p)| gelu(*g) * p).collect();
     let x = add(&x, &mv(w("per_layer_projection.weight"), &a), "post_per_layer_input_norm.weight");
     x.iter().map(|v| v * w("layer_scalar")[0]).collect()

@@ -28,7 +28,7 @@ pub struct Model {
 }
 
 /// Every model the catalog knows: the encoders, then the chat models, smallest first.
-pub const CATALOG: [Model; 9] = [
+pub const CATALOG: [Model; 10] = [
     Model {
         name: "granite-embedding-97m",
         repo: "ibm-granite/granite-embedding-97m-multilingual-r2",
@@ -86,6 +86,14 @@ pub const CATALOG: [Model; 9] = [
         later: None,
     },
     Model {
+        name: "gemma-4-12b",
+        repo: "google/gemma-4-12B-it",
+        task: "run",
+        about: "Gemma 4 12B: chat, text only for now, the default on 12–16 GB",
+        vram: 8 << 30,
+        later: None,
+    },
+    Model {
         name: "gemma-4-26b-a4b",
         repo: "google/gemma-4-26B-A4B-it",
         task: "run",
@@ -97,9 +105,9 @@ pub const CATALOG: [Model; 9] = [
         name: "gemma-4-31b",
         repo: "google/gemma-4-31B-it",
         task: "run",
-        about: "Gemma 4 31B: the highest quality, 32 GB and up",
+        about: "Gemma 4 31B: the highest quality, text only for now, 32 GB and up",
         vram: 19 << 30,
-        later: Some(12),
+        later: None,
     },
 ];
 

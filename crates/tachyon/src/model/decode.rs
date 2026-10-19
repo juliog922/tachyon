@@ -27,8 +27,8 @@ use super::prefill::Chunk;
 use crate::Result;
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Stream, arg};
 use crate::ptx::{
-    ATTEND_256, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE, SAMPLE_THREADS, SPIN,
-    Sampling, rope,
+    ATTEND_256, ATTEND_256_PAIRS, ATTEND_512, ATTEND_WARPS, EMBED_Q4, GEGLU_Q8, GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, NORM_Q8, NORM_THREADS, SAMPLE,
+    SAMPLE_THREADS, SPIN, Sampling, rope,
 };
 use crate::wpk::{ALIGN, Loader, Wpk};
 use std::os::unix::fs::FileExt;
@@ -153,15 +153,17 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
         end += len.next_multiple_of(256);
         base + at as u64
     };
-    let (d, kv, l, pl, f) = (cfg.head_dim[1], cfg.kv_heads, cfg.layers(), cfg.layers() * cfg.per_layer, 4);
+    let (d, l, pl, f) = (cfg.head_dim[1], cfg.layers(), cfg.layers() * cfg.per_layer, 4);
     let widest = cfg.hidden.max(cfg.mlp(l - 1)).max(cfg.heads * d).max(cfg.per_layer);
     let (x, q) = ([take(f * cfg.hidden), take(f * cfg.hidden)], [take(widest), take(widest / 4)]);
-    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * (2 * cfg.mlp(l - 1)).max(cfg.hidden).max(pl)));
+    let (qkv, y) = (take(f * qkv_width(cfg)), take(f * (2 * cfg.mlp(l - 1)).max(cfg.hidden).max(pl)));
     let (ple, pli, proj, logits, work) = (take(f * pl), take(f * pl), take(f * pl), take(f * cfg.vocab), take(f * cfg.vocab));
-    let (partial, count) = ([take(f * cfg.heads / 4 * 256 * (8 + 4 * d)), take(f * 8 * 1024)], [take(f * cfg.heads / 4), take(f)]);
+    // Attention's scratch: per block (at most heads / 2) and split (at most 256), the block's maxima, sums and outputs.
+    let partial = [take(f * cfg.heads / 2 * 256 * (8 + 4 * d)), take(f * 8 * 1024)];
+    let count = [take(f * cfg.heads / 2), take(f)];
     let caches: Vec<[u64; 2]> = (0..l)
         .map(|i| {
-            let len = 2 * kv * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
+            let len = 2 * cfg.kv(i) * if cfg.global[i] { context } else { ring } * cfg.head_dim[usize::from(cfg.global[i])];
             if cfg.source(i) == i { [take(len), take(len)] } else { [0, 0] }
         })
         .collect();
@@ -170,6 +172,11 @@ fn layout(cfg: &Config, settings: &Settings, base: u64) -> (Bufs, Chunk, usize) 
     let (context, ring) = (context as u32, ring as u32);
     let bufs = Bufs { x, q, qkv, y, ple, pli, proj, logits, work, partial, count, kv, context, ring, control: [0; 5], token: [0; 2] };
     (bufs, chunk, end)
+}
+
+/// Floats of one token's query, key and value projections, in the widest kind of layer.
+pub(super) fn qkv_width(cfg: &Config) -> usize {
+    (0..2).map(|g| (cfg.heads + 2 * cfg.kv_heads[g]) * cfg.head_dim[g]).max().unwrap_or(0)
 }
 
 /// The control buffer's contents for a new sequence: step counter and token, `sampling`, the RoPE tables, and no
@@ -466,7 +473,8 @@ pub fn footprint(dir: &Path, settings: &Settings) -> Result<usize> {
 fn load(ctx: &Context, dir: &Path, loader: &mut Loader) -> Result<Loaded<DevBuf>> {
     let cfg = Config::from_json(&std::fs::read(dir.join("config.json"))?)?;
     let (wpk, hpk) = (Wpk::open(dir.join("weights.wpk"))?, Wpk::open(dir.join("host.wpk"))?);
-    let (weights, mut host) = (ctx.alloc_pooled(wpk.data_len())?, ctx.alloc_host(hpk.data_len())?);
+    // A model without per-layer inputs has an empty host table.
+    let (weights, mut host) = (ctx.alloc_pooled(wpk.data_len())?, ctx.alloc_host(hpk.data_len().max(64))?);
     loader.to_device(&wpk, &weights)?;
     loader.to_host(&hpk, &mut host)?;
     let scalars = scalars(&dir.join("weights.wpk"), &wpk, cfg.layers())?;
@@ -554,15 +562,17 @@ fn embed(m: Mat, token: u64, out: u64, scale: f32) -> Op {
 /// The whole step.
 fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u32) -> Vec<Op> {
     let (h, pl, l, eps) = (cfg.hidden, cfg.per_layer, cfg.layers(), cfg.eps);
-    let mut ops = vec![
-        embed(w.mat("embed"), b.token[0], b.x[0], bf16((h as f32).sqrt())),
-        embed(hw.mat("embed_per_layer"), b.token[0], b.ple, (pl as f32).sqrt()),
-        norm([b.x[0], 0, 0, 0, 0], b.q, [h, 1], [eps, 1.0]),
-        gemv(w.mat("per_layer_proj"), b.q, b.proj),
-        // rmsnorm(c·y) is rmsnorm(y) with eps / c²: the projection's 1/√hidden scale folds into eps.
-        norm([b.ple, b.pli, b.proj, w.at("per_layer_norm"), 0], [0, 0], [pl, l], [eps * h as f32, std::f32::consts::FRAC_1_SQRT_2]),
-        norm([b.x[0], 0, 0, 0, w.at("0.input_layernorm")], b.q, [h, 1], [eps, 1.0]),
-    ];
+    let mut ops = vec![embed(w.mat("embed"), b.token[0], b.x[0], bf16((h as f32).sqrt()))];
+    if pl > 0 {
+        ops.extend([
+            embed(hw.mat("embed_per_layer"), b.token[0], b.ple, (pl as f32).sqrt()),
+            norm([b.x[0], 0, 0, 0, 0], b.q, [h, 1], [eps, 1.0]),
+            gemv(w.mat("per_layer_proj"), b.q, b.proj),
+            // rmsnorm(c·y) is rmsnorm(y) with eps / c²: the projection's 1/√hidden scale folds into eps.
+            norm([b.ple, b.pli, b.proj, w.at("per_layer_norm"), 0], [0, 0], [pl, l], [eps * h as f32, std::f32::consts::FRAC_1_SQRT_2]),
+        ]);
+    }
+    ops.push(norm([b.x[0], 0, 0, 0, w.at("0.input_layernorm")], b.q, [h, 1], [eps, 1.0]));
     for (i, &scalar) in scalars.iter().enumerate() {
         ops.extend(attention(cfg, w, b, i, sms));
         ops.extend(mlp(cfg, w, b, i, scalar));
@@ -575,40 +585,64 @@ fn step(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, scalars: &[f32], sms: u3
     ops
 }
 
-/// Layer `i`'s attention, from its normalized input in `q` to the residual stream in `x[(i + 1) % 2]` and the
-/// MLP's normalized input in `q`.
+/// The residual stream buffers layer `i` reads from and writes its attention to: with per-layer inputs a layer
+/// writes the stream three times and they alternate per layer; without, twice, and every layer starts in `x[0]`.
+pub(super) fn residual(cfg: &Config, x: [u64; 2], i: usize) -> (u64, u64) {
+    let c = if cfg.per_layer > 0 { i % 2 } else { 0 };
+    (x[c], x[1 - c])
+}
+
+/// Layer `i`'s attention, from its normalized input in `q` to the residual stream's other buffer (see [`residual`])
+/// and the MLP's normalized input in `q`.
 fn attention(cfg: &Config, w: &Weights, b: &Bufs, i: usize, sms: u32) -> Vec<Op> {
     let (g, n) = (usize::from(cfg.global[i]), |name: &str| w.at(&format!("{i}.{name}")));
-    let (d, blocks, fresh) = (cfg.head_dim[g], (cfg.heads / 4) as u32, cfg.source(i) == i);
+    let (d, per, fresh) = (cfg.head_dim[g], cfg.per_block(g), cfg.source(i) == i);
+    let blocks = cfg.heads as u32 / per;
     let (cap, win, splits) = if g == 1 { (b.context, b.context, sms / blocks) } else { (b.ring, cfg.window as u32, 2 * sms / blocks) };
     let ptrs = [b.qkv, n("q_norm"), if fresh { n("k_norm") } else { 0 }, b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]];
     let args =
-        ptrs.map(A::P).into_iter().chain([cap, win, u32::from(fresh), cfg.group()].map(A::U)).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
-    let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
+        ptrs.map(A::P).into_iter().chain([cap, win, u32::from(fresh), cfg.group(g)].map(A::U)).chain([b.partial[0], b.count[0], b.q[0], b.q[1]].map(A::P));
+    let (x0, x1) = residual(cfg, b.x, i);
     vec![
         gemv(w.mat(&format!("{i}.qkv")), b.q, b.qkv),
-        (if d == 256 { ATTEND_256 } else { ATTEND_512 }, [blocks, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
+        (attend_kernel(d, per), [blocks, splits.clamp(1, 256), 1], 32 * ATTEND_WARPS, args.collect()),
         gemv(w.mat(&format!("{i}.o")), b.q, b.y),
         norm([x0, x1, b.y, n("post_attention_layernorm"), n("pre_feedforward_layernorm")], b.q, [cfg.hidden, 1], [cfg.eps, 1.0]),
     ]
 }
 
-/// Layer `i`'s MLP and per-layer input, from the residual stream in `x[(i + 1) % 2]` back to it, times `scalar`,
-/// with the next layer's normalized input (or the final norm's) in `q`.
+/// The decode attention kernel for heads of `d`, `per` query heads a block.
+fn attend_kernel(d: usize, per: u32) -> &'static str {
+    match (d, per) {
+        (256, 2) => ATTEND_256_PAIRS,
+        (256, _) => ATTEND_256,
+        _ => ATTEND_512,
+    }
+}
+
+/// Layer `i`'s MLP and per-layer input, from the residual stream's other buffer (see [`residual`]) to the next
+/// layer's, times `scalar`, with the next layer's normalized input (or the final norm's) in `q`.
 fn mlp(cfg: &Config, w: &Weights, b: &Bufs, i: usize, scalar: f32) -> Vec<Op> {
     let (h, eps, n) = (cfg.hidden, cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
-    let (x0, x1) = (b.x[i % 2], b.x[(i + 1) % 2]);
+    let (x0, x1) = residual(cfg, b.x, i);
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
-    vec![
+    let mut ops = vec![
         gemv(w.mat(&format!("{i}.gate_up")), b.q, b.y),
         geglu(b.y, b.y + 4 * cfg.mlp(i) as u64, b.q, cfg.mlp(i)),
         gemv(w.mat(&format!("{i}.down")), b.q, b.y),
+    ];
+    if cfg.per_layer == 0 {
+        ops.push(norm([x1, x0, b.y, n("post_feedforward_layernorm"), next], b.q, [h, 1], [eps, scalar]));
+        return ops;
+    }
+    ops.extend([
         norm([x1, x0, b.y, n("post_feedforward_layernorm"), 0], b.q, [h, 1], [eps, 1.0]),
         gemv(w.mat(&format!("{i}.per_layer_gate")), b.q, b.y),
         geglu(b.y, b.pli + 4 * (i * cfg.per_layer) as u64, b.q, cfg.per_layer),
         gemv(w.mat(&format!("{i}.per_layer_proj")), b.q, b.y),
         norm([x0, x1, b.y, n("post_per_layer_input_norm"), next], b.q, [h, 1], [eps, scalar]),
-    ]
+    ]);
+    ops
 }
 
 /// `v` rounded to bfloat16, as Gemma's embedding scale is applied.

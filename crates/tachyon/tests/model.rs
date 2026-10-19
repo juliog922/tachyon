@@ -35,7 +35,7 @@ fn tiny_checkpoint_converts_without_loss() {
     let cfg = Config::from_json(&std::fs::read(dst.join("config.json")).unwrap()).unwrap();
     assert_eq!((cfg.hidden, cfg.layers(), cfg.head_dim, cfg.window, cfg.softcap), (256, 6, [256, 512], 8, 30.0));
     assert_eq!((0..6).map(|i| cfg.source(i)).collect::<Vec<_>>(), [0, 1, 2, 3, 3, 2]);
-    assert_eq!(((0..6).map(|i| cfg.mlp(i)).collect::<Vec<_>>(), cfg.group()), (vec![512, 512, 512, 512, 1024, 1024], 2), "E2B's wide shared layers");
+    assert_eq!(((0..6).map(|i| cfg.mlp(i)).collect::<Vec<_>>(), cfg.group(0)), (vec![512, 512, 512, 512, 1024, 1024], 2), "E2B's wide shared layers");
     let source: std::collections::HashMap<String, Vec<f32>> = tiny::tensors(1, tiny::E2B).into_iter().map(|(n, _, v)| (n, v)).collect();
     let p = "model.language_model.";
     assert_eq!(dequant(&dst, "weights.wpk", "embed"), source[&format!("{p}embed_tokens.weight")]);
@@ -51,27 +51,54 @@ fn tiny_checkpoint_converts_without_loss() {
     std::fs::remove_dir_all(src).unwrap();
 }
 
+/// The larger models' layout: no per-layer inputs (an empty host table), no shared caches, global layers whose
+/// values are their keys (the key projection stacked twice) with their own count of key-value heads.
 #[test]
-fn larger_models_features_are_refused_by_name() {
+fn dense_checkpoint_converts_without_loss() {
+    let src = common::tiny::checkpoint("convert-dense", 1, tiny::DENSE);
+    let dst = src.join("out");
+    convert(&src, &dst).unwrap();
+    let cfg = Config::from_json(&std::fs::read(dst.join("config.json")).unwrap()).unwrap();
+    assert_eq!((cfg.kv_heads, cfg.per_layer, cfg.shared), ([4, 1], 0, 0));
+    assert_eq!((cfg.per_block(0), cfg.group(0), cfg.per_block(1), cfg.group(1)), (2, 1, 4, 2), "pairs in sliding layers, two blocks of four in global ones");
+    assert_eq!((0..6).map(|i| cfg.source(i)).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+    let source: std::collections::HashMap<String, Vec<f32>> = tiny::tensors(1, tiny::DENSE).into_iter().map(|(n, _, v)| (n, v)).collect();
+    let p = "model.language_model.";
+    let qkv = ["q", "k", "k"].map(|k| source[&format!("{p}layers.2.self_attn.{k}_proj.weight")].as_slice()).concat();
+    assert_eq!(dequant(&dst, "weights.wpk", "2.qkv"), qkv, "a global layer's values are its keys");
+    assert_eq!(dequant(&dst, "weights.wpk", "1.qkv").len(), (8 + 2 * 4) * 256 * 256, "a sliding layer's own values");
+    assert!(Wpk::open(dst.join("weights.wpk")).unwrap().tensor("0.per_layer_gate.w").is_none());
+    assert_eq!(Wpk::open(dst.join("host.wpk")).unwrap().data_len(), 0, "no per-layer table");
+    std::fs::remove_dir_all(src).unwrap();
+}
+
+#[test]
+fn unsupported_features_are_refused_by_name() {
     let base = tiny::config(tiny::E4B);
     let refused = |from: &str, to: &str| match Config::from_json(base.replace(from, to).as_bytes()) {
         Err(tachyon::Error::Unsupported(what)) => what,
         other => panic!("{to}: {other:?}"),
     };
     assert!(refused(r#""enable_moe_block":false"#, r#""enable_moe_block":true"#).contains("mixture-of-experts"));
-    assert!(refused(r#""attention_k_eq_v":false"#, r#""attention_k_eq_v":true"#).contains("values equal to keys"));
-    assert!(refused(r#""hidden_size_per_layer_input":256"#, r#""hidden_size_per_layer_input":0"#).contains("per-layer inputs"));
-    assert!(refused(r#""num_key_value_heads":2"#, r#""num_key_value_heads":2,"num_global_key_value_heads":1"#).contains("global layers"));
-    assert!(refused(r#""num_key_value_heads":2"#, r#""num_key_value_heads":4"#).contains("four query heads"));
+    assert!(refused(r#""num_key_value_heads":2"#, r#""num_key_value_heads":8"#).contains("fewer than two"));
 }
 
-/// The tiny model on the GPU against the CPU reference in `f32`: after each of 20 tokens (past the 8-position sliding
-/// window), the logits agree within the error of Q8 activations and an `f16` cache (about 2% RMS), and the greedy
+/// The tiny model on the GPU against the CPU reference in `f32`, in E4B's shape and the larger models': after each of 20 tokens (past the 8-position sliding
+/// window), the logits agree within the error of Q8 activations and an `f16` cache (2–4.2% RMS measured over the
+/// shapes and positions, bound at 5%), and the greedy
 /// pick is the reference's best or within that error of it.
 #[cfg(feature = "gpu")]
 #[test]
 fn tiny_model_decodes_as_the_reference() {
-    let src = common::tiny::checkpoint("decode", 2, tiny::E4B);
+    for shape in [("decode", tiny::E4B), ("decode-dense", tiny::DENSE)] {
+        decodes_as_the_reference(shape);
+    }
+}
+
+/// [`tiny_model_decodes_as_the_reference`] for one shape.
+#[cfg(feature = "gpu")]
+fn decodes_as_the_reference((name, shape): (&str, tiny::Shape)) {
+    let src = common::tiny::checkpoint(name, 2, shape);
     let dst = src.join("out");
     convert(&src, &dst).unwrap();
     let ctx = tachyon::cuda::Context::new(0).unwrap();
@@ -79,13 +106,13 @@ fn tiny_model_decodes_as_the_reference() {
     dec.reset(&tachyon::ptx::Sampling::default()).unwrap();
     let tokens: Vec<u32> = (0..20).map(|i| (i * 797 + 11) % tiny::VOCAB as u32).collect();
     let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();
-    for (pos, (&tok, want)) in tokens.iter().zip(tiny::reference(2, tiny::E4B, &tokens)).enumerate() {
+    for (pos, (&tok, want)) in tokens.iter().zip(tiny::reference(2, shape, &tokens)).enumerate() {
         let picked = dec.step(tok).unwrap() as usize;
         let got = dec.logits().unwrap();
         let (scale, err) = (rms(&mut want.iter().copied()), rms(&mut got.iter().zip(&want).map(|(a, b)| a - b)));
         let best = (0..want.len()).fold(0, |b, i| if want[i] > want[b] { i } else { b });
-        assert!(err <= 0.04 * scale, "position {pos}: logits differ by {err} RMS (logits {scale} RMS)");
-        assert!(want[picked] >= want[best] - 3.0 * err, "position {pos}: picked {picked} ({}), reference {best} ({})", want[picked], want[best]);
+        assert!(err <= 0.05 * scale, "{name}, position {pos}: logits differ by {err} RMS (logits {scale} RMS)");
+        assert!(want[picked] >= want[best] - 3.0 * err, "{name}, position {pos}: picked {picked} ({}), reference {best} ({})", want[picked], want[best]);
     }
     // Generating with a step always queued gives the same tokens as stepping one at a time.
     let mut runs = [Vec::new(), Vec::new()];
@@ -109,13 +136,14 @@ fn tiny_model_decodes_as_the_reference() {
     std::fs::remove_dir_all(src).unwrap();
 }
 
-/// Prefill of the tiny model, in E4B's shape and in E2B's: 19 tokens through prefill and the 20th through a decode
-/// step give the logits of the CPU reference (within the error of Q8P activations and an `f16` cache), and the same
+/// Prefill of the tiny model, in E4B's shape, E2B's and the larger models' ([`tiny::DENSE`]): 19 tokens through prefill and the 20th through a decode
+/// step give the logits of the CPU reference (within the error of Q8P activations and an `f16` cache: 2–4% RMS
+/// measured, bound at 5%), and the same
 /// logits, bit for bit, whether prefill runs them in chunks of 8 (so sliding caches wrap their ring) or all at once.
 #[cfg(feature = "gpu")]
 #[test]
 fn tiny_model_prefills_as_the_reference_in_any_chunks() {
-    for (name, shape) in [("prefill-e4b", tiny::E4B), ("prefill-e2b", tiny::E2B)] {
+    for (name, shape) in [("prefill-e4b", tiny::E4B), ("prefill-e2b", tiny::E2B), ("prefill-dense", tiny::DENSE)] {
         let src = common::tiny::checkpoint(name, 4, shape);
         let dst = src.join("out");
         convert(&src, &dst).unwrap();
@@ -133,7 +161,7 @@ fn tiny_model_prefills_as_the_reference_in_any_chunks() {
         let want = tiny::reference(4, shape, &tokens).pop().unwrap();
         let rms = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt() / (tiny::VOCAB as f32).sqrt();
         let (scale, err) = (rms(&mut want.iter().copied()), rms(&mut whole.iter().zip(&want).map(|(a, b)| a - b)));
-        assert!(err <= 0.04 * scale, "{name}: logits differ by {err} RMS (logits {scale} RMS)");
+        assert!(err <= 0.05 * scale, "{name}: logits differ by {err} RMS (logits {scale} RMS)");
         std::fs::remove_dir_all(src).unwrap();
     }
 }

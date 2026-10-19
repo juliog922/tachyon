@@ -23,7 +23,7 @@
 //!   `h_out` (another buffer: every block reads all of `h`); then Q8 out of `w2 ⊙ rmsnorm(h')`, or of `h'` when
 //!   `w2` is null, where `h'` is `h` when `y` is null; no Q8 when `q` is null. `rmsnorm(x) = x / √(mean(x²) + eps)`.
 //!   Arguments: `h, h_out, y, w1, w2: *f32`, Q8 out, `len: u32, eps: f32, scale: f32`. `len` is a multiple of
-//!   [`NORM_THREADS`] up to 16 times it; vectors may hold several chunks of `len`, each normalized on its own with
+//!   [`NORM_THREADS`] up to 24 times it; vectors may hold several chunks of `len`, each normalized on its own with
 //!   the same weights. Launch a grid of `(len / NORM_THREADS, chunks)` blocks of [`NORM_THREADS`]: every block
 //!   reduces its whole chunk and writes one slice of it, so a vector spreads over several multiprocessors.
 //! - [`EMBED_Q4`] dequantizes row `*token` of a Q4 table: `out[i] = w[token, i] · scale`; with a grid `y` of
@@ -47,14 +47,14 @@ pub mod gemv;
 pub mod sample;
 pub mod vision;
 
-pub use attend::{ATTEND_256, ATTEND_512, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, QUERY_256, QUERY_512, rope};
+pub use attend::{ATTEND_256, ATTEND_256_PAIRS, ATTEND_512, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, QUERY_256, QUERY_512, rope};
 pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
 pub use encoder::{
     ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_TALL, GEMM_F16, GEMM_F16_128,
     GEMM_F16_TALL, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_TALL, NORM_F16, QUANT_F16, ROPE_F16,
 };
 use encoder::{LARGE, Operands, SMALL, TALL};
-pub use flash::{FLASH_256, FLASH_512, shared};
+pub use flash::{FLASH_256, FLASH_256_PAIRS, FLASH_512, shared};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H, SUM_SLICES, slices};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -97,9 +97,10 @@ pub fn module() -> String {
         gemm::gemm_q4(),
         gemm::PEAKS.map(gemm::mma_peak).concat(),
         attend::query(256) + &attend::query(512),
-        flash::flash(256) + &flash::flash(512),
-        attend::attend(256),
-        attend::attend(512),
+        flash::flash(256, 4) + &flash::flash(512, 4) + &flash::flash(256, 2),
+        attend::attend(256, 4),
+        attend::attend(512, 4),
+        attend::attend(256, 2),
         attend::store(256),
         attend::store(512),
         SPIN_PTX.into(),
@@ -344,7 +345,7 @@ fn quant(name: &str, gate: &str) -> String {
 }
 
 /// Values of [`NORM_Q8`] each thread reads: rows of up to `16 · NORM_THREADS`.
-const PER_THREAD: usize = 16;
+const PER_THREAD: usize = 24;
 
 /// [`NORM_Q8`]. Every block reads its whole chunk, `LOADS` putting value `k` of this thread in `%h{k}`, `%y{k}`
 /// and `%a{k}` (`w1 ⊙ y`), and `SUM` reduces Σy², Σh², Σh·a and Σa² at once: the new `h` is `(h + r·a)·scale`,
@@ -354,9 +355,9 @@ const NORM: &str = "
 .visible .entry norm_q8(.param .u64 ph, .param .u64 pho, .param .u64 py, .param .u64 pw1, .param .u64 pw2, .param .u64 pq, .param .u64 ps,
                         .param .u32 plen, .param .f32 peps, .param .f32 pscale)
 {
-    .reg .pred %hy, %hw, %hq, %t, %p<16>;
+    .reg .pred %hy, %hw, %hq, %t, %p<24>;
     .reg .b32 %len, %base, %slice, %own, %gi;
-    .reg .f32 %ss, %sh, %su, %uu, %r, %x, %w, %eps, %scale, %n, %h<16>, %y<16>, %a<16>;
+    .reg .f32 %ss, %sh, %su, %uu, %r, %x, %w, %eps, %scale, %n, %h<24>, %y<24>, %a<24>;
     .reg .b64 %hp, %ho, %yp, %w1, %w2, %ah, %ao, %ay, %aw, %ad;
 BLOCK Q8
     ld.param.u32 %len, [plen];

@@ -2,9 +2,10 @@
 //! queries sharing each key and value they read.
 //!
 //! [`FLASH_256`] and [`FLASH_512`] take the queries as [`super::QUERY_256`] leaves them (`f16 [tokens][H][D]`,
-//! normalized and rotated) and the cache as [`super::KV_256`] fills it (`f16 [Hkv][cap][D]`, the chunk's own keys
 //! and values already in). A block takes a tile of tokens × the four query heads of block row `ctaid.y` (all of
 //! key-value head `ctaid.y / group`): 16 tokens for heads of 256, 8 for heads of 512, one row per token and head.
+//! [`FLASH_256_PAIRS`] takes two query heads a block, for models whose key-value heads serve only two (Gemma 4's
+//! larger models' sliding layers): 32 tokens a block.
 //! It walks the keys the tile can see, from the oldest position its first token sees to its last token, a tile of
 //! keys at a time (32 for heads of 256, 16 for 512): with `mma` (`m16n8k16`, `f16` in, `f32` sums) the scores `Q·Kᵀ`, masked to each
 //! row's window (`p − window < j ≤ p`; tiles start at multiples of their size, so a token's sums do not depend on
@@ -16,8 +17,9 @@
 //! windows are longest. Out: `f32 [tokens][H·D]`, rows past `tokens` not written.
 //!
 //! Arguments: `q, k_cache, v_cache: u64`, `pos: *const u32` (the chunk's first position), `cap, window, group,
-//! tokens: u32`, `y: u64`. Launch a grid of `(tokens.div_ceil(T), H / 4)` blocks of [`Shape::threads`] with
-//! [`shared`] bytes of dynamic shared memory, `T` = [`Shape::tokens`]; the queries' buffer holds whole tiles.
+//! tokens: u32`, `y: u64`. Launch a grid of `(tokens.div_ceil(T), H / P)` blocks of [`Shape::threads`] with
+//! [`shared`] bytes of dynamic shared memory, `T` = [`Shape::tokens`], `P` the heads a block takes (4, or 2 for
+//! [`FLASH_256_PAIRS`]); the queries' buffer holds whole tiles.
 
 use std::fmt::Write;
 
@@ -25,27 +27,43 @@ use std::fmt::Write;
 pub const FLASH_256: &str = "flash_256";
 /// Name of the prefill attention on tensor cores, heads of 512.
 pub const FLASH_512: &str = "flash_512";
+/// Name of the prefill attention on tensor cores, heads of 256, two query heads a block.
+pub const FLASH_256_PAIRS: &str = "flash_256_2";
 
-/// A block of [`FLASH_256`] or [`FLASH_512`]: head size, tiles of 16 rows, keys per step.
+/// A block of [`FLASH_256`], [`FLASH_512`] or [`FLASH_256_PAIRS`]: head size, query heads, tiles of 16 rows, keys
+/// per step.
 #[derive(Clone, Copy)]
 pub struct Shape {
     d: usize,
+    per: usize,
     tiles: usize,
     keys: usize,
 }
 
 impl Shape {
-    /// The shape of the kernel for heads of `d`: four tiles of rows and 32 keys a step for 256, two and 16 for 512,
-    /// so the queries, keys and values fit in shared memory and a thread's sums in registers.
+    /// The shape of the kernel for heads of `d`, `per` (4 or 2) query heads a block: four tiles of rows and 32 keys
+    /// a step for 256, two and 16 for 512, so the queries, keys and values fit in shared memory and a thread's sums
+    /// in registers.
     #[must_use]
-    pub const fn of(d: usize) -> Shape {
-        if d == 256 { Shape { d, tiles: 4, keys: 32 } } else { Shape { d, tiles: 2, keys: 16 } }
+    pub const fn of(d: usize, per: u32) -> Shape {
+        let per = per as usize;
+        if d == 256 { Shape { d, per, tiles: 4, keys: 32 } } else { Shape { d, per, tiles: 2, keys: 16 } }
     }
 
-    /// Tokens per block: a row per token and each of four heads.
+    /// The kernel's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match (self.d, self.per) {
+            (256, 2) => FLASH_256_PAIRS,
+            (256, _) => FLASH_256,
+            _ => FLASH_512,
+        }
+    }
+
+    /// Tokens per block: a row per token and each of its heads.
     #[must_use]
     pub const fn tokens(self) -> u32 {
-        4 * self.tiles as u32
+        (16 * self.tiles / self.per) as u32
     }
 
     /// Threads per block: two warps per tile of rows.
@@ -67,12 +85,12 @@ impl Shape {
     }
 }
 
-/// The bytes of dynamic shared memory [`FLASH_256`] or [`FLASH_512`] takes; 0 for any other kernel.
+/// The bytes of dynamic shared memory a flash kernel takes; 0 for any other kernel.
 #[must_use]
 pub fn shared(name: &str) -> u32 {
     match name {
-        FLASH_256 => Shape::of(256).layout().2 as u32,
-        FLASH_512 => Shape::of(512).layout().2 as u32,
+        FLASH_256 | FLASH_256_PAIRS => Shape::of(256, 4).layout().2 as u32,
+        FLASH_512 => Shape::of(512, 4).layout().2 as u32,
         _ => 0,
     }
 }
@@ -95,7 +113,7 @@ const HEAD: &str = "
     mul.lo.u32 %tok0, %x, TOKENS;
     mov.u32 %hg, %ctaid.y;
     mov.u32 %nh, %nctaid.y;
-    shl.b32 %nh, %nh, 2;
+    shl.b32 %nh, %nh, PSHIFT;
     ld.param.u32 %x, [pgroup];
     div.u32 %kvh, %hg, %x;
     ld.param.u32 %n, [ptok];
@@ -115,10 +133,10 @@ const HEAD: &str = "
     add.u32 %hi, %pos0, %y;
     sub.u32 %hi, %hi, 1;
     mad.lo.u32 %x, %rt, 16, %g;
-    shr.u32 %x, %x, 2;
+    shr.u32 %x, %x, PSHIFT;
     add.u32 %pr0, %pos0, %tok0;
     add.u32 %pr0, %pr0, %x;
-    add.u32 %pr1, %pr0, 2;
+    add.u32 %pr1, %pr0, RSTEP;
     ld.param.u64 %qp, [pq];
     cvta.to.global.u64 %qp, %qp;
     ld.param.u64 %kc, [pkc];
@@ -148,13 +166,17 @@ fn fragments(s: &mut String, sh: Shape) {
 }
 
 /// Queues the copy of this thread's share of the queries: column `%col` (16 bytes) of rows `%r0 + step·i`, row
-/// `r` being token `%tok0 + r / 4` and head `4·%hg + r % 4`.
+/// `r` being token `%tok0 + r / P` and head `P·%hg + r % P`, `P` the heads a block takes.
 fn queries(s: &mut String, sh: Shape) {
     let (step, rows) = (sh.threads() as usize / (sh.d / 8), 16 * sh.tiles);
     for i in 0..rows / step {
-        let _ = writeln!(s, "    add.u32 %x, %r0, {};\n    shr.u32 %y, %x, 2;\n    add.u32 %y, %y, %tok0;\n    and.b32 %j, %x, 3;", step * i);
-        let _ =
-            writeln!(s, "    mad.lo.u32 %y, %y, %nh, %j;\n    mad.lo.u32 %y, %hg, 4, %y;\n    mul.lo.u32 %y, %y, {};\n    mad.lo.u32 %y, %col, 8, %y;", sh.d);
+        let (shift, per) = (sh.per.trailing_zeros(), sh.per);
+        let _ = writeln!(s, "    add.u32 %x, %r0, {};\n    shr.u32 %y, %x, {shift};\n    add.u32 %y, %y, %tok0;\n    and.b32 %j, %x, {};", step * i, per - 1);
+        let _ = writeln!(
+            s,
+            "    mad.lo.u32 %y, %y, %nh, %j;\n    mad.lo.u32 %y, %hg, {per}, %y;\n    mul.lo.u32 %y, %y, {};\n    mad.lo.u32 %y, %col, 8, %y;",
+            sh.d
+        );
         let _ =
             writeln!(s, "    mul.wide.u32 %o, %y, 2;\n    add.u64 %a, %qp, %o;\n    mad.lo.u32 %x, %x, {}, %sm;\n    mad.lo.u32 %x, %col, 16, %x;", sh.row());
         s.push_str("    cp.async.cg.shared.global [%x], [%a], 16;\n");
@@ -277,9 +299,11 @@ fn store(s: &mut String, sh: Shape) {
     for row in 0..2 {
         let _ = writeln!(s, "    shfl.sync.bfly.b32 %f, %l{row}, 1, 31, -1;\n    add.f32 %l{row}, %l{row}, %f;");
         let _ = writeln!(s, "    shfl.sync.bfly.b32 %f, %l{row}, 2, 31, -1;\n    add.f32 %l{row}, %l{row}, %f;\n    rcp.rn.f32 %l{row}, %l{row};");
-        // Row `r` of the block is token `%tok0 + r / 4`, head `4·%hg + r % 4`; row `g + 8` is two tokens on.
-        let _ = writeln!(s, "    mad.lo.u32 %x, %rt, 16, %g;\n    add.u32 %x, %x, {};\n    shr.u32 %y, %x, 2;\n    add.u32 %y, %y, %tok0;", 8 * row);
-        s.push_str("    setp.lt.u32 %p, %y, %n;\n    and.b32 %j, %x, 3;\n    mad.lo.u32 %y, %y, %nh, %j;\n    mad.lo.u32 %y, %hg, 4, %y;\n");
+        // Row `r` of the block is token `%tok0 + r / P`, head `P·%hg + r % P`; row `g + 8` is `8 / P` tokens on.
+        let (shift, per) = (sh.per.trailing_zeros(), sh.per);
+        let _ = writeln!(s, "    mad.lo.u32 %x, %rt, 16, %g;\n    add.u32 %x, %x, {};\n    shr.u32 %y, %x, {shift};\n    add.u32 %y, %y, %tok0;", 8 * row);
+        let _ =
+            writeln!(s, "    setp.lt.u32 %p, %y, %n;\n    and.b32 %j, %x, {};\n    mad.lo.u32 %y, %y, %nh, %j;\n    mad.lo.u32 %y, %hg, {per}, %y;", per - 1);
         let _ = writeln!(s, "    mul.lo.u32 %y, %y, {};\n    mad.lo.u32 %y, %half, {}, %y;\n    mad.lo.u32 %y, %t, 2, %y;", sh.d, sh.d / 2);
         s.push_str("    mul.wide.u32 %o, %y, 4;\n    add.u64 %b, %a, %o;\n");
         for n in 0..sh.d / 16 {
@@ -294,13 +318,13 @@ const LOG2E: &str = "0f3FB8AA3B";
 const LOG2E_NEG: &str = "0fBFB8AA3B";
 const NEG_INF: &str = "0fFF800000";
 
-/// [`FLASH_256`] or [`FLASH_512`], for heads of `d`.
-pub(super) fn flash(d: usize) -> String {
-    let sh = Shape::of(d);
+/// The flash kernel for heads of `d`, `per` query heads a block.
+pub(super) fn flash(d: usize, per: u32) -> String {
+    let sh = Shape::of(d, per);
     let (k_at, v_at, _) = sh.layout();
     let mut s = format!(
         ".extern .shared .align 16 .b8 fsmem[];
-.visible .entry flash_{d}(.param .u64 pq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap, .param .u32 pwin,
+.visible .entry {}(.param .u64 pq, .param .u64 pkc, .param .u64 pvc, .param .u64 ppos, .param .u32 pcap, .param .u32 pwin,
     .param .u32 pgroup, .param .u32 ptok, .param .u64 py)
     .maxntid {}, 1, 1
 {{
@@ -309,6 +333,7 @@ pub(super) fn flash(d: usize) -> String {
     .reg .b32 %pr0, %pr1, %sm, %col, %r0, %fq, %fk, %fv, %qa<4>, %kb<4>, %vb<4>, %pa<{}>;
     .reg .f32 %s<{}>, %o<{}>, %m<2>, %l<2>, %al<2>, %mx, %mu, %f;
     .reg .b64 %qp, %kc, %vc, %a, %b, %o;",
+        sh.name(),
         sh.threads(),
         sh.keys / 4,
         sh.keys / 2,
@@ -317,6 +342,8 @@ pub(super) fn flash(d: usize) -> String {
     let cols = sh.d / 8;
     s += &HEAD
         .replace("TOKENS", &sh.tokens().to_string())
+        .replace("PSHIFT", &sh.per.trailing_zeros().to_string())
+        .replace("RSTEP", &(8 / sh.per).to_string())
         .replace("COLMASK", &(cols - 1).to_string())
         .replace("COLSHIFT", &cols.trailing_zeros().to_string())
         .replace("KEYMASK", &format!("0x{:08X}", !(sh.keys as u32 - 1)));

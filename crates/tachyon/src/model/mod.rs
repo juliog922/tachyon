@@ -31,11 +31,11 @@ pub struct Config {
     pub ffn: usize,
     /// Query heads.
     pub heads: usize,
-    /// Key-value heads.
-    pub kv_heads: usize,
+    /// Key-value heads of sliding layers, and of global ones (Gemma 4's larger models have fewer in global layers).
+    pub kv_heads: [usize; 2],
     /// Head size of sliding layers, and of global ones.
     pub head_dim: [usize; 2],
-    /// Width of each layer's per-layer input.
+    /// Width of each layer's per-layer input; 0 for a model without them (12B, 26B A4B, 31B).
     pub per_layer: usize,
     /// Tokens.
     pub vocab: usize,
@@ -76,14 +76,16 @@ impl Config {
         let c = doc.get("text_config").unwrap_or(&doc);
         let n: Vec<f64> =
             INTS.iter().map(|k| c.get(k).and_then(Json::num).ok_or_else(|| Error::Format(format!("config.json: no {k}")))).collect::<Result<_>>()?;
-        unsupported(c, &n)?;
+        let global_kv = c.get("num_global_key_value_heads").and_then(Json::num).map_or(n[3] as usize, |g| g as usize);
+        let kv_heads = [n[3] as usize, global_kv];
+        unsupported(c, n[2] as usize, kv_heads)?;
         let rope = |kind: &str, k: &str, or: f64| c.get("rope_parameters").and_then(|r| r.get(kind)?.get(k)?.num()).unwrap_or(or) as f32;
         let types = c.get("layer_types").and_then(Json::arr).unwrap_or_default();
         Ok(Config {
             hidden: n[0] as usize,
             ffn: n[1] as usize,
             heads: n[2] as usize,
-            kv_heads: n[3] as usize,
+            kv_heads,
             head_dim: [n[4] as usize, n[5] as usize],
             per_layer: n[6] as usize,
             vocab: n[7] as usize,
@@ -108,9 +110,20 @@ impl Config {
         self.ffn << usize::from(self.wide && self.shared < self.layers() && i >= self.layers() - self.shared)
     }
 
-    /// Attention blocks per key-value head: each takes four query heads.
-    pub fn group(&self) -> u32 {
-        (self.heads / 4 / self.kv_heads) as u32
+    /// Key-value heads of layer `i`.
+    pub fn kv(&self, i: usize) -> usize {
+        self.kv_heads[usize::from(self.global[i])]
+    }
+
+    /// Query heads an attention block takes in layers of kind `g` (0 sliding, 1 global), all of one key-value head:
+    /// four, or two where a key-value head serves only two (the larger models' sliding layers).
+    pub fn per_block(&self, g: usize) -> u32 {
+        if self.heads / self.kv_heads[g] >= 4 { 4 } else { 2 }
+    }
+
+    /// Attention blocks per key-value head in layers of kind `g`.
+    pub fn group(&self, g: usize) -> u32 {
+        (self.heads / self.kv_heads[g]) as u32 / self.per_block(g)
     }
 
     /// The layer whose keys and values layer `i` attends over: itself, or for a shared layer the last unshared
@@ -121,17 +134,13 @@ impl Config {
     }
 }
 
-/// Refuses, as [`Error::Unsupported`], what Gemma 4's larger models add (step 12 brings it): `c` is the decoder's
-/// configuration, `n` the numbers [`Config::from_json`] read from it.
-fn unsupported(c: &Json, n: &[f64]) -> Result<()> {
+/// Refuses, as [`Error::Unsupported`], what Gemma 4's 26B A4B adds (step 12b brings it), and head counts the
+/// attention kernels do not take: `c` is the decoder's configuration.
+fn unsupported(c: &Json, heads: usize, kv: [usize; 2]) -> Result<()> {
     let on = |k: &str| c.get(k).and_then(Json::bool) == Some(true);
-    let (global_kv, [heads, kv]) = (c.get("num_global_key_value_heads").and_then(Json::num), [n[2] as usize, n[3] as usize]);
     let features = [
         (on("enable_moe_block"), "a mixture-of-experts block (26B A4B)"),
-        (on("attention_k_eq_v"), "values equal to keys in global layers (26B A4B, 31B)"),
-        (n[6] == 0.0, "layers without per-layer inputs (26B A4B, 31B)"),
-        (global_kv.is_some_and(|g| g as usize != kv), "a different number of key-value heads in global layers (26B A4B, 31B)"),
-        (kv == 0 || heads % (4 * kv) != 0, "fewer than four query heads per key-value head (26B A4B, 31B)"),
+        (kv.iter().any(|&k| k == 0 || heads % k != 0 || (heads / k) % 2 != 0), "a key-value head serving fewer than two query heads, or an odd number"),
     ];
     features.iter().find(|f| f.0).map_or(Ok(()), |f| Err(Error::Unsupported(f.1.into())))
 }
@@ -154,10 +163,14 @@ pub fn convert(src: &Path, dst: &Path) -> Result<()> {
 fn weights(dst: &Path, st: &Safetensors, cfg: &Config, p: &str) -> Result<()> {
     let mut w = Writer::create(dst.join("weights.wpk"))?;
     for (name, source) in [("embed", "embed_tokens"), ("per_layer_proj", "per_layer_model_projection")] {
-        matrix(&mut w, st, name, &[format!("{p}{source}.weight")])?;
+        if st.has(&format!("{p}{source}.weight")) {
+            matrix(&mut w, st, name, &[format!("{p}{source}.weight")])?;
+        }
     }
     for (name, source) in [("per_layer_norm", "per_layer_projection_norm"), ("norm", "norm")] {
-        vector(&mut w, st, name, &format!("{p}{source}.weight"))?;
+        if st.has(&format!("{p}{source}.weight")) {
+            vector(&mut w, st, name, &format!("{p}{source}.weight"))?;
+        }
     }
     for i in 0..cfg.layers() {
         layer(&mut w, st, &format!("{p}layers.{i}."), i, cfg.source(i) == i)?;
@@ -165,10 +178,13 @@ fn weights(dst: &Path, st: &Safetensors, cfg: &Config, p: &str) -> Result<()> {
     w.finish()
 }
 
-/// Writes `host.wpk` into `dst`.
+/// Writes `host.wpk` into `dst`: the per-layer embedding table, or nothing for a model without one.
 fn host(dst: &Path, st: &Safetensors, p: &str) -> Result<()> {
     let mut host = Writer::create(dst.join("host.wpk"))?;
-    matrix(&mut host, st, "embed_per_layer", &[format!("{p}embed_tokens_per_layer.weight")])?;
+    let table = format!("{p}embed_tokens_per_layer.weight");
+    if st.has(&table) {
+        matrix(&mut host, st, "embed_per_layer", &[table])?;
+    }
     host.finish()
 }
 
@@ -178,11 +194,15 @@ fn tokenizer(src: &Path, dst: &Path) -> Result<()> {
     Ok(std::fs::write(dst.join("tokenizer.tok"), tok.to_bytes())?)
 }
 
-/// Writes layer `i`, whose checkpoint names start with `l`; `kv` when it projects keys and values.
+/// Writes layer `i`, whose checkpoint names start with `l`; `kv` when it projects keys and values. A layer whose
+/// values are its keys (`attention_k_eq_v`: no `v_proj`) stacks the key projection twice, so the value is the
+/// projected key, normalized without a scale and not rotated, as Hugging Face has it.
 fn layer(w: &mut Writer, st: &Safetensors, l: &str, i: usize, kv: bool) -> Result<()> {
-    let qkv: &[&str] = if kv { &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] } else { &["self_attn.q_proj"] };
+    let v = if st.has(&format!("{l}self_attn.v_proj.weight")) { "self_attn.v_proj" } else { "self_attn.k_proj" };
+    let qkv: &[&str] = if kv { &["self_attn.q_proj", "self_attn.k_proj", v] } else { &["self_attn.q_proj"] };
     let fused = [("qkv", qkv), ("o", &["self_attn.o_proj"]), ("gate_up", &["mlp.gate_proj", "mlp.up_proj"]), ("down", &["mlp.down_proj"])];
-    for (name, parts) in fused.into_iter().chain([("per_layer_gate", &["per_layer_input_gate"][..]), ("per_layer_proj", &["per_layer_projection"])]) {
+    let per_layer = [("per_layer_gate", &["per_layer_input_gate"][..]), ("per_layer_proj", &["per_layer_projection"])];
+    for (name, parts) in fused.into_iter().chain(per_layer).filter(|(_, parts)| st.has(&format!("{l}{}.weight", parts[0]))) {
         matrix(w, st, &format!("{i}.{name}"), &parts.iter().map(|n| format!("{l}{n}.weight")).collect::<Vec<_>>())?;
     }
     let norms = ["self_attn.q_norm", "self_attn.k_norm", "input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm"];

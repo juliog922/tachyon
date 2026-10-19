@@ -5,6 +5,7 @@
 //! [`GEMM_Q4`] on Q8P activations, the keys and values stored by [`KV_256`] or [`KV_512`] and the queries by
 //! [`QUERY_256`] or [`QUERY_512`] before [`FLASH_256`] or [`FLASH_512`] attends on tensor cores (its `f32` out made
 //! Q8P by [`QUANT_Q8P`]), and the residual steps as [`NORM_Q8P`] and [`GEGLU_Q8P`].
+//! A model without per-layer inputs skips their kernels, and its layers start and end in the same residual buffer.
 //! Only the layers that write a cache run: the last [`super::Config::shared`] layers read earlier layers' caches
 //! and add nothing a later token needs, so a prompt's tokens but its last skip them (18 of E4B's 42 layers). The
 //! last token runs the decode step, which samples the first answer token. The chunk's kernels are launched
@@ -18,8 +19,8 @@
 use super::Config;
 use super::decode::{A, Bufs, Mat, Op, Weights};
 use crate::ptx::{
-    EMBED_Q4, FLASH_256, FLASH_512, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS, QUANT_Q8P, QUERY_256,
-    QUERY_512, SUM_SLICES, flash::Shape,
+    EMBED_Q4, GATHER_ROWS, GEGLU_Q8P, GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, KV_256, KV_512, NORM_Q8P, NORM_THREADS, QUANT_Q8P, QUERY_256, QUERY_512, SUM_SLICES,
+    flash::Shape,
 };
 
 /// Device addresses of prefill's buffers, each for a chunk of tokens: the residual stream (two), Q8P values and
@@ -40,12 +41,12 @@ pub(super) struct Chunk {
 
 /// Lays out prefill's buffers for `chunk` tokens with `take`, which returns the address of `len` new bytes.
 pub(super) fn layout(cfg: &Config, chunk: usize, take: &mut impl FnMut(usize) -> u64) -> Chunk {
-    let (d, kv, pl, f) = (cfg.head_dim[1], cfg.kv_heads, cfg.layers() * cfg.per_layer, 4 * chunk.next_multiple_of(GEMM_TOKENS as usize));
+    let (d, pl, f) = (cfg.head_dim[1], cfg.layers() * cfg.per_layer, 4 * chunk.next_multiple_of(GEMM_TOKENS as usize));
     let widest = cfg.hidden.max(cfg.mlp(cfg.layers() - 1)).max(cfg.heads * d).max(cfg.per_layer);
     let x = [take(f * cfg.hidden), take(f * cfg.hidden)];
     let q = [take(f / 4 * widest), take(f / 4 * widest / 8)];
     let room = (2 * cfg.mlp(cfg.layers() - 1)).max(cfg.hidden).max(pl).max(cfg.heads * d);
-    let (qkv, y) = (take(f * (cfg.heads + 2 * kv) * d), take(f * room));
+    let (qkv, y) = (take(f * super::decode::qkv_width(cfg)), take(f * room));
     let per_layer = [take(f * pl), take(f * pl), take(f * pl)];
     let attend = [take(f * cfg.heads / 4 * (8 + 4 * d)), take(f * cfg.heads / 4)];
     Chunk { x, q, qkv, y, per_layer, attend, ids: 0, room: room as u32, sms: 0 }
@@ -88,16 +89,13 @@ pub(super) fn ops(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, (c, scalars): 
     let [ple, pli, proj] = c.per_layer;
     let embed =
         |m: Mat, out, scale| (EMBED_Q4, [m.cols.div_ceil(256), n, 1], 256, vec![A::P(m.w[0]), A::P(m.w[1]), A::P(c.ids), A::P(out), A::U(m.cols), A::F(scale)]);
-    let mut ops = vec![
-        embed(w.mat("embed"), c.x[0], super::decode::bf16((h as f32).sqrt())),
-        embed(hw.mat("embed_per_layer"), ple, (pl as f32).sqrt()),
-        norm([c.x[0], 0, 0, 0, 0], c.q, h, n, [eps, 1.0]),
-    ];
-    ops.extend(gemm(w.mat("per_layer_proj"), c.q, proj, n, c));
-    ops.extend([
-        norm([ple, pli, proj, w.at("per_layer_norm"), 0], [0, 0], pl, n * l as u32, [eps * h as f32, std::f32::consts::FRAC_1_SQRT_2]),
-        norm([c.x[0], 0, 0, 0, w.at("0.input_layernorm")], c.q, h, n, [eps, 1.0]),
-    ]);
+    let mut ops = vec![embed(w.mat("embed"), c.x[0], super::decode::bf16((h as f32).sqrt()))];
+    if pl > 0 {
+        ops.extend([embed(hw.mat("embed_per_layer"), ple, (pl as f32).sqrt()), norm([c.x[0], 0, 0, 0, 0], c.q, h, n, [eps, 1.0])]);
+        ops.extend(gemm(w.mat("per_layer_proj"), c.q, proj, n, c));
+        ops.push(norm([ple, pli, proj, w.at("per_layer_norm"), 0], [0, 0], pl, n * l as u32, [eps * h as f32, std::f32::consts::FRAC_1_SQRT_2]));
+    }
+    ops.push(norm([c.x[0], 0, 0, 0, w.at("0.input_layernorm")], c.q, h, n, [eps, 1.0]));
     for (i, &scalar) in scalars.iter().enumerate().take(l - cfg.shared) {
         ops.extend(attention(cfg, w, b, c, i, n));
         ops.extend(mlp(cfg, w, c, [i, n as usize], scalar));
@@ -108,20 +106,20 @@ pub(super) fn ops(cfg: &Config, [w, hw]: [&Weights; 2], b: &Bufs, (c, scalars): 
 /// Layer `i`'s attention over the chunk, as [`super::decode`]'s, the keys and values stored first.
 fn attention(cfg: &Config, w: &Weights, b: &Bufs, c: &Chunk, i: usize, n: u32) -> Vec<Op> {
     let (g, at) = (usize::from(cfg.global[i]), |name: &str| w.at(&format!("{i}.{name}")));
-    let (d, kv) = (cfg.head_dim[g], cfg.kv_heads as u32);
+    let (d, kv, per) = (cfg.head_dim[g], cfg.kv_heads[g] as u32, cfg.per_block(g));
     let (cap, win) = if g == 1 { (b.context, b.context) } else { (b.ring, cfg.window as u32) };
     let (freq, kc, vc, pos) = (b.control[2 + g], b.kv[i][0], b.kv[i][1], b.control[0]);
-    let store = [c.qkv, at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter().chain([A::U(cap), A::U(cfg.group())]).collect();
-    let (heads, row, shape) = (cfg.heads as u32, ((cfg.heads + 2 * cfg.kv_heads) * d) as u32, Shape::of(d));
+    let (heads, row, shape) = (cfg.heads as u32, ((cfg.heads + 2 * cfg.kv_heads[g]) * d) as u32, Shape::of(d, per));
+    let store = [c.qkv, at("k_norm"), freq, kc, vc, pos].map(A::P).into_iter().chain([A::U(cap), A::U(heads / kv)]).collect();
     let query = [c.qkv, at("q_norm"), freq, c.attend[0], pos].map(A::P).into_iter().chain([A::U(row)]).collect();
-    let flash = [c.attend[0], kc, vc, pos].map(A::P).into_iter().chain([cap, win, cfg.group(), n].map(A::U)).chain([A::P(c.y)]).collect();
+    let flash = [c.attend[0], kc, vc, pos].map(A::P).into_iter().chain([cap, win, cfg.group(g), n].map(A::U)).chain([A::P(c.y)]).collect();
     let len = n * heads * d as u32;
     let quant = vec![A::P(c.y), A::P(c.q[0]), A::P(c.q[1]), A::U(len)];
-    let (x0, x1) = (c.x[i % 2], c.x[(i + 1) % 2]);
+    let (x0, x1) = super::decode::residual(cfg, c.x, i);
     let mut ops = gemm(w.mat(&format!("{i}.qkv")), c.q, c.qkv, n, c);
     ops.push((if d == 256 { KV_256 } else { KV_512 }, [kv, n, 1], 32, store));
     ops.push((if d == 256 { QUERY_256 } else { QUERY_512 }, [heads, n, 1], 32, query));
-    ops.push((if d == 256 { FLASH_256 } else { FLASH_512 }, [n.div_ceil(shape.tokens()), heads / 4, 1], shape.threads(), flash));
+    ops.push((shape.name(), [n.div_ceil(shape.tokens()), heads / per, 1], shape.threads(), flash));
     ops.push((QUANT_Q8P, [len.div_ceil(256), 1, 1], 256, quant));
     ops.extend(gemm(w.mat(&format!("{i}.o")), c.q, c.y, n, c));
     ops.push(norm([x0, x1, c.y, at("post_attention_layernorm"), at("pre_feedforward_layernorm")], c.q, cfg.hidden, n, [cfg.eps, 1.0]));
@@ -132,11 +130,15 @@ fn attention(cfg: &Config, w: &Weights, b: &Bufs, c: &Chunk, i: usize, n: u32) -
 fn mlp(cfg: &Config, w: &Weights, c: &Chunk, [i, n]: [usize; 2], scalar: f32) -> Vec<Op> {
     let n = n as u32;
     let (h, eps, at) = (cfg.hidden, cfg.eps, |name: &str| w.at(&format!("{i}.{name}")));
-    let (x0, x1, (ffn, pl)) = (c.x[i % 2], c.x[(i + 1) % 2], (cfg.mlp(i), cfg.per_layer));
+    let ((x0, x1), (ffn, pl)) = (super::decode::residual(cfg, c.x, i), (cfg.mlp(i), cfg.per_layer));
     let next = if i + 1 < cfg.layers() { w.at(&format!("{}.input_layernorm", i + 1)) } else { w.at("norm") };
     let mut ops = gemm(w.mat(&format!("{i}.gate_up")), c.q, c.y, n, c);
     ops.push(geglu([c.y, c.y + 4 * ffn as u64], c.q, n, ffn, [2 * ffn, 2 * ffn]));
     ops.extend(gemm(w.mat(&format!("{i}.down")), c.q, c.y, n, c));
+    if pl == 0 {
+        ops.push(norm([x1, x0, c.y, at("post_feedforward_layernorm"), next], c.q, h, n, [eps, scalar]));
+        return ops;
+    }
     ops.push(norm([x1, x0, c.y, at("post_feedforward_layernorm"), 0], c.q, h, n, [eps, 1.0]));
     ops.extend(gemm(w.mat(&format!("{i}.per_layer_gate")), c.q, c.y, n, c));
     ops.push(geglu([c.y, c.per_layer[1] + 4 * (i * pl) as u64], c.q, n, pl, [pl, cfg.layers() * pl]));

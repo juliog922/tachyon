@@ -14,7 +14,8 @@
 175      crates/tachyon/src/sys.rs
 # ptx (the model's kernels): raised from 1,800 to 1,900 for prefill attention on tensor cores (flash.rs, and the
 # queries' kernel in attend.rs), which replaced the per-token prefill attention.
-1900     crates/tachyon/src/ptx/mod.rs crates/tachyon/src/ptx/attend.rs crates/tachyon/src/ptx/gemm.rs crates/tachyon/src/ptx/gemv.rs crates/tachyon/src/ptx/sample.rs crates/tachyon/src/ptx/flash.rs
+# ptx: raised to 1925 in step 12a: attention blocks of two query heads (decode and prefill), for the larger models.
+1925     crates/tachyon/src/ptx/mod.rs crates/tachyon/src/ptx/attend.rs crates/tachyon/src/ptx/gemm.rs crates/tachyon/src/ptx/gemv.rs crates/tachyon/src/ptx/sample.rs crates/tachyon/src/ptx/flash.rs
 300      crates/tachyon/src/quant.rs
 # token: raised from 500 in step 10f: byte-level BPE (GPT-2's scheme, three patterns matched by hand, ignore_merges,
 # the post-processor's frame) and the Unicode it needs (letters by case, marks, NFC), for Laya English and
@@ -38,8 +39,8 @@
 # media: step 11, std-only decoders (PNG with inflate, baseline JPEG), PIL's resize, WAV, resampling, mel: spec step 11
 # decisions. Planned at 700, raised to 1100 in 11a: matching PIL and libjpeg-turbo bit for bit took 890 lines for images.
 1100     crates/tachyon/src/media
-# cli: raised from 500 in step 10f: three more models in the catalog.
-550      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs crates/tachyon-cli/src/encoders.rs
+# cli: raised from 500 in step 10f: three more models in the catalog; to 560 in step 12a: Gemma 4 12B.
+560      crates/tachyon-cli/src/main.rs crates/tachyon-cli/src/models.rs crates/tachyon-cli/src/lib.rs crates/tachyon-cli/src/encoders.rs
 # net: step 9, std-only downloads (spec §4, step 9 decisions): primitives, TLS 1.3 with certificates, HTTP and the Hub.
 950      crates/tachyon-cli/src/net/crypto.rs crates/tachyon-cli/src/net/aes_gcm.rs crates/tachyon-cli/src/net/x25519.rs crates/tachyon-cli/src/net/p256.rs crates/tachyon-cli/src/net/rsa.rs
 1050     crates/tachyon-cli/src/net/tls.rs crates/tachyon-cli/src/net/x509.rs

@@ -186,7 +186,7 @@ Baselines live in `bench/results/<machine>/`. Save one with `TACHYON_BENCH_SAVE=
 | 9 | `pull`, catalog, conversion | under validation |
 | 10 | ModernBERT encoder: Laya decisions, Granite embeddings | |
 | 11 | Vision and audio inputs | |
-| 12 | Larger tiers: 12B, 31B, FP8, MoE | |
+| 12 | Larger tiers: 12B, 31B, FP8, MoE | 12a (12B and 31B text) under validation |
 | 13 | Speculative decoding | |
 | 14 | `tachyon serve`: other processes over shared memory, `interface/` | under validation |
 

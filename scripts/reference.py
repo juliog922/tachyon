@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Writes the reference of the engine's top-1 agreement test (tests/engine.rs): Gemma 4 E4B's greedy answers in
+"""Writes the reference of the engine's top-1 agreement test (tests/engine.rs): a Gemma 4 model's greedy answers in
 bfloat16, as Hugging Face computes them. One JSON line per prompt: the prompt's text, its tokens through the chat
-template, the answer's tokens, and at each the gap between the best logit and the runner-up.
+template, the answer's tokens, and at each the gap between the best logit and the runner-up. The fixture is named
+after the model's directory in Tachyon's home (`gemma-4-e4b`, `gemma-4-12b`, `gemma-4-31b`, ...).
 
-Needs torch, transformers and a GPU with 20 GB:
+Needs torch, transformers and accelerate. The model spreads over the GPUs it sees and, past their memory, the CPU
+(the 31B's 62 GB of bfloat16 on a 48 GB GPU: slow, but a reference is made once):
 
     python3 scripts/reference.py ~/models/gemma-4-E4B-it > crates/tachyon/tests/fixtures/gemma-4-e4b.ref
 """
@@ -12,7 +14,7 @@ import json
 import sys
 
 import torch
-from transformers import AutoTokenizer, Gemma4ForConditionalGeneration
+from transformers import AutoModelForImageTextToText, AutoTokenizer
 
 ANSWER = 64
 PROMPTS = [
@@ -52,11 +54,8 @@ PROMPTS = [
 
 
 def main(src):
-    gpu = torch.cuda.get_device_properties(0)
-    if gpu.total_memory < 20e9:
-        sys.exit(f"the bfloat16 model needs a GPU with 20 GB; {gpu.name} has {gpu.total_memory / 1e9:.0f} GB")
     tok = AutoTokenizer.from_pretrained(src)
-    model = Gemma4ForConditionalGeneration.from_pretrained(src, dtype=torch.bfloat16).to("cuda").eval()
+    model = AutoModelForImageTextToText.from_pretrained(src, dtype=torch.bfloat16, device_map="auto").eval()
     for text in PROMPTS:
         chat = [{"role": "user", "content": text}]
         prompt = list(tok.apply_chat_template(chat, add_generation_prompt=True, tokenize=True, return_dict=True)["input_ids"])

@@ -8,7 +8,7 @@ mod common;
 
 use common::{Gpu, attention, normalize, rotate, values};
 use tachyon::cuda::{DevBuf, arg};
-use tachyon::ptx::{EMBED_Q4, FLASH_256, FLASH_512, GEGLU_Q8P, KV_256, KV_512, NORM_Q8, NORM_Q8P, NORM_THREADS, QUERY_256, QUERY_512, rope};
+use tachyon::ptx::{EMBED_Q4, FLASH_512, GEGLU_Q8P, KV_256, KV_512, NORM_Q8, NORM_Q8P, NORM_THREADS, QUERY_256, QUERY_512, rope};
 use tachyon::quant::{MAGIC, f16_bits, f16_value, q4};
 
 /// Q8P buffers for `len` values, and their contents.
@@ -109,7 +109,7 @@ fn embed_decodes_a_row_per_token() {
     }
 }
 
-/// Key-value heads in the attention tests (each serves four query heads), and new tokens.
+/// Key-value heads in the attention tests (each serves four query heads, or two), and new tokens.
 const KV: usize = 2;
 const TOKENS: usize = 40;
 
@@ -117,6 +117,7 @@ const TOKENS: usize = 40;
 /// norm weights, the RoPE frequencies, the caches as they were.
 struct Chunk {
     d: usize,
+    ratio: usize,
     cap: u32,
     win: u32,
     p0: u32,
@@ -129,18 +130,19 @@ struct Chunk {
 }
 
 impl Chunk {
-    /// A chunk at `p0` with heads of `d`, a ring of `cap` and a window of `win`: sliding layers' RoPE for 256, global
-    /// layers' (a quarter of the pairs turning) for 512.
-    fn new(d: usize, cap: u32, win: u32, p0: u32) -> Chunk {
+    /// A chunk at `p0` with heads of `d`, `ratio` query heads per key-value head, a ring of `cap` and a window of
+    /// `win`: sliding layers' RoPE for 256, global layers' (a quarter of the pairs turning) for 512.
+    fn new(d: usize, ratio: usize, cap: u32, win: u32, p0: u32) -> Chunk {
         let weights = |seed| values(d, seed).iter().map(|x| 0.2 + 0.1 * x).collect();
         let cache = |seed| values(KV * cap as usize * d, seed).iter().map(|&x| f16_bits(0.3 * x)).collect();
         let freq = if d == 256 { rope(10_000.0, d, 1.0) } else { rope(1_000_000.0, d, 0.25) };
-        Chunk { d, cap, win, p0, qkv: values(TOKENS * 6 * KV * d, 3), qn: weights(4), kn: weights(5), freq, k: cache(6), v: cache(7) }
+        let qkv = values(TOKENS * (ratio + 2) * KV * d, 3);
+        Chunk { d, ratio, cap, win, p0, qkv, qn: weights(4), kn: weights(5), freq, k: cache(6), v: cache(7) }
     }
 
     /// Head `i` of token `t`.
     fn head(&self, t: usize, i: usize) -> Vec<f64> {
-        self.qkv[(t * 6 * KV + i) * self.d..][..self.d].iter().map(|&v| f64::from(v)).collect()
+        self.qkv[(t * (self.ratio + 2) * KV + i) * self.d..][..self.d].iter().map(|&v| f64::from(v)).collect()
     }
 
     /// Key and value of key-value head `g` at age `age` for token `t`: a new token's, normalized and rotated, or the
@@ -151,7 +153,8 @@ impl Chunk {
             let old = |c: &[u16]| c[(g * cap + at % cap) * d..][..d].iter().map(|&h| f64::from(f16_value(h))).collect();
             return (old(&self.k), old(&self.v));
         }
-        let (mut k, mut v) = (self.head(t - age, 4 * KV + g), self.head(t - age, 5 * KV + g));
+        let h = self.ratio * KV;
+        let (mut k, mut v) = (self.head(t - age, h + g), self.head(t - age, h + KV + g));
         normalize(&mut k, Some(&self.kn));
         rotate(&mut k, &self.freq, at as u32);
         normalize(&mut v, None);
@@ -165,7 +168,7 @@ impl Chunk {
             let at = self.p0 as usize + t;
             for g in 0..KV {
                 let kv: Vec<_> = (0..(at + 1).min(self.win as usize)).map(|age| self.kv(t, age, g)).collect();
-                for h in 4 * g..4 * g + 4 {
+                for h in self.ratio * g..self.ratio * (g + 1) {
                     let mut q = self.head(t, h);
                     normalize(&mut q, Some(&self.qn));
                     rotate(&mut q, &self.freq, at as u32);
@@ -180,15 +183,16 @@ impl Chunk {
 /// Prefill attention on tensor cores: [`KV_256`] stores the keys and values, [`QUERY_256`] normalizes and rotates
 /// the queries to `f16`, and [`FLASH_256`] gives each token's heads over its window in `f32`, within a thousandth of
 /// the largest output (`f16` queries and probabilities); on the chunk above, a sliding window of a ring, and on
-/// heads of 512 with global attention ([`FLASH_512`], eight tokens a block), every earlier position seen.
+/// heads of 512 with global attention ([`FLASH_512`], eight tokens a block), every earlier position seen; and with two
+/// query heads per key-value head ([`FLASH_256_PAIRS`], 32 tokens a block), as the larger models' sliding layers.
 #[test]
 fn flash_attention_matches_the_reference() {
     let gpu = Gpu::new();
-    for chunk in [Chunk::new(256, 1024, 512, 600), Chunk::new(512, 700, 700, 600)] {
-        let (want, got, d) = (chunk.cpu(), chunk.flash(&gpu), chunk.d);
+    for chunk in [Chunk::new(256, 4, 1024, 512, 600), Chunk::new(512, 4, 700, 700, 600), Chunk::new(256, 2, 1024, 512, 600)] {
+        let (want, got, d, h) = (chunk.cpu(), chunk.flash(&gpu), chunk.d, chunk.ratio * KV);
         let top = want.iter().fold(0f64, |m, v| m.max(v.abs()));
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
-            assert!((f64::from(g) - w).abs() <= 1e-3 * top, "{d}: token {}, head {}, value {}: {g} against {w}", i / (4 * KV * d), i / d % (4 * KV), i % d);
+            assert!((f64::from(g) - w).abs() <= 1e-3 * top, "{d}/{h}: token {}, head {}, value {}: {g} against {w}", i / (h * d), i / d % h, i % d);
         }
     }
 }
@@ -196,24 +200,24 @@ fn flash_attention_matches_the_reference() {
 impl Chunk {
     /// The key-value store, the queries and the attention on tensor cores on the GPU: every token's heads, `f32`.
     fn flash(&self, gpu: &Gpu) -> Vec<f32> {
-        let (d, wide) = (self.d, self.d == 512);
-        let shape = tachyon::ptx::flash::Shape::of(d);
+        let (d, h, wide) = (self.d, self.ratio * KV, self.d == 512);
+        let shape = tachyon::ptx::flash::Shape::of(d, self.ratio as u32);
         let tiles = TOKENS.div_ceil(shape.tokens() as usize);
         let bufs = [gpu.upload(&self.qkv), gpu.upload(&self.qn), gpu.upload(&self.kn), gpu.upload(&self.freq), gpu.upload(&self.k), gpu.upload(&self.v)];
         let [pqkv, pqn, pkn, pfreq, pk, pv] = bufs.each_ref().map(DevBuf::ptr);
-        let (start, qh, y) = (gpu.upload(&[self.p0]), gpu.zeros(tiles * shape.tokens() as usize * 4 * KV * d * 2), gpu.zeros(TOKENS * 4 * KV * d * 4));
+        let (start, qh, y) = (gpu.upload(&[self.p0]), gpu.zeros(tiles * shape.tokens() as usize * h * d * 2), gpu.zeros(TOKENS * h * d * 4));
         let (ppos, pqh, py) = (start.ptr(), qh.ptr(), y.ptr());
-        let (cap, win, group, row, n) = (self.cap, self.win, 1u32, (6 * KV * d) as u32, TOKENS as u32);
-        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&group)];
+        let (cap, win, group, ratio, row, n) = (self.cap, self.win, 1u32, self.ratio as u32, ((self.ratio + 2) * KV * d) as u32, TOKENS as u32);
+        let store = [arg(&pqkv), arg(&pkn), arg(&pfreq), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&ratio)];
         let query = [arg(&pqkv), arg(&pqn), arg(&pfreq), arg(&pqh), arg(&ppos), arg(&row)];
         let flash = [arg(&pqh), arg(&pk), arg(&pv), arg(&ppos), arg(&cap), arg(&win), arg(&group), arg(&n), arg(&py)];
-        let [kv, q, attend] = if wide { [KV_512, QUERY_512, FLASH_512] } else { [KV_256, QUERY_256, FLASH_256] };
+        let [kv, q, attend] = if wide { [KV_512, QUERY_512, FLASH_512] } else { [KV_256, QUERY_256, shape.name()] };
         let f = |name| gpu.module.function(name).unwrap();
         // SAFETY: each launch passes its kernel's arguments in order and with their types; the buffers hold whole
         // tiles of tokens.
         unsafe {
             gpu.stream.launch(&f(kv), [KV as u32, n, 1], [32, 1, 1], 0, &store).unwrap();
-            gpu.stream.launch(&f(q), [4 * KV as u32, n, 1], [32, 1, 1], 0, &query).unwrap();
+            gpu.stream.launch(&f(q), [h as u32, n, 1], [32, 1, 1], 0, &query).unwrap();
             let grid = [tiles as u32, KV as u32, 1];
             gpu.stream.launch(&f(attend), grid, [shape.threads(), 1, 1], tachyon::ptx::shared(attend), &flash).unwrap();
         }
