@@ -91,7 +91,6 @@ api! {
     cuModuleLoadDataEx(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void);
     cuModuleUnload(Handle);
     cuModuleGetFunction(*mut Handle, Handle, *const c_char);
-    cuFuncSetAttribute(Handle, c_int, c_int);
     cuLaunchKernel(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void);
 }
 

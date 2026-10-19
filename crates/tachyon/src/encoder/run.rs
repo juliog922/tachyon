@@ -256,7 +256,7 @@ impl Encoder {
             .collect();
         // SAFETY: every call passes the kernel's arguments in order and with their types, as `crate::ptx::encoder`
         // documents them, on buffers laid out for the capacity this encoder was opened with.
-        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], crate::ptx::shared(name), &ptrs) }?;
+        unsafe { self.stream.launch(&self.module.function(name)?, grid, [threads, 1, 1], 0, &ptrs) }?;
         if let Some(marks) = self.marks.borrow_mut().as_mut() {
             let event = self.stream.context().event(true)?;
             self.stream.record(&event)?;

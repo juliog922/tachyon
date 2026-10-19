@@ -189,7 +189,7 @@ fn products(suite: &mut Suite, gpu: &Gpu, peaks: [f64; 2]) {
             let blocks = tokens.div_ceil(tile) * rows / height;
             let launch = |s: &tachyon::cuda::Stream| {
                 // SAFETY: the kernel's arguments in order; `act` holds whole blocks of tokens, `out` every token's row.
-                unsafe { s.launch(&kernel, [blocks, 1, 1], [threads, 1, 1], tachyon::ptx::shared(name), &args) }.unwrap();
+                unsafe { s.launch(&kernel, [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
             };
             let tall = if height == 64 { String::new() } else { format!("×{height}") };
             let label = format!("/{tile}{tall}{}", if q8 { " q8" } else { "" });

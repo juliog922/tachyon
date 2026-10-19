@@ -255,7 +255,7 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds two tiles of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], tachyon::ptx::shared(kernel), &args) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let got: Vec<f32> = if mode < 2 { gpu.floats(&y) } else { gpu.halves(&y).iter().map(|&h| tachyon::quant::f16_value(h)).collect() };
         for (i, &v) in want.iter().enumerate() {
             let expect = match mode {
@@ -291,7 +291,7 @@ fn the_f16_product_gates() {
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).collect();
         // SAFETY: the kernel's arguments in order; `a` holds whole blocks of tokens, `y` room for all of them.
-        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], tachyon::ptx::shared(kernel), &args) }.unwrap();
+        unsafe { gpu.stream.launch(&gpu.module.function(kernel).unwrap(), [blocks, 1, 1], [threads, 1, 1], 0, &args) }.unwrap();
         let gated = gpu.halves(&y);
         for (t, r) in (0..tokens).flat_map(|t| (0..rows / 2).map(move |r| (t, 2 * r))) {
             let gate = if mode == 4 { gelu(dot(t, r)) } else { silu(dot(t, r)) };
@@ -309,7 +309,7 @@ fn q8_product(gpu: &common::Gpu, kernel: (&str, u32, u32), buffers: [u64; 5], si
     let (pointers, scales) = ([buffers[0], buffers[2], 0, buffers[4]], [buffers[1], buffers[3]]);
     let args: Vec<_> = pointers.iter().map(arg).chain(sizes.iter().map(arg)).chain(scales.iter().map(arg)).collect();
     // SAFETY: the kernel's arguments in order; `a` and its scales hold whole blocks of tokens, `y` room for all.
-    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [kernel.1, 1, 1], [kernel.2, 1, 1], tachyon::ptx::shared(kernel.0), &args) }.unwrap();
+    unsafe { gpu.stream.launch(&gpu.module.function(kernel.0).unwrap(), [kernel.1, 1, 1], [kernel.2, 1, 1], 0, &args) }.unwrap();
 }
 
 /// `f16` rows rounded to Q8E on the GPU exactly as on the CPU; then the 8-bit product in every mode (store, add,

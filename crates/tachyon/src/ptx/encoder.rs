@@ -9,9 +9,10 @@
 //!   mode: u32`. `rows` is a multiple of [`GEMM_F16_TILE`], `cols` of 64; `a` holds whole blocks of tokens. Blocks
 //!   of 64 tokens × 64 rows: launch `tokens.div_ceil(64) · rows / 64` blocks of 128 threads. [`GEMM_F16_128`] is
 //!   the same in blocks of 128 tokens (256 threads), and [`GEMM_F16_TALL`] in blocks of 128 tokens × 128 rows (512
-//!   threads, `rows` a multiple of 128, [`shared`] bytes of dynamic shared memory), each reading fewer bytes per
-//!   operation than the last: which of the three a shape takes is raced on the GPU (`encoder::race`). [`GEMM_CLIP`],
-//!   [`GEMM_CLIP_128`] and [`GEMM_CLIP_TALL`] are Gemma 4's clipped linear layers: one more argument,
+//!   threads, `rows` a multiple of 128), each reading fewer bytes per operation than the last: which of the three a
+//!   shape takes is raced on the GPU (`encoder::race`). [`GEMM_CLIP`], [`GEMM_CLIP_128`] and [`GEMM_CLIP_TALL`] are
+//!   Gemma 4's clipped
+//!   linear layers: one more argument,
 //!   `clip: u64`, `f32 [4 + 2·rows]`: the bounds of `a`'s values, two unused, then each row's bounds of `y` (before
 //!   any activation). Their mode 3 takes a `SiLU` instead of the ReLU, mode 4 GELU's tanh form, and mode 5 stores
 //!   `y[2j]·σ(y[2j+1])` (a GLU), as mode 4 its pair.
@@ -103,31 +104,28 @@ pub(super) enum Operands {
 /// Tiles of tokens a group of [`GEMM_F16`]'s blocks takes together.
 const GROUP: usize = 8;
 
-/// Blocks of 64 tokens × 64 rows (128 threads, four stages), of 128 × 64 (256 threads, three stages: four would pass
-/// 48 KiB), and of 128 × 128 (512 threads), which read a third fewer bytes per operation from L2 and memory than
-/// 128 × 64: four stages, past 48 KiB, so in dynamic shared memory.
-pub(super) const SMALL: Tile = Tile { tokens: 64, rows: 64, stages: 4 };
-pub(super) const LARGE: Tile = Tile { tokens: 128, rows: 64, stages: 3 };
-pub(super) const TALL: Tile = Tile { tokens: 128, rows: 128, stages: 4 };
+/// Blocks of 64 tokens × 64 rows (128 threads), of 128 × 64 (256 threads), and of 128 × 128 (512 threads), which
+/// read a third fewer bytes per operation from L2 and memory than 128 × 64.
+pub(super) const SMALL: Tile = Tile { tokens: 64, rows: 64 };
+pub(super) const LARGE: Tile = Tile { tokens: 128, rows: 64 };
+pub(super) const TALL: Tile = Tile { tokens: 128, rows: 128 };
 
-/// A product kernel's block: the tokens and the rows it takes, 32 × 32 to a warp, and the stages of its pipeline.
+/// A product kernel's block: the tokens and the rows it takes, 32 × 32 to a warp.
 #[derive(Clone, Copy)]
 pub(super) struct Tile {
     pub tokens: usize,
     pub rows: usize,
-    pub stages: usize,
-}
-
-/// The bytes of dynamic shared memory product kernel `name` takes: those of blocks of 128 × 128, 0 for the others.
-#[must_use]
-pub fn shared(name: &str) -> u32 {
-    if name.ends_with("_tall") { (TALL.stages * stage(TALL, true)) as u32 } else { 0 }
 }
 
 /// A block's warps, and the rows a pass of its copies covers (four threads to a row).
 const fn block(tile: Tile) -> (usize, usize) {
     let warps = tile.tokens / 32 * (tile.rows / 32);
     (warps, 8 * warps)
+}
+
+/// Stages of a product's pipeline: as many as fit in 48 KiB, four at most.
+fn stages(tile: Tile, q8: bool) -> usize {
+    (2..=4).rev().find(|n| n * stage(tile, q8) <= 48 << 10).unwrap_or(2)
 }
 
 /// Queues stage `buf`'s copy of the slice `off` bytes past the current, under `%q`, for blocks of `tokens`; with
@@ -500,7 +498,7 @@ fn gemm_store(s: &mut String, clip: bool) {
 pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
     let (clip, q8) = (ops == Operands::Clip, ops == Operands::Q8);
     let mut s = gemm_head(name, tile, ops);
-    let n = tile.stages;
+    let n = stages(tile, q8);
     for p in 0..n - 1 {
         let _ = writeln!(s, "    setp.gt.u32 %q, %turns, {p};");
         copy(&mut s, tile, (p, 64 * p), q8);
@@ -526,12 +524,12 @@ pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
     s + "    ret;\n}\n"
 }
 
-/// The declaration of a product kernel (see [`gemm_f16`]): its parameters, registers and shared memory, dynamic past
-/// 48 KiB and so declared outside the kernel (again for each: PTX allows it).
-fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
-    let (q8, bytes) = (ops == Operands::Q8, tile.stages * stage(tile, ops == Operands::Q8));
-    format!(
-        "{}.visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
+/// The entry of a product kernel (see [`gemm_f16`]), its registers and shared memory, its pointers and fragments'
+/// addresses, and its sums zeroed.
+fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
+    let q8 = ops == Operands::Q8;
+    let mut s = format!(
+        ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
     .maxntid {}, 1, 1
 {{
     .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
@@ -539,8 +537,7 @@ fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
     .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
     .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
     .reg .b64 %rd<10>, %ga<2>, %gw<2>;{}
-    {}",
-        if bytes > 48 << 10 { ".extern .shared .align 16 .b8 dsmem[];\n" } else { "" },
+    .shared .align 16 .b8 smem[{}];",
         match ops {
             Operands::F16 => "",
             Operands::Clip => ", .param .u64 pclip",
@@ -548,14 +545,8 @@ fn gemm_entry(name: &str, tile: Tile, ops: Operands) -> String {
         },
         32 * block(tile).0,
         if q8 { Q8_REGS } else { "" },
-        if bytes > 48 << 10 { String::new() } else { format!(".shared .align 16 .b8 smem[{bytes}];") }
-    )
-}
-
-/// The entry of a product kernel (see [`gemm_f16`]), its pointers and fragments' addresses, and its sums zeroed.
-fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
-    let q8 = ops == Operands::Q8;
-    let mut s = gemm_entry(name, tile, ops);
+        stages(tile, q8) * stage(tile, q8)
+    );
     let (tokens, pass) = (tile.tokens, block(tile).1);
     let numbers = [
         ("HALF", tokens * ROW),
@@ -571,8 +562,7 @@ fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
         ("ESHIFT", usize::from(!q8)),
         ("TURNSHIFT", if q8 { 6 } else { 5 }),
     ];
-    let head = if s.starts_with(".extern") { GEMM_HEAD.replace("%sm, smem", "%sm, dsmem") } else { GEMM_HEAD.to_string() };
-    s += &numbers.iter().fold(head, |h, (key, v)| h.replace(key, &v.to_string()));
+    s += &numbers.iter().fold(GEMM_HEAD.to_string(), |h, (key, v)| h.replace(key, &v.to_string()));
     // The other passes' copy sources, a pass of rows apart.
     (1..tokens / pass).for_each(|p| _ = writeln!(s, "    add.u64 %ga{p}, %ga{}, %rd3;", p - 1));
     (1..tile.rows / pass).for_each(|p| _ = writeln!(s, "    add.u64 %gw{p}, %gw{}, %rd3;", p - 1));
