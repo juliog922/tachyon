@@ -40,12 +40,13 @@ pub const SUM_SLICES: &str = "sum_slices";
 
 /// The slices of the columns a [`GEMM_Q4`] of `rows × cols` over `tokens` takes on a GPU of `sms`
 /// multiprocessors, with room in `y` for `room` slices: as many as keep its blocks within the three per
-/// multiprocessor that run at once, eight at most, so short and narrow products fill the GPU. They follow the
+/// multiprocessor that run at once, eight at most and 512 columns each at least (a slice of fewer spends more on
+/// its store and the sum than it saves), so short and narrow products fill the GPU. They follow the
 /// tokens, so a product's sums can differ in their last bits between batches of different lengths.
 #[must_use]
 pub fn slices(rows: u32, cols: u32, tokens: u32, sms: u32, room: u32) -> u32 {
     let blocks = tokens.div_ceil(GEMM_TOKENS) * (rows / GEMM_ROWS);
-    (3 * sms / blocks.max(1)).min(room).min(cols / 128).clamp(1, 8)
+    (3 * sms / blocks.max(1)).min(room).min(cols / 512).clamp(1, 8)
 }
 /// Name of the kernel that runs `iters` rounds of 8 independent integer `mma` per warp and writes one word per
 /// thread to `out`. Arguments: `out: *mut u32`, `iters: u32`. Each `mma` is 8,192 operations.
