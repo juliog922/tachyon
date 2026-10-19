@@ -163,6 +163,26 @@ fn gemma_4_chats_match_its_template() {
     }
 }
 
+/// A template whose generation prompt closes an empty thinking block when thinking is off (Gemma 4 12B's) opens the
+/// model's turn with it, as Hugging Face's prompt has it; with thinking on, or under E4B's template, the turn opens
+/// bare.
+#[cfg(feature = "models")]
+#[test]
+fn a_template_can_open_the_turn_with_an_empty_thought() {
+    let tok = gemma();
+    let template = r"{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- if not enable_thinking -%}{{- '<|channel>thought\n<channel|>' -}}{%- endif -%}{%- endif -%}";
+    let (plain, closed) = (Chat::gemma4(&tok).unwrap(), Chat::gemma4(&tok).unwrap().with_template(&tok, template));
+    let encode = |chat: &Chat, think| {
+        let mut ids = Vec::new();
+        chat.encode(&tok, &[Message::new(Role::User, "Why is the sky blue?")], think, &mut ids);
+        ids
+    };
+    let e4b = vec![2, 105, 2364, 107, 11355, 563, 506, 7217, 3730, 236_881, 106, 107, 105, 4368, 107];
+    assert_eq!(encode(&plain, false), e4b, "E4B's prompt");
+    assert_eq!(encode(&closed, false), [&e4b[..], &[100, 45518, 107, 101]].concat(), "the 12B's prompt");
+    assert_eq!(encode(&closed, true), encode(&plain, true), "thinking on: the model opens its own block");
+}
+
 #[cfg(feature = "models")]
 #[test]
 fn a_marker_in_user_text_stays_text() {

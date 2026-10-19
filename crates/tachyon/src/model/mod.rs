@@ -3,7 +3,7 @@
 //!
 //! [`convert`] reads a checkpoint directory (`config.json`, `tokenizer.json`, `*.safetensors`) and writes a model
 //! directory: `weights.wpk`, everything that lives in VRAM; `host.wpk`, the per-layer embedding table, which stays
-//! in pinned host memory and is read one row per token over PCIe; `tokenizer.tok`; `config.json`, copied; and
+//! in pinned host memory and is read one row per token over PCIe; `tokenizer.tok`; `chat_template.jinja` and `config.json`, copied; and
 //! `vision.wpk` and `audio.wpk`, the towers, when the checkpoint has them ([`crate::vision::convert`],
 //! [`crate::audio::convert`]). Each
 //! matrix becomes Q4 ([`crate::quant`]) as `{name}.w` and `{name}.s`; projections that read the same input are
@@ -188,10 +188,19 @@ fn host(dst: &Path, st: &Safetensors, p: &str) -> Result<()> {
     host.finish()
 }
 
-/// Stores the tokenizer of `src` in `dst`.
+/// Stores the tokenizer of `src` in `dst`, and its chat template (`chat_template.jinja`, or the one in
+/// `tokenizer_config.json`), which tells how the model's turn opens ([`crate::token::Chat::open`]).
 fn tokenizer(src: &Path, dst: &Path) -> Result<()> {
     let tok = Tokenizer::from_json(&std::fs::read(src.join("tokenizer.json"))?)?;
-    Ok(std::fs::write(dst.join("tokenizer.tok"), tok.to_bytes())?)
+    std::fs::write(dst.join("tokenizer.tok"), tok.to_bytes())?;
+    let template = std::fs::read_to_string(src.join("chat_template.jinja")).ok().or_else(|| {
+        let config = std::fs::read(src.join("tokenizer_config.json")).ok()?;
+        Json::parse(&config).ok()?.get("chat_template")?.str().map(String::from)
+    });
+    match template {
+        Some(t) => Ok(std::fs::write(dst.join("chat_template.jinja"), t)?),
+        None => Ok(()),
+    }
 }
 
 /// Writes layer `i`, whose checkpoint names start with `l`; `kv` when it projects keys and values. A layer whose

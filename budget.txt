@@ -19,8 +19,9 @@
 300      crates/tachyon/src/quant.rs
 # token: raised from 500 in step 10f: byte-level BPE (GPT-2's scheme, three patterns matched by hand, ignore_merges,
 # the post-processor's frame) and the Unicode it needs (letters by case, marks, NFC), for Laya English and
-# typed-decisions and Granite 97M; the tables are data, unicode.bin.
-900      crates/tachyon/src/token
+# typed-decisions and Granite 97M; the tables are data, unicode.bin. Raised to 925 in step 12a: templates that open the
+# model's turn with an empty thinking block (Gemma 4 12B).
+925      crates/tachyon/src/token
 900      crates/tachyon/src/model
 450      crates/tachyon/src/engine.rs
 # encoder: step 10, ModernBERT for Laya multilingual and Granite Embedding 311M, with its own kernels (an f16

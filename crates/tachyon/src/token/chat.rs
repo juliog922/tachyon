@@ -6,6 +6,8 @@
 //! ```
 //!
 //! The system turn appears when there is a system message or thinking is on; `<|think|>` switches thinking on.
+//! Some models' templates (Gemma 4 12B's) open the model's turn with an empty thinking block when thinking is off,
+//! `<|channel>thought\n<channel|>`: [`Chat::open`] reads the model's `chat_template.jinja` to tell.
 //! Messages are trimmed, consecutive model messages share one turn, and the conversation ends by opening the
 //! model's turn. A user or system message's images come before its text, each as `<|image>`, then `<|image|>` once
 //! per soft token its budget gives it ([`Chat::with_budget`]), then `<image|>`: the slots the vision tower's soft
@@ -60,6 +62,8 @@ pub struct Chat {
     image: Option<[u32; 3]>,
     audio: Option<[u32; 3]>,
     budget: usize,
+    /// `<|channel>` and `<channel|>`, when the model's turn opens with an empty thinking block if thinking is off.
+    closed: Option<[u32; 2]>,
 }
 
 impl Chat {
@@ -71,7 +75,31 @@ impl Chat {
             ids.iter().all(Option::is_some).then(|| ids.map(Option::unwrap_or_default))
         };
         let (image, audio) = (marks(["<|image>", "<|image|>", "<image|>"]), marks(["<|audio>", "<|audio|>", "<audio|>"]));
-        Ok(Chat { bos: get("<bos>")?, turn: get("<|turn>")?, end: get("<turn|>")?, think: get("<|think|>")?, image, audio, budget: DEFAULT_BUDGET })
+        let (bos, turn, end, think) = (get("<bos>")?, get("<|turn>")?, get("<turn|>")?, get("<|think|>")?);
+        Ok(Chat { bos, turn, end, think, image, audio, budget: DEFAULT_BUDGET, closed: None })
+    }
+
+    /// The chat format of the model in `dir`: [`Chat::gemma4`], as its `chat_template.jinja` opens the model's turn
+    /// (see [`Chat::with_template`]); a model converted without one opens it as E4B does.
+    pub fn open(tok: &Tokenizer, dir: &std::path::Path) -> Result<Chat> {
+        let chat = Chat::gemma4(tok)?;
+        Ok(match std::fs::read_to_string(dir.join("chat_template.jinja")) {
+            Ok(template) => chat.with_template(tok, &template),
+            Err(_) => chat,
+        })
+    }
+
+    /// This format as the Jinja `template` opens the model's turn: with an empty thinking block when thinking is off,
+    /// if its generation prompt writes one.
+    #[must_use]
+    pub fn with_template(self, tok: &Tokenizer, template: &str) -> Chat {
+        let prompt = template.rfind("add_generation_prompt").map_or("", |at| &template[at..]);
+        let marks = [tok.special("<|channel>"), tok.special("<channel|>")];
+        let closed = match marks {
+            [Some(open), Some(close)] if prompt.contains(r"'<|channel>thought\n<channel|>'") => Some([open, close]),
+            _ => None,
+        };
+        Chat { closed, ..self }
     }
 
     /// This format with images at `budget` soft tokens (one of [`crate::media::BUDGETS`]; 280 by default).
@@ -126,6 +154,11 @@ impl Chat {
         self.model_turn(tok, model, out);
         out.push(self.turn);
         tok.encode("model\n", out);
+        if let Some([open, close]) = self.closed.filter(|_| !think) {
+            out.push(open);
+            tok.encode("thought\n", out);
+            out.push(close);
+        }
     }
 
     /// A user or system message's turn: its images' slots, its text, its audio's slots.

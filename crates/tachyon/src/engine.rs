@@ -196,7 +196,7 @@ impl Engine {
             return self.load_encoder(name, dir);
         }
         let tok = Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok"))?)?;
-        let chat = Chat::gemma4(&tok)?.with_budget(load.budget);
+        let chat = Chat::open(&tok, dir)?.with_budget(load.budget);
         let ends = [chat.end_of_turn(), tok.special("<eos>").unwrap_or(chat.end_of_turn())];
         let need = footprint(dir, &load.settings)?;
         let (used, at) = (Instant::now(), Place::Disk);

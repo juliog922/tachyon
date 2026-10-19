@@ -154,7 +154,7 @@ fn gemma_agrees_with_hugging_face() {
     let dir = std::env::var("TACHYON_MODEL")
         .map_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/tachyon/gemma-4-e4b"), Into::into);
     let tok = tachyon::token::Tokenizer::from_bytes(&std::fs::read(dir.join("tokenizer.tok")).unwrap()).unwrap();
-    let chat = Chat::gemma4(&tok).unwrap();
+    let chat = Chat::open(&tok, &dir).unwrap();
     let ctx = tachyon::cuda::Context::new(0).unwrap();
     let mut dec = tachyon::model::Decoder::open(&ctx, &dir, &Settings::default()).unwrap();
     let name = dir.file_name().unwrap().to_string_lossy();
