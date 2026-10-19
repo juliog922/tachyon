@@ -23,7 +23,8 @@ Commands:
                                --image=FILE, --audio=FILE, repeatable: PNG or JPEG files the prompt shows
                                first, WAV files it plays after)
   transcribe <model> <file>    Transcribe a WAV file's speech, up to 30 s
-  decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions)
+  decide <model> <request>     Answer a Laya request (a JSON file: a state and named questions); the model
+                               `laya` picks laya-english for English text, else laya-multilingual
   embed <model> <text>...      Print each text's embedding, one JSON array per line (--dims=N: Matryoshka)
   gpu                          List the GPUs the driver sees
   doctor                       Check the driver, GPUs, CPU, memory, certificates and the connection to Hugging Face
@@ -63,7 +64,7 @@ fn command(words: &[&str], json: bool) -> ExitCode {
     match words {
         ["gpu"] => gpu(json),
         ["convert", from, to] => done(encoders::convert(from.as_ref(), to.as_ref())),
-        ["decide", model, request] => printed(encoders::decide(&model_dir(model), request.as_ref())),
+        ["decide", model, request] => printed(encoders::routed(model, request.as_ref()).and_then(|m| encoders::decide(&model_dir(&m), request.as_ref()))),
         ["embed", model, rest @ ..] if !rest.is_empty() => embed(model, rest),
         ["run", model, rest @ ..] => run_args(model, rest),
         ["transcribe", model, file] => done(run(&model_dir(model), TRANSCRIBE, &[&format!("--audio={file}")])),

@@ -2,13 +2,10 @@
 //! [`crate::ptx::encoder`]; the hidden states, Granite's embeddings or Laya's option logits out.
 
 use super::laya::{Head, Kind};
-use super::race::Products;
+use super::race::{F16, Kernels, Products, Q8, label};
 use super::{Config, Settings};
 use crate::cuda::{Context, DevBuf, Event, Graph, HostBuf, Module, Stream, arg};
-use crate::ptx::{
-    ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE, GEMM_Q8, GEMM_Q8_128, NORM_F16, QUANT_F16,
-    ROPE_F16, SPIN,
-};
+use crate::ptx::{ADD_ROWS, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_F16_TILE, NORM_F16, QUANT_F16, ROPE_F16, SPIN};
 use crate::token::Tokenizer;
 use crate::wpk::{Dtype, Loader, Wpk};
 use crate::{Error, Result};
@@ -18,12 +15,7 @@ use std::time::Duration;
 
 /// Rows of the last scorer layer, padded for the matrix product.
 const SCORES: u32 = 64;
-/// Two product kernels, largest blocks first: tokens per block, kernel, threads.
-type Kernels = [(u32, &'static str, u32); 2];
-/// The matrix products.
-const PRODUCTS: Kernels = [(128, GEMM_F16_128, 256), (64, GEMM_F16, 128)];
-/// The same for Q8 weights.
-const PRODUCTS_Q8: Kernels = [(128, GEMM_Q8_128, 256), (64, GEMM_Q8, 128)];
+
 /// Batch shapes whose graphs an encoder keeps.
 const GRAPHS: usize = 16;
 /// Rows past the capacity in each `f16` buffer, so a product's last block of 128 tokens stays inside it.
@@ -91,7 +83,7 @@ pub struct Encoder {
     module: Module,
     stream: Stream,
     cap: usize,
-    /// The product kernel each shape takes, an index of [`PRODUCTS`].
+    /// The product kernel each shape takes, an index of its [`Kernels`].
     products: Products,
     /// While [`Encoder::timeline`] runs: each launch's kind and an event recorded after it.
     marks: RefCell<Option<Vec<(String, Event)>>>,
@@ -304,7 +296,7 @@ impl Encoder {
         *self.marks.borrow_mut() = marks;
         let k = k?;
         run(k)?;
-        let (tile, q8) = (kernels[k].0, if kernels == PRODUCTS_Q8 { " q8" } else { "" });
+        let (tile, q8) = (label(&kernels, k), if kernels == Q8 { " q8" } else { "" });
         if let Some(last) = self.marks.borrow_mut().as_mut().and_then(|m| m.last_mut()) {
             last.0 = format!("gemm {tokens}×{cols}→{rows} /{tile}{q8}");
         }
@@ -312,7 +304,7 @@ impl Encoder {
     }
 
     /// The arguments of `p`'s product over `tokens` rows, stored as `mode` says; its matrix's rows and columns; the
-    /// kernels that take it, [`PRODUCTS_Q8`] for 8-bit weights, after rounding the activations to Q8.
+    /// kernels that take it, the 8-bit ones for 8-bit weights, after rounding the activations to Q8.
     fn operands(&self, p: &Product, tokens: usize, mode: u32) -> Result<(Vec<A>, [u32; 2], Kernels)> {
         let t = self.wpk.tensor(p.w).ok_or_else(|| Error::Format(format!("weights.wpk: no tensor {}", p.w)))?;
         let (rows, cols) = (t.shape[0] as u32, t.shape[1] as u32);
@@ -324,7 +316,7 @@ impl Encoder {
         let (a, scales) = if q8 { self.quantize(p.a, cols, tokens)? } else { (p.a, 0) };
         let mut args = vec![A::P(a), A::P(self.at(p.w)), A::P(bias), A::P(p.y), A::U(rows), A::U(cols), A::U(tokens as u32), A::U(mode)];
         args.extend(q8.then(|| [A::P(scales), A::P(self.at(&format!("{}.scale", p.w)))]).into_iter().flatten());
-        Ok((args, [rows, cols], if q8 { PRODUCTS_Q8 } else { PRODUCTS }))
+        Ok((args, [rows, cols], if q8 { Q8 } else { F16 }))
     }
 
     /// Rounds `tokens` rows of `cols` `f16` at `a` to Q8 in `big`: the values, then a scale per 64 of them; their

@@ -1,7 +1,7 @@
 [
-{"name":"SHA-256, SHA-NI, 256 MiB","median_ns":159377904,"p99_ns":252280554,"rate":1.684,"unit":"GB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
-{"name":"AES-128-GCM open, 16 KiB records","median_ns":11365325,"p99_ns":11606035,"rate":5.905,"unit":"GB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
-{"name":"curl, one connection","median_ns":3234263749,"p99_ns":3299121967,"rate":82.997,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
-{"name":"tachyon, 1 connection(s)","median_ns":3481139098,"p99_ns":3655884544,"rate":77.111,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null},
-{"name":"tachyon, 8 connection(s)","median_ns":3540029870,"p99_ns":3667411172,"rate":75.829,"unit":"MB/s","cycles":null,"instructions":null,"cache_misses":null,"page_faults":null}
+{"name":"SHA-256, SHA-NI, 256 MiB","median_ns":252923639,"p99_ns":256712206,"rate":1.061,"unit":"GB/s","cycles":628455766,"instructions":2600470015,"cache_misses":4138224,"page_faults":0},
+{"name":"AES-128-GCM open, 16 KiB records","median_ns":11277645,"p99_ns":12812741,"rate":5.951,"unit":"GB/s","cycles":46043591,"instructions":176025876,"cache_misses":11,"page_faults":0},
+{"name":"curl, one connection","median_ns":3484858703,"p99_ns":3622504295,"rate":77.029,"unit":"MB/s","cycles":33953,"instructions":7259,"cache_misses":843,"page_faults":0},
+{"name":"tachyon, 1 connection(s)","median_ns":3539505143,"p99_ns":3541983395,"rate":75.840,"unit":"MB/s","cycles":628559143,"instructions":2600523627,"cache_misses":100480,"page_faults":11},
+{"name":"tachyon, 8 connection(s)","median_ns":3524741669,"p99_ns":3881610607,"rate":76.157,"unit":"MB/s","cycles":629477226,"instructions":2600542090,"cache_misses":176561,"page_faults":1}
 ]

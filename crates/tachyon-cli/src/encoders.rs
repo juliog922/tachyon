@@ -50,6 +50,21 @@ fn options(q: &Json, kind: Kind) -> Vec<(String, String)> {
     }
 }
 
+/// The Laya checkpoint for the request in file `request` when it names `model` `laya`: `laya-english` for English text
+/// if it is pulled, else `laya-multilingual` (see [`tachyon::encoder::route`]). Any other name stays as it is.
+pub fn routed(model: &str, request: &Path) -> tachyon::Result<String> {
+    if model != "laya" {
+        return Ok(model.into());
+    }
+    let r = Json::parse(&std::fs::read(request)?)?;
+    let state = r.get("state").ok_or_else(|| tachyon::Error::Format("request: no \"state\"".into()))?;
+    let english = tachyon::encoder::route::english(&state.str().map_or_else(|| state.dumps(), str::to_string));
+    let pulled = crate::models::home().join("laya-english").join("weights.wpk").exists();
+    let name = if english && pulled { "laya-english" } else { "laya-multilingual" };
+    eprintln!("laya: {name}");
+    Ok(name.into())
+}
+
 /// Answers the request in file `request` with the Laya model in `dir`, as one JSON object.
 pub fn decide(dir: &Path, request: &Path) -> tachyon::Result<String> {
     let r = Json::parse(&std::fs::read(request)?)?;

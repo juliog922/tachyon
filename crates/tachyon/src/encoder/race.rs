@@ -1,11 +1,25 @@
-//! Which `f16` product kernel each shape takes on this GPU: blocks of 64 tokens or of 128, raced the first time a
-//! shape comes. The 128-token blocks read fewer bytes per operation but leave multiprocessors idle on short batches;
-//! where the two cross depends on the GPU (its multiprocessors, its clocks, its caches), so it is measured, not
-//! modelled. Used by the encoder and by Gemma 4's vision and audio towers.
+//! Which product kernel each shape takes on this GPU: blocks of 64 tokens, of 128 (32 to a warp), or of 128 with 64
+//! to a warp, raced the first time a shape comes. Larger blocks and warps read fewer bytes per operation but leave
+//! multiprocessors idle on short batches; where they cross depends on the GPU (its multiprocessors, its clocks, its
+//! caches), so it is measured, not modelled. Used by the encoder and by Gemma 4's vision and audio towers.
 
 use crate::Result;
 use crate::cuda::{Event, Module, Stream, arg};
-use crate::ptx::SPIN;
+use crate::ptx::{GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_WIDE, GEMM_F16, GEMM_F16_128, GEMM_F16_WIDE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_WIDE, SPIN};
+
+/// The kernels of one product that race: tokens per block, kernel, threads.
+pub(crate) type Kernels = [(u32, &'static str, u32); 3];
+/// The `f16` products.
+pub(crate) const F16: Kernels = [(64, GEMM_F16, 128), (128, GEMM_F16_128, 256), (128, GEMM_F16_WIDE, 128)];
+/// The 8-bit products.
+pub(crate) const Q8: Kernels = [(64, GEMM_Q8, 128), (128, GEMM_Q8_128, 256), (128, GEMM_Q8_WIDE, 128)];
+/// The clipped `f16` products of Gemma 4's towers.
+pub(crate) const CLIP: Kernels = [(64, GEMM_CLIP, 128), (128, GEMM_CLIP_128, 256), (128, GEMM_CLIP_WIDE, 128)];
+
+/// How a timeline names kernel `k` of a [`Kernels`]: its tokens per block, `w` for 64 tokens to a warp.
+pub(crate) fn label(kernels: &Kernels, k: usize) -> String {
+    format!("/{}{}", kernels[k].0, if kernels[k].1.ends_with("wide") { "w" } else { "" })
+}
 use std::cell::{Cell, RefCell};
 
 /// Launches of each kernel timed in a race.
@@ -19,20 +33,19 @@ pub(crate) struct Products {
     picked: RefCell<Vec<([u32; 3], usize)>>,
     /// Whether a race ran since [`Products::raced`] last answered.
     ran: Cell<bool>,
-    /// While a graph records, which cannot wait for a race: shapes not yet raced take blocks of 64.
+    /// While a graph records, which cannot wait for a race: shapes not yet raced take kernel 0, blocks of 64.
     pub recording: Cell<bool>,
 }
 
 impl Products {
-    /// Kernel 0 (blocks of 128 tokens) or 1 (blocks of 64) for `shape`, racing them the first time on `stream`
-    /// unless a graph records. `run(k)` launches kernel `k`; a race launches each several times, so a product that
+    /// The kernel of a [`Kernels`] for `shape`, racing them the first time on `stream` unless a graph records. `run(k)` launches kernel `k`; a race launches each several times, so a product that
     /// adds into its output leaves it wrong, and the pass that raced runs again (see [`Products::raced`]).
     pub fn pick(&self, stream: &Stream, module: &Module, shape: [u32; 3], run: &dyn Fn(usize) -> Result<()>) -> Result<usize> {
         if let Some(&(_, k)) = self.picked.borrow().iter().find(|p| p.0 == shape) {
             return Ok(k);
         }
         if self.recording.get() {
-            return Ok(1);
+            return Ok(0);
         }
         let k = race(stream, module, run)?;
         self.picked.borrow_mut().push((shape, k));
@@ -46,23 +59,24 @@ impl Products {
     }
 }
 
-/// The faster of `run(0)` and `run(1)`: [`LAPS`] launches each, back to back behind a [`SPIN`], timed on the GPU
+/// The fastest of `run(0)` to `run(2)`: [`LAPS`] launches each, back to back behind a [`SPIN`], timed on the GPU
 /// after one launch each to warm up.
 fn race(stream: &Stream, module: &Module, run: &dyn Fn(usize) -> Result<()>) -> Result<usize> {
-    let events = (0..3).map(|_| stream.context().event(true)).collect::<Result<Vec<_>>>()?;
+    let events = (0..4).map(|_| stream.context().event(true)).collect::<Result<Vec<_>>>()?;
     // SAFETY: SPIN takes one u64, and runs as one block of 32 threads.
     unsafe { stream.launch(&module.function(SPIN)?, [1, 1, 1], [32, 1, 1], 0, &[arg(&HOLD)]) }?;
-    (0..2).try_for_each(run)?;
+    (0..3).try_for_each(run)?;
     stream.record(&events[0])?;
     for (k, event) in events[1..].iter().enumerate() {
         (0..LAPS).try_for_each(|_| run(k))?;
         stream.record(event)?;
     }
-    faster(&events)
+    fastest(&events)
 }
 
-/// 1 when the time between the last two of `events` is shorter than between the first two, once they have passed.
-fn faster(events: &[Event]) -> Result<usize> {
-    events[2].sync()?;
-    Ok(usize::from(events[2].since(&events[1])? < events[1].since(&events[0])?))
+/// The index of the shortest of the times between consecutive `events`, once they have passed.
+fn fastest(events: &[Event]) -> Result<usize> {
+    events[events.len() - 1].sync()?;
+    let times = events.windows(2).map(|w| w[1].since(&w[0])).collect::<Result<Vec<f32>>>()?;
+    Ok((0..times.len()).fold(0, |best, k| if times[k] < times[best] { k } else { best }))
 }

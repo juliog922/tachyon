@@ -1,0 +1,68 @@
+[
+    {
+        "name": "SHA-256, SHA-NI, 256 MiB",
+        "median_ns": 214583545,
+        "p99_ns": 221780833,
+        "rate": 1.251,
+        "unit": "GB/s",
+        "cycles": 961156376,
+        "instructions": 2600469814,
+        "cache_misses": 1161502,
+        "page_faults": 0
+    },
+    {
+        "name": "AES-128-GCM open, 16 KiB records",
+        "median_ns": 11841337,
+        "p99_ns": 12270562,
+        "rate": 5.667,
+        "unit": "GB/s",
+        "cycles": 54063975,
+        "instructions": 176021753,
+        "cache_misses": 87,
+        "page_faults": 0
+    },
+    {
+        "name": "curl, one connection",
+        "median_ns": 3492991300,
+        "p99_ns": 3507525351,
+        "rate": 76.850,
+        "unit": "MB/s",
+        "cycles": 111980,
+        "instructions": 7477,
+        "cache_misses": 1254,
+        "page_faults": 0
+    },
+    {
+        "name": "tachyon, 1 connection(s)",
+        "median_ns": 3194106981,
+        "p99_ns": 3204397766,
+        "rate": 84.041,
+        "unit": "MB/s",
+        "cycles": 993341414,
+        "instructions": 2600520992,
+        "cache_misses": 1165709,
+        "page_faults": 11
+    },
+    {
+        "name": "tachyon, 8 connection(s)",
+        "median_ns": 3916010648,
+        "p99_ns": 4309862965,
+        "rate": 68.548,
+        "unit": "MB/s",
+        "cycles": 971671794,
+        "instructions": 2600542663,
+        "cache_misses": 1253140,
+        "page_faults": 0
+    },
+    {
+        "name": "convert gemma-4-e2b",
+        "median_ns": 145554373974,
+        "p99_ns": 145554373974,
+        "rate": 70.618,
+        "unit": "MB/s",
+        "cycles": 23156129736,
+        "instructions": 25755158348,
+        "cache_misses": 618064234,
+        "page_faults": 340396
+    }
+]

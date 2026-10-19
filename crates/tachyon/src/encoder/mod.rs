@@ -9,6 +9,7 @@
 mod convert;
 pub mod laya;
 pub(crate) mod race;
+pub mod route;
 mod run;
 mod text;
 

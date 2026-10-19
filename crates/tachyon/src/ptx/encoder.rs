@@ -8,8 +8,10 @@
 //!   GELU whose two halves' rows are interleaved), 5 `silu(y[2j])·y[2j+1]` likewise. Arguments: `a, w, bias (or 0), y: u64`, `rows, cols, tokens,
 //!   mode: u32`. `rows` is a multiple of [`GEMM_F16_TILE`], `cols` of 64; `a` holds whole blocks of tokens. Blocks
 //!   of 64 tokens × 64 rows: launch `tokens.div_ceil(64) · rows / 64` blocks of 128 threads. [`GEMM_F16_128`] is
-//!   the same in blocks of 128 tokens (256 threads), reading fewer bytes per operation: which of the two a shape
-//!   takes is raced on the GPU (`encoder::race`). [`GEMM_CLIP`] and [`GEMM_CLIP_128`] are Gemma 4's clipped linear layers: one more argument,
+//!   the same in blocks of 128 tokens (256 threads), and [`GEMM_F16_WIDE`] in blocks of 128 tokens with 64 to a warp
+//!   (128 threads), each reading fewer bytes per operation than the last: which of the three a shape takes is raced
+//!   on the GPU (`encoder::race`). [`GEMM_CLIP`], [`GEMM_CLIP_128`] and [`GEMM_CLIP_WIDE`] are Gemma 4's clipped
+//!   linear layers: one more argument,
 //!   `clip: u64`, `f32 [4 + 2·rows]`: the bounds of `a`'s values, two unused, then each row's bounds of `y` (before
 //!   any activation). Their mode 3 takes a `SiLU` instead of the ReLU, mode 4 GELU's tanh form, and mode 5 stores
 //!   `y[2j]·σ(y[2j+1])` (a GLU), as mode 4 its pair.
@@ -40,6 +42,12 @@ use std::fmt::Write;
 pub const GEMM_F16: &str = "gemm_f16";
 /// Name of the 8-bit matrix product: [`GEMM_F16`]'s modes on Q8 weights and activations.
 pub const GEMM_Q8: &str = "gemm_q8";
+/// Name of the `f16` matrix product in blocks of 128 tokens of 128 threads, 64 tokens to a warp.
+pub const GEMM_F16_WIDE: &str = "gemm_f16_wide";
+/// Name of the clipped product in blocks of 128 tokens of 128 threads.
+pub const GEMM_CLIP_WIDE: &str = "gemm_clip_wide";
+/// Name of the 8-bit matrix product in blocks of 128 tokens of 128 threads.
+pub const GEMM_Q8_WIDE: &str = "gemm_q8_wide";
 /// Name of the 8-bit matrix product in blocks of 128 tokens.
 pub const GEMM_Q8_128: &str = "gemm_q8_128";
 /// Name of the kernel that rounds `f16` rows to Q8, for [`GEMM_Q8`].
@@ -95,10 +103,24 @@ pub(super) enum Operands {
 /// Tiles of tokens a group of [`GEMM_F16`]'s blocks takes together.
 const GROUP: usize = 8;
 
-/// The shape of a product's block of `tokens` tokens: its warps (two across the 64 rows, the rest down the tokens,
-/// 32 each), each warp's tokens, and the rows a pass of copies covers (four threads to a row).
-const fn block(tokens: usize) -> (usize, usize, usize) {
-    (tokens / 16, 32, tokens / 2)
+/// Blocks of 64 tokens, 32 to a warp (128 threads); of 128, 32 to a warp (256 threads); and of 128, 64 to a warp (128
+/// threads, each fragment of weights used twice as often).
+pub(super) const SMALL: Tile = Tile { tokens: 64, warp: 32 };
+pub(super) const LARGE: Tile = Tile { tokens: 128, warp: 32 };
+pub(super) const WIDE: Tile = Tile { tokens: 128, warp: 64 };
+
+/// A product kernel's block: the tokens it takes, and each warp's (a warp takes 32 rows of the 64).
+#[derive(Clone, Copy)]
+pub(super) struct Tile {
+    pub tokens: usize,
+    pub warp: usize,
+}
+
+/// The shape of a product's block `t`: its warps (two across the 64 rows, the rest down the tokens), each warp's
+/// tokens, and the rows a pass of copies covers (four threads to a row).
+const fn block(tile: Tile) -> (usize, usize, usize) {
+    let warps = 2 * tile.tokens / tile.warp;
+    (warps, tile.warp, 8 * warps)
 }
 
 /// Stages of a product's pipeline for blocks of `tokens`: four, or three where four would pass 48 KiB.
@@ -108,11 +130,12 @@ const fn stages(tokens: usize) -> usize {
 
 /// Queues stage `buf`'s copy of the slice `off` bytes past the current, under `%q`, for blocks of `tokens`; with
 /// `q8`, its group's scales too.
-fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), q8: bool) {
-    let (base, pass) = (buf * stage(tokens, q8), block(tokens).2);
+fn copy(s: &mut String, tile: Tile, (buf, off): (usize, usize), q8: bool) {
+    let tokens = tile.tokens;
+    let (base, pass) = (buf * stage(tokens, q8), block(tile).2);
     let mut parts = Vec::new();
-    for (dst, n, src) in [("%sa", tokens, ["%ga0", "%ga1"]), ("%sw", 64, ["%gw0", "%gw1"])] {
-        parts.extend((0..n / pass).map(|p| (dst, p * pass * ROW, src[p])));
+    for (dst, n, src) in [("%sa", tokens, "%ga"), ("%sw", 64, "%gw")] {
+        parts.extend((0..n / pass).map(|p| (dst, p * pass * ROW, format!("{src}{p}"))));
     }
     for (dst, at, src) in parts {
         let _ = writeln!(s, "    @%q cp.async.cg.shared.global [{dst}+{}], [{src}+{off}], 16;", base + at);
@@ -132,10 +155,11 @@ fn copy(s: &mut String, tokens: usize, (buf, off): (usize, usize), q8: bool) {
 /// The products of stage `buf`: per 16 of `k`, an `ldmatrix` of activations per row tile of 16 tokens (two for
 /// blocks of 64 tokens, one for 32), clamped to the input bounds if `clip`, two of weights (four tiles of 8 rows),
 /// and an `mma` per pair of tiles.
-fn products(s: &mut String, tokens: usize, buf: usize, clip: bool) {
+fn products(s: &mut String, tile: Tile, buf: usize, clip: bool) {
+    let tokens = tile.tokens;
     let base = buf * stage(tokens, false);
     for ks in 0..2 {
-        for mi in 0..block(tokens).1 / 16 {
+        for mi in 0..block(tile).1 / 16 {
             let a = 4 * mi;
             let _ = writeln!(
                 s,
@@ -158,7 +182,7 @@ fn products(s: &mut String, tokens: usize, buf: usize, clip: bool) {
                 base + pair * 16 * ROW + 32 * ks
             );
         }
-        for mi in 0..block(tokens).1 / 16 {
+        for mi in 0..block(tile).1 / 16 {
             for nt in 0..4 {
                 let (c, a, b) = ((mi * 4 + nt) * 4, 4 * mi, 2 * nt);
                 let _ = writeln!(
@@ -220,7 +244,6 @@ const GEMM_HEAD: &str = "
     cvta.to.global.u64 %rd2, %rd2;
     add.u64 %ga0, %rd2, %rd0;
     mul.wide.u32 %rd3, %r4, PSTRIDE;
-    add.u64 %ga1, %ga0, %rd3;
     add.u32 %r10, %r8, %r7;
     mul.wide.u32 %rd0, %r10, %r4;
     add.u64 %rd0, %rd0, %rd1;
@@ -295,10 +318,11 @@ const Q8_HEAD: &str = "    shr.u32 %ng, %r4, 6;
 /// The Q8 products of stage `buf`: per 32 of `k`, the `ldmatrix` of [`products`] (32 bytes of a row are 32 values
 /// here) and an integer `mma` per pair of tiles, two chained per group of 64 from `%mz`, so a chain's sum `i`
 /// reads as the float `MAGIC + i`; then [`scale_q8`].
-fn products_q8(s: &mut String, tokens: usize, buf: usize) {
+fn products_q8(s: &mut String, tile: Tile, buf: usize) {
+    let tokens = tile.tokens;
     let base = buf * stage(tokens, true);
     for ks in 0..2 {
-        for mi in 0..block(tokens).1 / 16 {
+        for mi in 0..block(tile).1 / 16 {
             let a = 4 * mi;
             let _ = writeln!(
                 s,
@@ -320,7 +344,7 @@ fn products_q8(s: &mut String, tokens: usize, buf: usize) {
                 base + pair * 16 * ROW + 32 * ks
             );
         }
-        for mi in 0..block(tokens).1 / 16 {
+        for mi in 0..block(tile).1 / 16 {
             for nt in 0..4 {
                 let (c, a, b) = ((mi * 4 + nt) * 4, 4 * mi, 2 * nt);
                 let acc = if ks == 0 { "%mz, %mz, %mz, %mz".to_string() } else { format!("%i{c}, %i{}, %i{}, %i{}", c + 1, c + 2, c + 3) };
@@ -338,14 +362,14 @@ fn products_q8(s: &mut String, tokens: usize, buf: usize) {
             }
         }
     }
-    scale_q8(s, tokens, base);
+    scale_q8(s, tile, base);
 }
 
 /// The Q8 products' integer sums of the stage at `base` scaled into the `f32` sums: per output `fma(i, s, −MAGIC·s)`
 /// with its token's scale `s`, then one more with its row's.
-fn scale_q8(s: &mut String, tokens: usize, base: usize) {
+fn scale_q8(s: &mut String, tile: Tile, base: usize) {
     (0..4).for_each(|nt| _ = writeln!(s, "    ld.shared.v2.f32 {{%ws{}, %ws{}}}, [%fd+{}];", 2 * nt, 2 * nt + 1, base + 32 * nt));
-    for (mi, j) in (0..block(tokens).1 / 16).flat_map(|mi| [(mi, 0), (mi, 1)]) {
+    for (mi, j) in (0..block(tile).1 / 16).flat_map(|mi| [(mi, 0), (mi, 1)]) {
         let _ = writeln!(s, "    ld.shared.f32 %ts, [%fs+{}];\n    mul.f32 %tz, %ts, 0fCB400000;", base + 4 * (16 * mi + 8 * j));
         for (nt, e) in (0..4).flat_map(|nt| [(nt, 0), (nt, 1)]) {
             let c = (mi * 4 + nt) * 4 + 2 * j + e;
@@ -440,7 +464,7 @@ fn store_pair(s: &mut String, c: usize, nt: usize, clip: bool) {
 
 /// Stores the warp's tiles as `mode` asks: tokens `%r12 + 16mi + 8j + g`, rows `%r13 + 8nt + 2t, +1`; for mode 4
 /// the pair's `gelu(even)·odd` as one `f16`, column `(%r13 + 8nt + 2t) / 2` of a row half as wide.
-fn gemm_store(s: &mut String, tokens: usize, clip: bool) {
+fn gemm_store(s: &mut String, tile: Tile, clip: bool) {
     s.push_str(STORE_HEAD);
     if clip {
         s.push_str("    mul.wide.u32 %rd9, %r13, 8;\n    add.u64 %rd9, %rd8, %rd9;\n");
@@ -458,7 +482,7 @@ fn gemm_store(s: &mut String, tokens: usize, clip: bool) {
             32 * nt
         );
     }
-    for mi in 0..block(tokens).1 / 16 {
+    for mi in 0..block(tile).1 / 16 {
         for j in 0..2 {
             let _ = writeln!(s, "    add.u32 %r14, %r12, {};\n    setp.lt.u32 %pt, %r14, %r5;", 16 * mi + 8 * j);
             s.push_str("    and.pred %s32, %pt, %n2;\n    and.pred %sadd, %pt, %m1;\n    and.pred %s16, %pt, %m2;\n");
@@ -471,41 +495,44 @@ fn gemm_store(s: &mut String, tokens: usize, clip: bool) {
     }
 }
 
-/// [`GEMM_F16`] (blocks of 64 tokens) or [`GEMM_F16_128`], [`GEMM_CLIP`] or [`GEMM_CLIP_128`], [`GEMM_Q8`] or
-/// [`GEMM_Q8_128`] as `ops` says: [`stages`] of 64 bytes of `k` (32 `f16` or 64 Q8 values, one group), the next
-/// slices' copies in flight while one multiplies, and one barrier per slice: the one that lets a slice in, after
-/// which the stage multiplied before it is free to refill. Each warp takes 32 tokens × 32 rows.
-pub(super) fn gemm_f16(name: &str, tokens: usize, ops: Operands) -> String {
+/// A product of blocks of `tile` ([`GEMM_F16`], [`GEMM_CLIP`] or [`GEMM_Q8`] and their `_128` and `_WIDE` forms) as
+/// `ops` says: [`stages`] of 64 bytes of `k` (32 `f16` or 64 Q8 values, one group), the next slices' copies in
+/// flight while one multiplies, and one barrier per slice: the one that lets a slice in, after which the stage
+/// multiplied before it is free to refill. Each warp takes `tile.warp` tokens × 32 rows.
+pub(super) fn gemm_f16(name: &str, tile: Tile, ops: Operands) -> String {
+    let tokens = tile.tokens;
     let (clip, q8) = (ops == Operands::Clip, ops == Operands::Q8);
-    let mut s = gemm_head(name, tokens, ops);
+    let mut s = gemm_head(name, tile, ops);
     let n = stages(tokens);
     for p in 0..n - 1 {
         let _ = writeln!(s, "    setp.gt.u32 %q, %turns, {p};");
-        copy(&mut s, tokens, (p, 64 * p), q8);
+        copy(&mut s, tile, (p, 64 * p), q8);
     }
     s += "TURN:\n";
     for buf in 0..n {
         let _ = writeln!(s, "    cp.async.wait_group {};\n    bar.sync 0;\n    setp.gt.u32 %q, %turns, {};", n - 2, n - 1);
-        copy(&mut s, tokens, ((buf + n - 1) % n, 64 * (n - 1)), q8);
+        copy(&mut s, tile, ((buf + n - 1) % n, 64 * (n - 1)), q8);
         if q8 {
-            products_q8(&mut s, tokens, buf);
+            products_q8(&mut s, tile, buf);
             s += "    add.u64 %gs, %gs, 4;\n    add.u64 %gd, %gd, 4;\n";
         } else {
-            products(&mut s, tokens, buf, clip);
+            products(&mut s, tile, buf, clip);
         }
-        for p in ["%ga0", "%ga1", "%gw0", "%gw1"] {
+        let (a, w) = (tokens / block(tile).2, (64 / block(tile).2).max(1));
+        for p in (0..a).map(|p| format!("%ga{p}")).chain((0..w).map(|p| format!("%gw{p}"))) {
             let _ = writeln!(s, "    add.u64 {p}, {p}, 64;");
         }
         s += "    sub.u32 %turns, %turns, 1;\n    setp.eq.u32 %p, %turns, 0;\n    @%p bra STORE;\n";
     }
     s += "    bra TURN;\nSTORE:\n";
-    gemm_store(&mut s, tokens, clip);
+    gemm_store(&mut s, tile, clip);
     s + "    ret;\n}\n"
 }
 
 /// The entry of a product kernel (see [`gemm_f16`]), its registers and shared memory, its pointers and fragments'
 /// addresses, and its sums zeroed.
-fn gemm_head(name: &str, tokens: usize, ops: Operands) -> String {
+fn gemm_head(name: &str, tile: Tile, ops: Operands) -> String {
+    let tokens = tile.tokens;
     let q8 = ops == Operands::Q8;
     let mut s = format!(
         ".visible .entry {name}(.param .u64 pa, .param .u64 pw, .param .u64 pb, .param .u64 py, .param .u32 prows, .param .u32 pcols, .param .u32 ptok, .param .u32 pmode{})
@@ -513,20 +540,22 @@ fn gemm_head(name: &str, tokens: usize, ops: Operands) -> String {
 {{
     .reg .pred %p, %q, %pb, %m1, %m2, %n2, %m3, %m4, %m5, %pt, %s32, %sadd, %s16, %s4, %neg;
     .reg .b16 %hg;
-    .reg .b32 %r<16>, %a<8>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
-    .reg .f32 %c<32>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
-    .reg .b64 %rd<10>, %ga<2>, %gw<2>;{}
+    .reg .b32 %r<16>, %a<{}>, %b<8>, %h, %sm, %sa, %sw, %fa, %fb, %turns, %mode, %lo, %hi;
+    .reg .f32 %c<{}>, %v<2>, %o<2>, %bs<8>, %cl<16>, %x, %y, %u, %w, %z;
+    .reg .b64 %rd<10>, %ga<4>, %gw<2>;{}
     .shared .align 16 .b8 smem[{}];",
         match ops {
             Operands::F16 => "",
             Operands::Clip => ", .param .u64 pclip",
             Operands::Q8 => ", .param .u64 pas, .param .u64 pws",
         },
-        32 * block(tokens).0,
-        if q8 { Q8_REGS } else { "" },
+        32 * block(tile).0,
+        tile.warp / 4,
+        tile.warp,
+        if q8 { Q8_REGS.replace("%i<32>", &format!("%i<{}>", tile.warp)) } else { String::new() },
         stages(tokens) * stage(tokens, q8)
     );
-    let (_, warp, pass) = block(tokens);
+    let (_, warp, pass) = block(tile);
     s += &GEMM_HEAD
         .replace("HALF", &(tokens * ROW).to_string())
         .replace("ROW", &ROW.to_string())
@@ -538,6 +567,8 @@ fn gemm_head(name: &str, tokens: usize, ops: Operands) -> String {
         .replace("CSHIFT", if q8 { "4" } else { "3" })
         .replace("ESHIFT", if q8 { "0" } else { "1" })
         .replace("TURNSHIFT", if q8 { "6" } else { "5" });
+    // The other passes' copy sources, a pass of rows apart.
+    (1..tokens / pass).for_each(|p| _ = writeln!(s, "    add.u64 %ga{p}, %ga{}, %rd3;", p - 1));
     if ops == Operands::Clip {
         s += CLIP_HEAD;
     }

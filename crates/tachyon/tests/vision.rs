@@ -50,8 +50,9 @@ fn the_clipped_product_clamps_its_input_and_each_rows_output() {
         y.clamp(bounds[r][0], bounds[r][1])
     };
     let (ab, wb, cb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&clip));
-    for (mode, (kernel, blocks, threads)) in
-        [0, 2, 3, 4, 5].into_iter().flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256)].map(|k| (m, k)))
+    for (mode, (kernel, blocks, threads)) in [0, 2, 3, 4, 5]
+        .into_iter()
+        .flat_map(|m| [(tachyon::ptx::GEMM_CLIP, 4, 128), (tachyon::ptx::GEMM_CLIP_128, 2, 256), (tachyon::ptx::GEMM_CLIP_WIDE, 2, 128)].map(|k| (m, k)))
     {
         let y = gpu.zeros(4 * tokens * rows);
         let sizes = [rows, cols, tokens, mode as usize].map(|v| (v as u32, false));

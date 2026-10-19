@@ -10,10 +10,10 @@ pub(crate) mod convert;
 pub use convert::convert;
 
 use crate::cuda::{Context, DevBuf, HostBuf, Module, Stream, arg};
-use crate::encoder::race::Products;
+use crate::encoder::race::{CLIP, Products};
 use crate::json::Json;
 use crate::media::{BUDGETS, Image, PATCH, POOL};
-use crate::ptx::{ADD_ROWS_F16, ATTEND_F16, GEMM_CLIP, GEMM_CLIP_128, HEADS_F16, POOL_F16, RMS_F16};
+use crate::ptx::{ADD_ROWS_F16, ATTEND_F16, HEADS_F16, POOL_F16, RMS_F16};
 use crate::quant::f16_bits;
 use crate::wpk::{Loader, Wpk};
 use crate::{Error, Result};
@@ -164,7 +164,7 @@ impl Vision {
         let (rows, cols, n) = (matrix.shape[0] as u32, matrix.shape[1] as u32, tokens as u32);
         let args = [A::P(a), A::P(self.at(w)), A::P(0), A::P(y), A::U(rows), A::U(cols), A::U(n), A::U(mode), A::P(self.at(&format!("{w}.clip")))];
         let run = |k: usize| {
-            let (tile, kernel, threads) = [(128, GEMM_CLIP_128, 256), (64, GEMM_CLIP, 128)][k];
+            let (tile, kernel, threads) = CLIP[k];
             self.launch(kernel, [n.div_ceil(tile) * (rows / 64), 1, 1], threads, &args)
         };
         run(self.products.pick(&self.stream, &self.module, [rows, cols, n], &run)?)

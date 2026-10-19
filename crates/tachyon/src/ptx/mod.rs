@@ -48,11 +48,11 @@ pub mod vision;
 
 pub use attend::{ATTEND_256, ATTEND_256P, ATTEND_512, ATTEND_512P, ATTEND_WARPS, HEADS_PER_BLOCK, KV_256, KV_512, rope};
 pub use audio::{ATTEND_AUDIO, LCONV, SUBSAMPLE};
-use encoder::Operands;
 pub use encoder::{
-    ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_F16, GEMM_F16_128, GEMM_F16_TILE,
-    GEMM_Q8, GEMM_Q8_128, NORM_F16, QUANT_F16, ROPE_F16,
+    ADD_ROWS, ADD_ROWS_F16, ATTEND_F16, ATTEND_F16_32, EMBED_F16, GATHER_ROWS, GELU_F16, GEMM_CLIP, GEMM_CLIP_128, GEMM_CLIP_WIDE, GEMM_F16, GEMM_F16_128,
+    GEMM_F16_TILE, GEMM_F16_WIDE, GEMM_Q8, GEMM_Q8_128, GEMM_Q8_WIDE, NORM_F16, QUANT_F16, ROPE_F16,
 };
+use encoder::{LARGE, Operands, SMALL, WIDE};
 pub use gemm::{GEMM_Q4, GEMM_ROWS, GEMM_TOKENS, MMA_PEAK, MMA_PEAK_F16, MMA_PEAK_F16H};
 pub use gemv::{GEMV_Q4, GEMV_Q4_NARROW, GEMV_ROWS, UNROLL};
 pub use sample::{SAMPLE, SAMPLE_THREADS, Sampling};
@@ -103,12 +103,15 @@ pub fn module() -> String {
         attend::store(256),
         attend::store(512),
         SPIN_PTX.into(),
-        encoder::gemm_f16(GEMM_F16, 64, Operands::F16),
-        encoder::gemm_f16(GEMM_F16_128, 128, Operands::F16),
-        encoder::gemm_f16(GEMM_CLIP, 64, Operands::Clip),
-        encoder::gemm_f16(GEMM_CLIP_128, 128, Operands::Clip),
-        encoder::gemm_f16(GEMM_Q8, 64, Operands::Q8),
-        encoder::gemm_f16(GEMM_Q8_128, 128, Operands::Q8),
+        encoder::gemm_f16(GEMM_F16, SMALL, Operands::F16),
+        encoder::gemm_f16(GEMM_F16_128, LARGE, Operands::F16),
+        encoder::gemm_f16(GEMM_F16_WIDE, WIDE, Operands::F16),
+        encoder::gemm_f16(GEMM_CLIP, SMALL, Operands::Clip),
+        encoder::gemm_f16(GEMM_CLIP_128, LARGE, Operands::Clip),
+        encoder::gemm_f16(GEMM_CLIP_WIDE, WIDE, Operands::Clip),
+        encoder::gemm_f16(GEMM_Q8, SMALL, Operands::Q8),
+        encoder::gemm_f16(GEMM_Q8_128, LARGE, Operands::Q8),
+        encoder::gemm_f16(GEMM_Q8_WIDE, WIDE, Operands::Q8),
         encoder::quant_f16(),
         encoder::norm_f16(),
         encoder::rows(EMBED_F16, true, false),

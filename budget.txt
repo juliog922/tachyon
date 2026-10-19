@@ -23,8 +23,9 @@
 # tensor-core product, layer norm, attention over packed sequences): spec step 10 decisions. Raised to 1700 in
 # step 10c: the kernel timeline, and the work to answer one Laya question in 5 ms on a laptop GPU. Raised to 1750 in
 # step 10d: the product kernels raced per shape on each GPU, shared with the vision and audio towers. Raised to 2000
-# in step 10e: Q8 for Granite (the 8-bit product, rounding f16 rows to Q8, Q8 conversion).
-2000     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
+# in step 10e: Q8 for Granite (the 8-bit product, rounding f16 rows to Q8, Q8 conversion). Raised to 2075 in step 10g:
+# the products' block shapes as a tile with a warp's share, for a third raced kernel of wider warps; Laya's routing.
+2075     crates/tachyon/src/encoder crates/tachyon/src/ptx/encoder.rs
 # vision: step 11b, Gemma 4's vision tower on the GPU: its conversion, its pipeline, and its own kernels (an RMS norm
 # with the residual step, per-head norms with 2-D RoPE, pooling); the products and attention are the encoder's.
 600      crates/tachyon/src/vision crates/tachyon/src/ptx/vision.rs

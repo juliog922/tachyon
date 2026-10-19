@@ -234,7 +234,7 @@ fn halves(v: &[f32]) -> (Vec<u16>, Vec<f32>) {
 }
 
 /// The `f16` product in its four modes (store, add, `f16`, `f16` after ReLU), with a bias, for 70 tokens, in blocks
-/// of 64 and 128 tokens: the last block of tokens ends past them, and nothing is stored there.
+/// of 64 and 128 tokens (32 or 64 to a warp): the last block of tokens ends past them, and nothing is stored there.
 #[cfg(feature = "gpu")]
 #[test]
 fn the_f16_product_matches_the_cpu_in_every_mode() {
@@ -248,7 +248,7 @@ fn the_f16_product_matches_the_cpu_in_every_mode() {
         .map(|(t, r)| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r])
         .collect();
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
-    let kernels = [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)];
+    let kernels = [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256), (tachyon::ptx::GEMM_F16_WIDE, 1, 128)];
     for (mode, (kernel, blocks, threads)) in (0..4u32).flat_map(|m| kernels.map(|k| (m, k))) {
         let y = gpu.upload(&base);
         // The values live until the launch: `arg` takes their addresses.
@@ -283,8 +283,9 @@ fn the_f16_product_gates() {
     let bias = common::values(rows, 7);
     let dot = |t: usize, r: usize| (0..cols).map(|k| a[t * cols + k] * w[r * cols + k]).sum::<f32>() + bias[r];
     let (ab, wb, bb) = (gpu.upload(&a16), gpu.upload(&w16), gpu.upload(&bias));
-    for (mode, (kernel, blocks, threads)) in
-        [4u32, 5].into_iter().flat_map(|m| [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256)].map(|k| (m, k)))
+    for (mode, (kernel, blocks, threads)) in [4u32, 5]
+        .into_iter()
+        .flat_map(|m| [(tachyon::ptx::GEMM_F16, 2, 128), (tachyon::ptx::GEMM_F16_128, 1, 256), (tachyon::ptx::GEMM_F16_WIDE, 1, 128)].map(|k| (m, k)))
     {
         let y = gpu.upload(&vec![0f32; tokens * rows]);
         let (pointers, sizes) = ([ab.ptr(), wb.ptr(), bb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
@@ -332,7 +333,9 @@ fn the_q8_product_matches_the_cpu_in_every_mode() {
     let value = |q: &[i8], s: &[f32], i: usize| f64::from(q[i]) * f64::from(s[i / 64]);
     let dot = |t: usize, r: usize| (0..cols).map(|k| value(&aq, &sa, t * cols + k) * value(&wq, &sw, r * cols + k)).sum::<f64>() as f32;
     let (wb, swb, base) = (gpu.upload(&wq), gpu.upload(&sw), common::values(128 * rows, 10));
-    for (mode, kernel) in (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 2, 128), (tachyon::ptx::GEMM_Q8_128, 1, 256)].map(|k| (m, k))) {
+    for (mode, kernel) in
+        (0..6u32).flat_map(|m| [(tachyon::ptx::GEMM_Q8, 2, 128), (tachyon::ptx::GEMM_Q8_128, 1, 256), (tachyon::ptx::GEMM_Q8_WIDE, 1, 128)].map(|k| (m, k)))
+    {
         let y = gpu.upload(&base);
         q8_product(&gpu, kernel, [qb.ptr(), sb.ptr(), wb.ptr(), swb.ptr(), y.ptr()], [rows as u32, cols as u32, tokens as u32, mode]);
         let (f32s, f16s) = (gpu.floats(&y), gpu.halves(&y));
