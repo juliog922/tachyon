@@ -148,12 +148,16 @@ fn layer_tensors(out: &mut Tensors, rng: &mut Rng, l: &str, (i, shape): (usize, 
     vector(out, rng, format!("{l}layer_scalar"), 1, [0.5, 1.0]);
 }
 
-/// A layer's experts, named as the 26B A4B's checkpoint names them: the router's projection, scale and per-expert
-/// scales, every expert's gate and up stacked, every expert's down, and their three norms.
+/// A layer's experts, named as the 26B A4B's checkpoint names them: the router's projection, scale (zero, see
+/// below) and per-expert scales, every expert's gate and up stacked, every expert's down, and their three norms.
 fn experts(out: &mut Tensors, rng: &mut Rng, l: &str) {
     let [e, _, w] = EXPERTS;
     matrix(out, rng, format!("{l}router.proj.weight"), [e, HIDDEN], 5);
-    vector(out, rng, format!("{l}router.scale"), HIDDEN, [0.5, 1.5]);
+    // A zero scale: every logit is 0, so every token takes experts 0..k with equal probabilities, on the GPU as in
+    // the reference. Random routers put the k-th and the next expert within the GPU's Q8 rounding of each other
+    // often enough that a token takes another expert within a few positions, and the comparison fails for a
+    // rounding, not an error; `tests/moe.rs` checks the routing itself against the CPU.
+    out.push((format!("{l}router.scale"), vec![HIDDEN], vec![0.0; HIDDEN]));
     vector(out, rng, format!("{l}router.per_expert_scale"), e, [0.5, 1.5]);
     matrix(out, rng, format!("{l}experts.gate_up_proj"), [e * 2 * w, HIDDEN], 5);
     matrix(out, rng, format!("{l}experts.down_proj"), [e * HIDDEN, w], 5);
