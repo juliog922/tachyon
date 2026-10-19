@@ -6,6 +6,8 @@
 //! its doorbell rang, one at a time, and streams the answer into that client's ring. Between tokens it looks for that
 //! client's cancel, and every second it lets the engine move out models whose keep-alive ran out.
 
+pub mod client;
+pub mod commands;
 mod sbe;
 mod shm;
 
@@ -66,7 +68,11 @@ struct Client {
     cancel: bool,
 }
 
-/// Serves on `opts.socket` until the process ends, with the engine on GPU 0.
+/// Set by a Shutdown request: the loop ends once its answer is out.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serves on `opts.socket`, with the engine on GPU 0, until a Shutdown request; then removes the socket and returns,
+/// the engine's models freed.
 pub fn serve(opts: &Options) -> tachyon::Result<()> {
     let listener = listen(&opts.socket)?;
     let mut engine = Engine::new(0, Limits::default())?;
@@ -84,14 +90,23 @@ pub fn serve(opts: &Options) -> tachyon::Result<()> {
         for i in (0..fds.len() - 1).filter(|&i| fds[i + 1].revents != 0) {
             ring(&mut clients[i], i, &mut queue);
         }
-        while let Some(i) = queue.pop_front() {
-            if let Some(c) = clients[i].as_mut().filter(|c| c.queued) {
-                c.queued = false;
-                answer(&mut engine, c, opts);
-            }
+        if drain(&mut engine, (&mut clients, &mut queue), opts) {
+            eprintln!("tachyon serve: shut down");
+            return Ok(std::fs::remove_file(&opts.socket)?);
         }
         engine.expire()?;
     }
+}
+
+/// Answers the queued requests, in order; whether one was a Shutdown.
+fn drain(engine: &mut Engine, (clients, queue): (&mut [Option<Client>], &mut VecDeque<usize>), opts: &Options) -> bool {
+    while let Some(i) = queue.pop_front() {
+        if let Some(c) = clients[i].as_mut().filter(|c| c.queued) {
+            c.queued = false;
+            answer(engine, c, opts);
+        }
+    }
+    STOP.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Binds `path`, replacing a socket no daemon answers on, readable and writable by this user only.
@@ -166,6 +181,7 @@ enum Ask {
     Load { model: String, keep: Option<Duration>, context: usize, pin: bool },
     Unload(String),
     List,
+    Shutdown,
 }
 
 /// An Embed request: the model, the texts, the values kept of each embedding (0: all) and where they go.
@@ -219,12 +235,18 @@ fn read(bytes: &[u8]) -> (u64, Result<Ask, Bad>) {
         1 => read_chat(block, &mut r).map(Ask::Chat),
         2 => read_embed(block, &mut r),
         3 => read_decide(block, &mut r),
-        4 => r.text().and_then(|model| Ok(Ask::Load { model, keep: keep(block.u64(8)?), context: block.u32(16)? as usize, pin: block.u8(20)? != 0 })),
+        4 => read_load(block, &mut r),
         5 => r.text().map(Ask::Unload),
         6 => Ok(Ask::List),
+        7 => Ok(Ask::Shutdown),
         _ => Err(Bad),
     };
     (id, ask)
+}
+
+/// A Load's block and model.
+fn read_load(b: sbe::Block<'_>, r: &mut Reader<'_>) -> Result<Ask, Bad> {
+    Ok(Ask::Load { model: r.text()?, keep: keep(b.u64(8)?), context: b.u32(16)? as usize, pin: b.u8(20)? != 0 })
 }
 
 /// A Chat's block and groups.
@@ -343,6 +365,10 @@ fn run(engine: &mut Engine, c: &mut Client, opts: &Options, (id, ask): (u64, Ask
             Ok(done(Fields::default().u64(0).u64(0).u32(0).u32(0)))
         }
         Ask::List => Ok(list(engine, id)),
+        Ask::Shutdown => {
+            STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(done(Fields::default().u64(0).u64(0).u32(0).u32(0)))
+        }
     }
 }
 

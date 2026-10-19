@@ -5,7 +5,7 @@
   ring and the futex) is in tachyon.h.
 
   Every message is a messageHeader, then its fixed block, then its groups, then its variable-length data, all
-  little-endian, as SBE lays them out. Requests (ids 1 to 6) go in the request area of the shared memory, one at a
+  little-endian, as SBE lays them out. Requests (ids 1 to 7) go in the request area of the shared memory, one at a
   time; responses (ids 101 to 106) come back in the response ring, each answer ending with Done or Error.
   Bytes bigger than a few kilobytes (images, audio, embeddings, probabilities) live in the data area and are named
   by a blob: an offset from the data area's start and a length.
@@ -130,6 +130,10 @@
   </sbe:message>
 
   <sbe:message name="List" id="6" description="The loaded models; then Models">
+    <field name="request" id="1" type="uint64"/>
+  </sbe:message>
+
+  <sbe:message name="Shutdown" id="7" description="Ends the daemon once its Done is out: its models are freed, its socket removed">
     <field name="request" id="1" type="uint64"/>
   </sbe:message>
 

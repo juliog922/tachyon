@@ -77,8 +77,17 @@ embeddings and probabilities go through its data area, named by offset and lengt
 then Done with timings), Embed, Decide (Laya), Load, Unload, List; one at a time per daemon, in the order they rang,
 a cancel stopping one between tokens. Only processes of the daemon's user are let in.
 
+The command line drives it too: `tachyon up` starts it in the background (its log in
+`~/.local/state/tachyon/serve.log`), `tachyon ps` lists its models (where, VRAM, time left), `tachyon load` and
+`tachyon unload` place them, and `tachyon down` stops it. While it is up, `run`, `transcribe`, `embed` and `decide`
+go through it, so a model loads once and answers the next command from VRAM.
+
 ```sh
-cargo run --release -p tachyon-cli -- serve --keep-alive=600
+tachyon up --keep-alive=600
+tachyon run gemma-4-e4b "Why is the sky blue?"     # loads it
+tachyon run gemma-4-e4b "And the sunset?"          # answers from VRAM
+tachyon ps
+tachyon down
 ```
 
 ## Layout

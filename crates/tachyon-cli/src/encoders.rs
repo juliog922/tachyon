@@ -14,15 +14,15 @@ use tachyon::engine::{Engine, Limits, Load};
 use tachyon::json::Json;
 
 /// A question as the request writes it, its options owned.
-struct Asked {
+pub(crate) struct Asked {
     name: String,
-    kind: Kind,
-    instructions: String,
-    options: Vec<(String, String)>,
+    pub(crate) kind: Kind,
+    pub(crate) instructions: String,
+    pub(crate) options: Vec<(String, String)>,
 }
 
 /// The questions of request `r`.
-fn questions(r: &Json) -> tachyon::Result<Vec<Asked>> {
+pub(crate) fn questions(r: &Json) -> tachyon::Result<Vec<Asked>> {
     let bad = |why: &str| tachyon::Error::Format(format!("request: {why}"));
     let all = r.get("questions").and_then(Json::obj).ok_or_else(|| bad("no \"questions\" object"))?;
     all.iter()
@@ -80,7 +80,7 @@ pub fn decide(dir: &Path, request: &Path) -> tachyon::Result<String> {
 }
 
 /// The answers to `asked`, as one JSON object.
-fn render(asked: &[Asked], answers: &[Vec<f32>]) -> String {
+pub(crate) fn render(asked: &[Asked], answers: &[Vec<f32>]) -> String {
     let mut out = String::from("{");
     for (i, (a, p)) in asked.iter().zip(answers).enumerate() {
         let _ = write!(out, "{}{}: {}", if i > 0 { ", " } else { "" }, Json::Str(a.name.clone()).dumps(), answer(a, p));
@@ -110,8 +110,12 @@ fn answer(a: &Asked, p: &[f32]) -> String {
 pub fn embed(dir: &Path, texts: &[&str], dims: Option<usize>) -> tachyon::Result<String> {
     let mut engine = Engine::new(0, Limits::default())?;
     engine.load("embed", dir, &Load::default())?;
-    let vectors = engine.embed("embed", texts, dims)?;
-    Ok(vectors.iter().map(|v| format!("[{}]", v.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n"))
+    Ok(rows(&engine.embed("embed", texts, dims)?))
+}
+
+/// Embeddings as one JSON array per line.
+pub(crate) fn rows(vectors: &[Vec<f32>]) -> String {
+    vectors.iter().map(|v| format!("[{}]", v.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(", "))).collect::<Vec<_>>().join("\n")
 }
 
 /// Runs `convert` while a line on standard error reports, every two seconds, how much of the checkpoint in `src`

@@ -24,20 +24,20 @@ const SEQ: usize = 128;
 const TAIL: usize = 192;
 
 #[repr(C)]
-struct Iovec {
-    base: *mut c_void,
-    len: usize,
+pub(super) struct Iovec {
+    pub(super) base: *mut c_void,
+    pub(super) len: usize,
 }
 
 #[repr(C)]
-struct Msghdr {
-    name: *mut c_void,
-    namelen: u32,
-    iov: *mut Iovec,
-    iovlen: usize,
-    control: *mut c_void,
-    controllen: usize,
-    flags: c_int,
+pub(super) struct Msghdr {
+    pub(super) name: *mut c_void,
+    pub(super) namelen: u32,
+    pub(super) iov: *mut Iovec,
+    pub(super) iovlen: usize,
+    pub(super) control: *mut c_void,
+    pub(super) controllen: usize,
+    pub(super) flags: c_int,
 }
 
 #[repr(C)]
@@ -58,13 +58,15 @@ pub struct Pollfd {
 unsafe extern "C" {
     fn memfd_create(name: *const u8, flags: u32) -> c_int;
     fn ftruncate(fd: c_int, len: i64) -> c_int;
-    fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
-    fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    pub(super) fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+    pub(super) fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    pub(super) fn recvmsg(fd: c_int, msg: *mut Msghdr, flags: c_int) -> isize;
+    pub(super) fn close(fd: c_int) -> c_int;
     fn sendmsg(fd: c_int, msg: *const Msghdr, flags: c_int) -> isize;
     fn getsockopt(fd: c_int, level: c_int, name: c_int, value: *mut c_void, len: *mut u32) -> c_int;
     fn getuid() -> u32;
     fn poll(fds: *mut Pollfd, n: u64, timeout: c_int) -> c_int;
-    fn syscall(n: i64, ...) -> i64;
+    pub(super) fn syscall(n: i64, ...) -> i64;
 }
 
 /// Readable, and the other end gone, for [`Pollfd::events`] and `revents`.

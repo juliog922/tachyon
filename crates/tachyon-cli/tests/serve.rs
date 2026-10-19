@@ -175,8 +175,8 @@ fn error(answer: &[Vec<u8>], id: u64) -> u16 {
 }
 
 /// The tiny model converted, and a daemon serving on a socket beside it: the model's directory and the socket.
-fn daemon() -> (String, std::path::PathBuf) {
-    let src = tiny::checkpoint("serve", 3, tiny::E4B);
+fn daemon(name: &str) -> (String, std::path::PathBuf) {
+    let src = tiny::checkpoint(name, 3, tiny::E4B);
     tachyon::model::convert(&src, &src.join("out")).unwrap();
     let socket = src.join("tachyon.sock");
     let opts = tachyon_cli::serve::Options { socket: socket.clone(), keep_alive: Duration::from_secs(60), data: 1 << 20 };
@@ -221,7 +221,7 @@ fn a_client_loads_lists_chats_and_cancels() {
         eprintln!("no NVIDIA device: skipped");
         return;
     }
-    let (model, socket) = daemon();
+    let (model, socket) = daemon("serve");
     let mut c = Client::connect(&socket);
 
     // Load with a short context, then List: one model, in VRAM.
@@ -248,5 +248,29 @@ fn a_client_loads_lists_chats_and_cancels() {
     drop(gone);
     assert_eq!(streamed(&c.answer(&chat(10, &model, "hello there, how are you", 30))), first, "after a client left");
     round_trips(&mut c);
+    std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+}
+
+/// The command line's own commands against the daemon: load, ps, a chat, unload, and down, which ends the daemon
+/// and removes its socket.
+#[test]
+fn the_command_line_drives_the_daemon() {
+    use tachyon_cli::serve::{client::Daemon, commands};
+    if !Path::new("/dev/nvidiactl").exists() && !Path::new("/dev/dxg").exists() {
+        eprintln!("no NVIDIA device: skipped");
+        return;
+    }
+    let (model, socket) = daemon("serve-commands");
+    let mut d = Daemon::connect(&socket).unwrap();
+    commands::load(&mut d, &model, -1, (64, false)).unwrap();
+    let listed = commands::ps(&mut d).unwrap();
+    assert!(listed.contains(&model) && listed.contains("vram"), "{listed}");
+    commands::run(&mut d, &model, "hello there, how are you", &[]).unwrap();
+    commands::unload(&mut d, &model).unwrap();
+    assert_eq!(commands::ps(&mut d).unwrap().lines().count(), 1, "only the header once unloaded");
+    assert!(commands::run(&mut d, "no-such-model", "hi", &[]).unwrap_err().to_string().contains("code 2"), "NoModel");
+    drop(d);
+    assert_eq!(commands::down(&socket).unwrap(), "tachyon serve: down");
+    assert!(!socket.exists() && Daemon::connect(&socket).is_err(), "the socket is gone");
     std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
 }

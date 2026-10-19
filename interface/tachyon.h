@@ -7,7 +7,7 @@
  *    /tmp/tachyon-<uid>.sock. Only processes of the daemon's user are let in (SO_PEERCRED).
  * 2. Receive one Welcome message (tachyon.xml) with the shared memory's file descriptor attached (SCM_RIGHTS), and
  *    map Welcome.size bytes of it, shared, read and write. It starts with a tachyon_control.
- * 3. To ask: write one request message (Chat, Embed, Decide, Load, Unload or List) at request_offset, with its
+ * 3. To ask: write one request message (Chat, Embed, Decide, Load, Unload, List or Shutdown) at request_offset, with its
  *    bytes in the data area as needed, then write the byte TACHYON_DOORBELL_REQUEST to the socket. Write the next
  *    request only after the answer to this one has ended (Done or Error): the daemon reads the request area while
  *    it answers. TACHYON_DOORBELL_CANCEL stops the request being answered (Error, Cancelled).

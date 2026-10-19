@@ -29,6 +29,12 @@ Commands:
   serve                        Serve every process of this user from one engine, models kept in VRAM between
                                requests (interface/tachyon.h and tachyon.xml; --socket=PATH, --keep-alive=SECONDS,
                                --data-mib=N: each client's data area, 64 by default)
+  up [serve's options]         Start `tachyon serve` in the background (its log in ~/.local/state/tachyon)
+  down                         Stop it: its models freed
+  ps                           List its models: where they are, their VRAM, their time left in VRAM
+  load <model>                 Load a model into it ahead of use (--keep-alive=SECONDS or never, --pin,
+                               --context=N); while it is up, run, transcribe, embed and decide go through it
+  unload <model>               Drop a model from it
   gpu                          List the GPUs the driver sees
   doctor                       Check the driver, GPUs, CPU, memory, certificates and the connection to Hugging Face
   convert <checkpoint> <model> Convert a Hugging Face checkpoint directory (Gemma 4, Laya, Granite) to a model
@@ -40,7 +46,83 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (json, keep) = (args.iter().any(|a| a == "--json"), args.iter().any(|a| a == "--keep"));
     let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| !["--json", "--keep"].contains(a)).collect();
-    models_command(&words, keep).unwrap_or_else(|| command(&words, json))
+    daemon_command(&words).or_else(|| models_command(&words, keep)).unwrap_or_else(|| command(&words, json))
+}
+
+/// Runs the command of `words` that drives the daemon, or goes through it while it is up, if it is one.
+fn daemon_command(words: &[&str]) -> Option<ExitCode> {
+    use tachyon_cli::serve::commands as daemon;
+    let socket = tachyon_cli::serve::socket();
+    Some(match words {
+        ["up", rest @ ..] => options(rest).map_or(ExitCode::from(2), |opts| said(daemon::up(&opts))),
+        ["down"] => said(daemon::down(&socket)),
+        ["ps"] => said(up().and_then(|mut d| daemon::ps(&mut d))),
+        ["load", model, rest @ ..] => match load_options(rest) {
+            Some(how) => said(up().and_then(|mut d| daemon::load(&mut d, model, how.0, how.1))),
+            None => ExitCode::from(2),
+        },
+        ["unload", model] => said(up().and_then(|mut d| daemon::unload(&mut d, model))),
+        _ => return through(words, daemon::running()?),
+    })
+}
+
+/// The commands that go through a running daemon `d`, if `words` is one.
+fn through(words: &[&str], mut d: tachyon_cli::serve::client::Daemon) -> Option<ExitCode> {
+    use tachyon_cli::serve::commands as daemon;
+    Some(match words {
+        ["run", model, rest @ ..] => {
+            let (files, prompt): (Vec<&str>, Vec<&str>) = rest.iter().partition(|w| w.starts_with("--image=") || w.starts_with("--audio="));
+            let [prompt] = prompt[..] else { return None };
+            said(daemon::run(&mut d, model, prompt, &files).map(|()| String::new()))
+        }
+        ["transcribe", model, file] => said(daemon::run(&mut d, model, TRANSCRIBE, &[&format!("--audio={file}")]).map(|()| String::new())),
+        ["decide", model, request] => said(daemon::decide(&mut d, model, request.as_ref())),
+        ["embed", model, rest @ ..] if !rest.is_empty() => {
+            let dims = rest.iter().find_map(|w| w.strip_prefix("--dims=")).map(str::parse).transpose().ok()?;
+            let texts: Vec<&str> = rest.iter().copied().filter(|w| !w.starts_with("--dims=")).collect();
+            said(daemon::embed(&mut d, model, &texts, dims))
+        }
+        _ => return None,
+    })
+}
+
+/// The daemon on the default socket, or why there is none.
+fn up() -> std::io::Result<tachyon_cli::serve::client::Daemon> {
+    tachyon_cli::serve::commands::running().ok_or_else(|| std::io::Error::other("no tachyon serve is up; `tachyon up` starts one"))
+}
+
+/// What a daemon command printed, or its error.
+fn said(r: std::io::Result<String>) -> ExitCode {
+    match r {
+        Ok(out) => {
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `load`'s options: the keep-alive in milliseconds (−1 the daemon's default, −2 never), the context and the pin.
+fn load_options(rest: &[&str]) -> Option<(i64, (u32, bool))> {
+    let (mut keep, mut context, mut pin) = (-1, 0, false);
+    for w in rest {
+        match w.split_once('=') {
+            Some(("--keep-alive", "never")) => keep = -2,
+            Some(("--keep-alive", s)) => keep = s.parse::<i64>().ok()? * 1000,
+            Some(("--context", n)) => context = n.parse().ok()?,
+            None if *w == "--pin" => pin = true,
+            _ => {
+                eprint!("error: unknown load option '{w}'\n\n{HELP}");
+                return None;
+            }
+        }
+    }
+    Some((keep, (context, pin)))
 }
 
 /// Runs the model-management command of `words`, or `serve`, if it is one.
@@ -89,6 +171,11 @@ fn command(words: &[&str], json: bool) -> ExitCode {
 
 /// Runs the daemon with the options of `rest`.
 fn serve(rest: &[&str]) -> ExitCode {
+    options(rest).map_or(ExitCode::from(2), |opts| done(tachyon_cli::serve::serve(&opts)))
+}
+
+/// The daemon's options in `rest`, or `None` (reported) for one it does not take.
+fn options(rest: &[&str]) -> Option<tachyon_cli::serve::Options> {
     let mut opts = tachyon_cli::serve::Options::default();
     for w in rest {
         let ok = match w.split_once('=') {
@@ -102,10 +189,10 @@ fn serve(rest: &[&str]) -> ExitCode {
         };
         if !ok {
             eprint!("error: unknown serve option '{w}'\n\n{HELP}");
-            return ExitCode::from(2);
+            return None;
         }
     }
-    done(tachyon_cli::serve::serve(&opts))
+    Some(opts)
 }
 
 /// Embeds the texts of `rest` with `model`; a `--dims=N` among them cuts the vectors to `N` values.
